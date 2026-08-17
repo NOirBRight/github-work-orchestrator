@@ -439,6 +439,41 @@ def test_execute_rejects_compilation_record_mutation_after_preflight(tmp_path):
     assert fixture.transitions.history(fixture.repository) == ()
 
 
+def test_execute_uses_immutable_plan_snapshot_at_controller_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    request = _request(fixture, authorization)
+    facade = _facade(fixture, authorization)
+    preflight = facade.preflight(request)
+    expected_record = json.loads(canonical_bytes(request.compiled_plan.compilation_record))
+    observed_plans = []
+    original_cutover = fixture.controller.cutover
+
+    def cutover(compiled_plan, **kwargs):
+        request.compiled_plan.compilation_record["source_digest"] = "0" * 64
+        observed_plans.append(compiled_plan)
+        return original_cutover(compiled_plan, **kwargs)
+
+    monkeypatch.setattr(fixture.controller, "cutover", cutover)
+
+    outcome = facade.execute(
+        request,
+        authorization=authorization,
+        preflight=preflight,
+    )
+
+    assert outcome.status == "cut_over"
+    assert len(observed_plans) == 1
+    assert observed_plans[0] is not request.compiled_plan
+    assert observed_plans[0].compilation_record == expected_record
+    active = fixture.publication.read_active(fixture.repository)
+    assert active is not None
+    assert active.compilation_record == expected_record
+
+
 def test_execute_rejects_authorization_request_mismatch_before_cutover(tmp_path):
     fixture = activation_fixture(tmp_path)
     authorization = _authorization(fixture, tmp_path)

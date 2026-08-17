@@ -264,8 +264,29 @@ class ProductionActivationFacade:
         self,
         request: ProductionActivationRequest,
     ) -> ProductionActivationPreflight:
-        authorization_receipt = self._validate_common(request)
-        plan_identity = self._capture_plan_identity(request.compiled_plan)
+        if type(request) is not ProductionActivationRequest:
+            self._validate_common(request)
+        plan_snapshot = self._snapshot_compiled_plan(
+            self._capture_plan_identity(request.compiled_plan),
+        )
+        return self._preflight(request, plan_snapshot=plan_snapshot)
+
+    def _preflight(
+        self,
+        request: ProductionActivationRequest,
+        *,
+        plan_snapshot: CompiledPlan,
+    ) -> ProductionActivationPreflight:
+        if type(plan_snapshot) is not CompiledPlan:
+            _reject(
+                "COMPILED_PLAN_IDENTITY_CHANGED",
+                "preflight Plan snapshot has the wrong exact type",
+            )
+        plan_identity = self._capture_plan_identity(plan_snapshot)
+        authorization_receipt = self._validate_common(
+            request,
+            compiled_plan=plan_snapshot,
+        )
         current = self._read_current(request.authorization.repository)
         if current.writer_generation != EXPECTED_SOURCE_WRITER_GENERATION:
             if current.writer_generation != request.authorization.target_writer_generation:
@@ -277,7 +298,12 @@ class ProductionActivationFacade:
                 request.authorization.repository,
                 current.record_id,
             )
-            if not self._pending_matches(request, current, record):
+            if not self._pending_matches(
+                request,
+                current,
+                record,
+                compiled_plan=plan_snapshot,
+            ):
                 _reject(
                     "ACTIVATION_READBACK_INVALID",
                     "current pending cutover is not the exact activation request",
@@ -302,7 +328,7 @@ class ProductionActivationFacade:
             authorization_receipt=authorization_receipt,
             plan_identity=plan_identity,
             current_writer=current,
-            plan_digest=request.compiled_plan.digest,
+            plan_digest=plan_snapshot.digest,
             canary_evidence_digest=evidence_digest,
             guard_receipt_digest=receipt.receipt_digest,
             checks=(
@@ -345,7 +371,11 @@ class ProductionActivationFacade:
                 request.compiled_plan,
                 preflight.plan_identity,
             )
-            current_receipt = self._validate_common(request)
+            compiled_plan = self._snapshot_compiled_plan(preflight.plan_identity)
+            current_receipt = self._validate_common(
+                request,
+                compiled_plan=compiled_plan,
+            )
             if current_receipt != preflight.authorization_receipt:
                 _reject(
                     "AUTHORIZATION_PROVENANCE_STALE",
@@ -353,7 +383,10 @@ class ProductionActivationFacade:
                 )
             current = self._read_current(request.authorization.repository)
             if current.writer_generation == authorization.target_writer_generation:
-                completed = self._read_completed_outcome(request)
+                completed = self._read_completed_outcome(
+                    request,
+                    compiled_plan=compiled_plan,
+                )
                 if not isinstance(completed, _NotCompleted):
                     if isinstance(completed, _PendingActivation):
                         completed = _NotCompleted()
@@ -364,9 +397,14 @@ class ProductionActivationFacade:
                                 "completed activation readback has the wrong type",
                             )
                         return completed
-            self.preflight(request)
         else:
-            completed = self._read_completed_outcome(request)
+            compiled_plan = self._snapshot_compiled_plan(
+                self._capture_plan_identity(request.compiled_plan),
+            )
+            completed = self._read_completed_outcome(
+                request,
+                compiled_plan=compiled_plan,
+            )
             if not isinstance(completed, _NotCompleted):
                 if isinstance(completed, _PendingActivation):
                     completed = _NotCompleted()
@@ -377,10 +415,14 @@ class ProductionActivationFacade:
                             "completed activation readback has the wrong type",
                         )
                     return completed
-            self.preflight(request)
 
+        final_preflight = self._preflight(
+            request,
+            plan_snapshot=compiled_plan,
+        )
+        compiled_plan = self._snapshot_compiled_plan(final_preflight.plan_identity)
         outcome = self._controller.cutover(
-            request.compiled_plan,
+            compiled_plan,
             canary=request.canary,
             guard_subject=request.guard_subject,
             guard_receipt=request.guard_receipt,
@@ -388,12 +430,18 @@ class ProductionActivationFacade:
             worker_capacity=request.worker_capacity,
             coordinator_capacity=request.coordinator_capacity,
         )
-        self._validate_activation_readback(request, outcome)
+        self._validate_activation_readback(
+            request,
+            outcome,
+            compiled_plan=compiled_plan,
+        )
         return outcome
 
     def _validate_common(
         self,
         request: ProductionActivationRequest,
+        *,
+        compiled_plan: CompiledPlan | None = None,
     ) -> ProductionActivationAuthorizationReceipt:
         if type(request) is not ProductionActivationRequest:
             _reject(
@@ -407,7 +455,7 @@ class ProductionActivationFacade:
                 "activation request authorization has the wrong exact type",
             )
         authorization_receipt = self._read_authorization_receipt(authorization)
-        plan = request.compiled_plan
+        plan = request.compiled_plan if compiled_plan is None else compiled_plan
         subject = request.guard_subject
 
         if (
@@ -542,6 +590,38 @@ class ProductionActivationFacade:
                 "COMPILED_PLAN_IDENTITY_CHANGED",
                 "CompiledPlan bytes or compilation metadata changed after preflight",
             )
+
+    def _snapshot_compiled_plan(
+        self,
+        identity: ProductionActivationPlanIdentity,
+    ) -> CompiledPlan:
+        """Rebuild one detached Plan from the final canonical identity bytes."""
+
+        if type(identity) is not ProductionActivationPlanIdentity:
+            _reject(
+                "COMPILED_PLAN_IDENTITY_CHANGED",
+                "final preflight has no exact immutable Plan identity",
+            )
+        try:
+            canonical_plan_bytes = bytes(identity.canonical_bytes)
+            compilation_record_bytes = bytes(identity.compilation_record_bytes)
+            compilation_record = load_canonical_json(compilation_record_bytes)
+            if type(compilation_record) is not dict:
+                raise ValueError("compilation record must be a JSON object")
+            snapshot = CompiledPlan(
+                repository=identity.repository,
+                canonical_bytes=canonical_plan_bytes,
+                digest=identity.digest,
+                compilation_record=compilation_record,
+            )
+            if canonical_bytes(snapshot.compilation_record) != compilation_record_bytes:
+                raise ValueError("snapshot bytes do not round-trip")
+            return snapshot
+        except Exception as error:
+            raise ProductionActivationError(
+                "COMPILED_PLAN_IDENTITY_CHANGED",
+                "final preflight Plan snapshot could not be reconstructed",
+            ) from error
 
     def _validate_canary_readback(
         self,
@@ -727,8 +807,11 @@ class ProductionActivationFacade:
     def _read_completed_outcome(
         self,
         request: ProductionActivationRequest,
+        *,
+        compiled_plan: CompiledPlan | None = None,
     ) -> WriterTransitionOutcome | _PendingActivation | _NotCompleted:
-        self._validate_common(request)
+        plan = request.compiled_plan if compiled_plan is None else compiled_plan
+        self._validate_common(request, compiled_plan=plan)
         repository = request.authorization.repository
         current = self._read_current(repository)
         if current.writer_generation != request.authorization.target_writer_generation:
@@ -738,7 +821,12 @@ class ProductionActivationFacade:
             record.kind == "cutover_pending"
             and record.status == "pending"
         ):
-            if self._pending_matches(request, current, record):
+            if self._pending_matches(
+                request,
+                current,
+                record,
+                compiled_plan=plan,
+            ):
                 return _PendingActivation()
             _reject(
                 "ACTIVATION_READBACK_INVALID",
@@ -749,7 +837,7 @@ class ProductionActivationFacade:
             or record.status != "cut_over"
             or record.writer_generation
             != request.authorization.target_writer_generation
-            or record.plan_digest != request.compiled_plan.digest
+            or record.plan_digest != plan.digest
             or record.canary_evidence_digest
             != request.canary.evidence_package_digest
             or record.worker_capacity != request.worker_capacity
@@ -768,7 +856,11 @@ class ProductionActivationFacade:
             worker_capacity=record.worker_capacity,
             coordinator_capacity=record.coordinator_capacity,
         )
-        self._validate_activation_readback(request, outcome)
+        self._validate_activation_readback(
+            request,
+            outcome,
+            compiled_plan=plan,
+        )
         return outcome
 
     def _read_transition_record(
@@ -795,7 +887,10 @@ class ProductionActivationFacade:
         request: ProductionActivationRequest,
         current: CurrentWriter,
         record: WriterTransitionRecord,
+        *,
+        compiled_plan: CompiledPlan | None = None,
     ) -> bool:
+        plan = request.compiled_plan if compiled_plan is None else compiled_plan
         return (
             type(current) is CurrentWriter
             and type(record) is WriterTransitionRecord
@@ -810,7 +905,7 @@ class ProductionActivationFacade:
             and record.writer_generation
             == request.authorization.target_writer_generation
             and record.activation_id is None
-            and record.plan_digest == request.compiled_plan.digest
+            and record.plan_digest == plan.digest
             and record.canary_evidence_digest
             == request.canary.evidence_package_digest
             and record.canary_evidence_refs == request.canary.evidence_refs
@@ -824,7 +919,10 @@ class ProductionActivationFacade:
         self,
         request: ProductionActivationRequest,
         outcome: WriterTransitionOutcome,
+        *,
+        compiled_plan: CompiledPlan | None = None,
     ) -> None:
+        plan = request.compiled_plan if compiled_plan is None else compiled_plan
         if (
             type(outcome) is not WriterTransitionOutcome
             or outcome.status != "cut_over"
@@ -868,7 +966,7 @@ class ProductionActivationFacade:
             or record.activation_id != outcome.activation_id
             or record.writer_generation
             != request.authorization.target_writer_generation
-            or record.plan_digest != request.compiled_plan.digest
+            or record.plan_digest != plan.digest
             or record.canary_evidence_digest
             != request.canary.evidence_package_digest
             or record.canary_evidence_refs != request.canary.evidence_refs
@@ -914,7 +1012,7 @@ class ProductionActivationFacade:
             receipt = publication.durable.read_current_activation(repository)
             durable_plan = publication.durable.read_plan(
                 repository,
-                request.compiled_plan.digest,
+                plan.digest,
             )
         except Exception as error:
             raise ProductionActivationError(
@@ -924,25 +1022,25 @@ class ProductionActivationFacade:
         if (
             type(active) is not PublishedPlan
             or active.repository != repository
-            or active.plan_digest != request.compiled_plan.digest
+            or active.plan_digest != plan.digest
             or active.writer_generation
             != request.authorization.target_writer_generation
             or active.activation_id != outcome.activation_id
-            or active.canonical_bytes != request.compiled_plan.canonical_bytes
-            or active.compilation_record != request.compiled_plan.compilation_record
-            or digest_bytes(active.canonical_bytes) != request.compiled_plan.digest
+            or active.canonical_bytes != plan.canonical_bytes
+            or active.compilation_record != plan.compilation_record
+            or digest_bytes(active.canonical_bytes) != plan.digest
             or type(receipt) is not ActivationReceipt
             or receipt.repository != repository
-            or receipt.plan_digest != request.compiled_plan.digest
+            or receipt.plan_digest != plan.digest
             or receipt.writer_generation
             != request.authorization.target_writer_generation
             or receipt.activation_id != outcome.activation_id
             or type(durable_plan) is not DurablePlanRecord
             or durable_plan.repository != repository
-            or durable_plan.plan_digest != request.compiled_plan.digest
-            or durable_plan.canonical_bytes != request.compiled_plan.canonical_bytes
+            or durable_plan.plan_digest != plan.digest
+            or durable_plan.canonical_bytes != plan.canonical_bytes
             or durable_plan.compilation_record
-            != request.compiled_plan.compilation_record
+            != plan.compilation_record
         ):
             _reject(
                 "ACTIVATION_READBACK_INVALID",
