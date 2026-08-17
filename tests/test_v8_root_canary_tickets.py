@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -25,6 +26,9 @@ from scripts.provision_v8_root_canary import (
 
 
 ROOT = Path(__file__).parents[1]
+SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 
 def _repository_identity():
@@ -181,6 +185,119 @@ def test_root_ticket_specs_are_disjoint_and_derive_three_standard_one_strict():
     assert f'policy_path: str = "{POLICY_WITNESS_PATH}"' in snapshot_source
 
 
+def test_checked_in_policy_witness_is_canonical_and_plancontrol_accepts_its_digest():
+    from gwo_v8._canonical import digest_value as canonical_digest, load_canonical_json
+    from gwo_v8.plan_control import _normalize_policy
+
+    witness_path = ROOT / POLICY_WITNESS_PATH
+    witness_bytes = witness_path.read_bytes()
+    witness = load_canonical_json(witness_bytes)
+
+    assert set(witness) == {
+        "schema_version",
+        "ref",
+        "digest",
+        "authority_grants",
+        "allowed_capabilities",
+        "exclusive_resources",
+    }
+    assert witness["schema_version"] == 1
+    assert witness["ref"] == "policy:gwo-v8-root-canary"
+    assert witness["authority_grants"] == {
+        "campaign": [
+            {
+                "operation_id": "repository.read.v1",
+                "resource_id": "campaign.snapshot.v1",
+            }
+        ],
+        "worker": [
+            {
+                "operation_id": "workspace.write.v1",
+                "resource_id": "work-run.workspace.v1",
+            }
+        ],
+        "recovery_worker": [
+            {
+                "operation_id": "workspace.write.v1",
+                "resource_id": "work-run.workspace.v1",
+            }
+        ],
+        "review": [
+            {
+                "operation_id": "repository.read.v1",
+                "resource_id": "review.subject.v1",
+            }
+        ],
+    }
+    assert witness["allowed_capabilities"] == ["git", "local_check"]
+    assert witness["exclusive_resources"] == ["repository.target.v1"]
+    assert witness["digest"] == canonical_digest(
+        {key: value for key, value in witness.items() if key != "digest"}
+    )
+    assert _normalize_policy(witness) == witness
+
+
+def test_github_snapshot_reads_the_checked_in_policy_witness_bytes_exactly():
+    from gwo_v8.activation import GitHubContent
+    from gwo_v8.github_snapshot import GitHubReadySnapshotSource
+    from gwo_v8._canonical import load_canonical_json
+
+    witness_path = ROOT / POLICY_WITNESS_PATH
+    witness_bytes = witness_path.read_bytes()
+    witness = load_canonical_json(witness_bytes)
+    calls = []
+
+    class ContentClient:
+        def read(self, repository, branch, path):
+            calls.append((repository, branch, path))
+            return GitHubContent(witness_bytes, "blob:policy-witness")
+
+    source = GitHubReadySnapshotSource(
+        content_client=ContentClient(),
+        issue_client=object(),
+        control_branch="gwo-control",
+        target_branch="main",
+    )
+
+    assert source._policy(ROOT_REPOSITORY) == (witness, witness_bytes)
+    assert calls == [(ROOT_REPOSITORY, "gwo-control", POLICY_WITNESS_PATH)]
+
+
+@pytest.mark.parametrize("content", [None, b"{}"])
+def test_policy_witness_readback_rejects_missing_or_invalid_content(content):
+    from gwo_v8.activation import GitHubContent
+    from gwo_v8.github_snapshot import GitHubReadySnapshotSource
+    from gwo_v8.plan_control import PlanControlError, _normalize_policy
+
+    class ContentClient:
+        def read(self, _repository, _branch, _path):
+            return None if content is None else GitHubContent(content, "blob:policy")
+
+    source = GitHubReadySnapshotSource(
+        content_client=ContentClient(),
+        issue_client=object(),
+        control_branch="gwo-control",
+        target_branch="main",
+    )
+
+    with pytest.raises(PlanControlError) as error:
+        policy, _ = source._policy(ROOT_REPOSITORY)
+        _normalize_policy(policy)
+    assert error.value.code == "POLICY_WITNESS_INVALID"
+
+
+def test_plancontrol_rejects_a_tampered_digest_from_the_checked_in_witness():
+    from gwo_v8._canonical import load_canonical_json
+    from gwo_v8.plan_control import PlanControlError, _normalize_policy
+
+    witness = load_canonical_json((ROOT / POLICY_WITNESS_PATH).read_bytes())
+    witness["ref"] = "policy:tampered"
+
+    with pytest.raises(PlanControlError) as error:
+        _normalize_policy(witness)
+    assert error.value.code == "POLICY_WITNESS_INVALID"
+
+
 def test_provision_refuses_issue_mutation_without_named_owner_approval(fake_github):
     with pytest.raises(RootCanaryProvisionError, match="ROOT_CANARY_APPROVAL_REQUIRED"):
         provision_root_tickets(
@@ -285,6 +402,7 @@ def test_runbook_contains_all_four_fixed_contracts(tmp_path):
     assert "GWO V8 GA Canary A: document Candidate receipt readback" in text
     assert "docs/canary/protected/gwo-v8-ga-delta.md" in text
     assert "CREATE-GWO-V8-GA-ROOT-CANARY-TICKETS" in text
+    assert f"Policy Witness: `{POLICY_WITNESS_PATH}`" in text
     assert "github://" not in text
 
 

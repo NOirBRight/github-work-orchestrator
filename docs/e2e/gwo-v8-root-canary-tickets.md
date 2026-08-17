@@ -4,6 +4,8 @@ Repository: `NOirBRight/github-work-orchestrator`
 
 Approval: `CREATE-GWO-V8-GA-ROOT-CANARY-TICKETS`
 
+Policy Witness: `.gwo-v8/policy-witness.json`
+
 ## alpha: GWO V8 GA Canary A: document Candidate receipt readback
 
 - Path: `docs/canary/gwo-v8-ga-alpha.md`
