@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
@@ -129,6 +130,7 @@ class VerifiedBatch:
     pull_request_number: int
     hosted_run_id: int | str
     batch_sha: str
+    target_sha: str
     receipt_digest: str
 
 
@@ -159,6 +161,7 @@ class RootCanaryAcceptanceReceiptV1:
     batch_receipt_digests: tuple[tuple[str, str], ...]
     fault_journal_digest: str
     canary_target_sha: str
+    authoritative_evidence: dict[str, object]
     receipt_digest: str
 
     def canonical_digest_payload(self) -> dict[str, object]:
@@ -204,10 +207,14 @@ class RootCanaryAcceptanceReceiptV1:
             ),
             "duplicate_effect_ids": list(self.duplicate_effect_ids),
             "canary_target_sha": self.canary_target_sha,
+            "authoritative_evidence": self.authoritative_evidence,
         }
 
     def validate_digest(self, expected: str) -> None:
-        if self.receipt_digest != expected:
+        if (
+            self.receipt_digest != expected
+            or self.receipt_digest != digest_value(self.canonical_digest_payload())
+        ):
             _reject("CANARY_RECEIPT_DIGEST_MISMATCH")
 
     def validate_for(self, admission: CanaryAdmissionIdentity) -> None:
@@ -264,13 +271,15 @@ def _campaign_identity(
 
 def _validate_status(bundle: Mapping[str, object]) -> None:
     diagnostics = bundle.get("diagnostics")
-    candidates = [bundle]
-    if type(diagnostics) is dict:
-        candidates.append(diagnostics)
-    for value in candidates:
-        for name in ("status", "public_status"):
-            if name in value and _normalise_status(value[name]) != "complete":
-                _reject("DIAGNOSTICS_NOT_COMPLETE")
+    if diagnostics is not None:
+        value = _mapping(diagnostics, "DIAGNOSTICS_INVALID")
+        status = value.get("status", value.get("public_status"))
+    else:
+        status = bundle.get("status", bundle.get("public_status"))
+    if status is None:
+        _reject("DIAGNOSTICS_STATUS_REQUIRED")
+    if _normalise_status(status) != "complete":
+        _reject("DIAGNOSTICS_NOT_COMPLETE")
 
 
 def _validate_ticket_repository(ticket: Mapping[str, object]) -> None:
@@ -298,6 +307,75 @@ def _ticket_label_names(ticket: Mapping[str, object]) -> tuple[str, ...]:
         else:
             _reject("ROOT_TICKET_READBACK_INVALID")
     return tuple(names)
+
+
+def _ticket_contract_payload(
+    ticket: Mapping[str, object], code: str = "ROOT_TICKET_READBACK_INVALID"
+) -> dict[str, object]:
+    """Return Task 1's complete canonical Ticket contract readback."""
+
+    number = _positive_int(ticket.get("number"), code)
+    state = _text(ticket.get("state"), code)
+    labels = list(_ticket_label_names(ticket))
+    body = ticket.get("body")
+    if type(body) is not str:
+        _reject(code)
+
+    comments = _sequence(ticket.get("comments"), code)
+    comment_bodies: list[str] = []
+    for comment in comments:
+        if type(comment) is str:
+            comment_bodies.append(comment)
+        elif type(comment) is dict:
+            comment_bodies.append(_text(comment.get("body"), code))
+        else:
+            _reject(code)
+
+    if "blocked_by" in ticket:
+        blocked_values = ticket["blocked_by"]
+    elif "blockers" in ticket:
+        blocked_values = ticket["blockers"]
+    else:
+        _reject(code)
+    blocked_by = _sequence(blocked_values, code)
+    blocked_numbers: list[int] = []
+    for blocker in blocked_by:
+        if type(blocker) is int:
+            blocked_numbers.append(_positive_int(blocker, code))
+        elif type(blocker) is dict:
+            blocked_numbers.append(_positive_int(blocker.get("number"), code))
+        else:
+            _reject(code)
+
+    blocker_states_value = ticket.get("blocker_states")
+    if blocker_states_value is None:
+        if blocked_numbers:
+            _reject(code)
+        blocker_states: list[list[object]] = []
+    else:
+        blocker_states_raw = _sequence(blocker_states_value, code)
+        blocker_states = []
+        for state_value in blocker_states_raw:
+            if type(state_value) is dict:
+                blocker_number = _positive_int(state_value.get("number"), code)
+                blocker_state = _text(state_value.get("state"), code)
+            else:
+                state_pair = _sequence(state_value, code)
+                if len(state_pair) != 2:
+                    _reject(code)
+                blocker_number = _positive_int(state_pair[0], code)
+                blocker_state = _text(state_pair[1], code)
+            blocker_states.append([blocker_number, blocker_state])
+
+    return {
+        "number": number,
+        "state": state,
+        "labels": labels,
+        "body": body,
+        "comments": comment_bodies,
+        "blocked_by": blocked_numbers,
+        "blocker_states": blocker_states,
+    }
 
 
 def _ticket_is_unblocked(ticket: Mapping[str, object]) -> bool:
@@ -338,9 +416,7 @@ def _ticket_aliases(bundle: Mapping[str, object]) -> tuple[dict[str, str], tuple
             _reject("ROOT_TICKET_READBACK_INVALID")
         number = int(match.group(1))
         provided_number = ticket.get("number")
-        if provided_number is not None and (
-            type(provided_number) is not int or provided_number != number
-        ):
+        if type(provided_number) is not int or provided_number != number:
             _reject("ROOT_TICKET_READBACK_INVALID")
         if ticket_key in aliases or number in {
             int(item.split(":", 1)[1]) for item in aliases
@@ -352,7 +428,11 @@ def _ticket_aliases(bundle: Mapping[str, object]) -> tuple[dict[str, str], tuple
             _reject("ROOT_TICKET_NOT_READY")
         if not _ticket_is_unblocked(ticket):
             _reject("ROOT_TICKET_NOT_READY")
-        _text(ticket.get("contract_digest"), "ROOT_TICKET_READBACK_INVALID")
+        contract_digest = _text(
+            ticket.get("contract_digest"), "ROOT_TICKET_READBACK_INVALID"
+        )
+        if digest_value(_ticket_contract_payload(ticket)) != contract_digest:
+            _reject("TICKET_CONTRACT_DIGEST_MISMATCH")
         aliases[ticket_key] = key
         seen_keys.add(key)
         entries.append(ticket)
@@ -391,15 +471,20 @@ def _proof(bundle: Mapping[str, object]) -> dict[str, object]:
     return _mapping(bundle.get("proof"), "RECOVERY_PROOF_INCOMPLETE")
 
 
-def _proof_digest(proof: Mapping[str, object], *names: str) -> str | None:
+def _proof_digest(
+    proof: Mapping[str, object], *names: str, code: str
+) -> str | None:
     for name in names:
         value = proof.get(name)
+        if value is None:
+            continue
         if type(value) is str and value:
             return value
         if type(value) is dict:
             nested = _readback_digest(value, "digest", "receipt_digest")
             if nested:
                 return nested
+        _reject(code)
     return None
 
 
@@ -428,17 +513,38 @@ def _evidence_digest(
     code: str,
 ) -> str:
     value = bundle.get(field)
-    if value is None:
-        value = _proof_digest(proof, field)
+    top_digest: str | None = None
+    if value is not None:
+        if type(value) is str:
+            top_digest = _text(value, code)
+        elif type(value) is dict:
+            top_digest = _text(
+                _readback_digest(value, "digest", "receipt_digest"), code
+            )
+        else:
+            _reject(code)
+
+    proof_digest = _proof_digest(proof, field, evidence_name, code=code)
+    if top_digest is not None and proof_digest is not None and top_digest != proof_digest:
+        _reject(code)
+    value_digest = top_digest or proof_digest
     evidence = bundle.get(evidence_name)
-    if value is None and evidence is not None:
+    if value_digest is None and evidence is not None:
         evidence_mapping = _mapping(evidence, code)
-        value = _readback_digest(evidence_mapping, "digest", "receipt_digest")
-    result = _text(value, code)
+        value_digest = _readback_digest(evidence_mapping, "digest", "receipt_digest")
+    result = _text(value_digest, code)
     if evidence is not None:
         evidence_mapping = _mapping(evidence, code)
         embedded = _readback_digest(evidence_mapping, "digest", "receipt_digest")
         if embedded is not None and embedded != result:
+            _reject(code)
+    proof_evidence = proof.get(evidence_name)
+    if proof_evidence is not None:
+        proof_evidence_mapping = _mapping(proof_evidence, code)
+        embedded = _readback_digest(
+            proof_evidence_mapping, "digest", "receipt_digest"
+        )
+        if embedded is None or embedded != result:
             _reject(code)
     return result
 
@@ -460,6 +566,24 @@ def _validate_effects(proof: Mapping[str, object]) -> tuple[str, ...]:
         _reject("DUPLICATE_EFFECT")
     if duplicate_ids:
         _reject("DUPLICATE_EFFECT")
+    for field, ids in (
+        ("semantic_effect_records", semantic_ids),
+        ("external_effect_records", external_ids),
+    ):
+        records = _sequence(proof.get(field), "EFFECT_PROOF_INCOMPLETE")
+        record_ids: list[str] = []
+        for record in records:
+            mapping = _mapping(record, "EFFECT_PROOF_INCOMPLETE")
+            record_id = _text(
+                mapping.get("stable_action_id"), "EFFECT_PROOF_INCOMPLETE"
+            )
+            _text(
+                mapping.get("effect_digest", mapping.get("digest")),
+                "EFFECT_PROOF_INCOMPLETE",
+            )
+            record_ids.append(record_id)
+        if tuple(record_ids) != ids:
+            _reject("EFFECT_PROOF_INCOMPLETE")
     history = proof.get("effect_history")
     if history is not None:
         history_values = _sequence(history, "DUPLICATE_EFFECT")
@@ -494,7 +618,7 @@ def _normalise_proof_keys(value: object, aliases: Mapping[str, str], code: str) 
 
 def _validate_recovery_proof(
     proof: Mapping[str, object], aliases: Mapping[str, str]
-) -> tuple[int, bool, bool, bool, tuple[str, ...], tuple[str, ...]]:
+) -> tuple[int, bool, bool, bool, bool, tuple[str, ...], tuple[str, ...]]:
     limit = proof.get("worker_slot_limit")
     if limit is not None and (type(limit) is not int or limit != 4):
         _reject("WORKER_SLOT_PROOF_INVALID")
@@ -513,6 +637,7 @@ def _validate_recovery_proof(
     )
     if not pairs:
         _reject("PERMISSION_BINDING_MISMATCH")
+    permission_pairs: list[tuple[str, str]] = []
     for pair in pairs:
         values = _sequence(pair, "PERMISSION_BINDING_MISMATCH")
         if len(values) != 2:
@@ -521,6 +646,61 @@ def _validate_recovery_proof(
         after = _text(values[1], "PERMISSION_BINDING_MISMATCH")
         if before != after:
             _reject("PERMISSION_BINDING_MISMATCH")
+        permission_pairs.append((before, after))
+
+    permission_links = proof.get("permission_authorization_links")
+    permission_values = _sequence(
+        permission_links, "PERMISSION_AUTHORIZATION_INCOMPLETE"
+    )
+    if not permission_values:
+        _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
+    linked_permission_pairs: list[tuple[str, str]] = []
+    permission_link_records: list[tuple[str, str]] = []
+    permission_request_ids: set[str] = set()
+    for raw in permission_values:
+        link = _mapping(raw, "PERMISSION_AUTHORIZATION_INCOMPLETE")
+        ticket_ref = _text(
+            link.get("ticket_key"), "PERMISSION_AUTHORIZATION_INCOMPLETE"
+        )
+        ticket_key = _ticket_key_from_ref(ticket_ref)
+        if ticket_key in aliases:
+            ticket_key = aliases[ticket_key]
+        if ticket_key not in ROOT_TICKET_KEYS:
+            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
+        request_id = _text(
+            link.get("request_id", link.get("permission_request_id")),
+            "PERMISSION_AUTHORIZATION_INCOMPLETE",
+        )
+        if request_id in permission_request_ids:
+            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
+        permission_request_ids.add(request_id)
+        binding_id = _text(
+            link.get("binding_id"), "PERMISSION_AUTHORIZATION_INCOMPLETE"
+        )
+        before = _text(
+            link.get("before_binding_id", link.get("before")),
+            "PERMISSION_AUTHORIZATION_INCOMPLETE",
+        )
+        after = _text(
+            link.get("after_binding_id", link.get("after")),
+            "PERMISSION_AUTHORIZATION_INCOMPLETE",
+        )
+        _text(link.get("request_digest"), "PERMISSION_AUTHORIZATION_INCOMPLETE")
+        _text(
+            link.get("authorization_digest"),
+            "PERMISSION_AUTHORIZATION_INCOMPLETE",
+        )
+        if "authorized" in link and link["authorized"] is not True:
+            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
+        if binding_id != before or before != after:
+            _reject("PERMISSION_BINDING_MISMATCH")
+        linked_permission_pairs.append((before, after))
+        permission_link_records.append((ticket_key, binding_id))
+    if (
+        len(linked_permission_pairs) != len(permission_pairs)
+        or sorted(linked_permission_pairs) != sorted(permission_pairs)
+    ):
+        _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
     permission_same = True
 
     stale_values = _sequence(
@@ -540,13 +720,53 @@ def _validate_recovery_proof(
     if len(set(stale_ids)) != len(stale_ids):
         _reject("RECOVERY_BOUND_INVALID")
     diagnosed = proof.get("stale_diagnosed_binding_ids")
-    if diagnosed is not None:
-        diagnosed_ids = tuple(
-            _text(value, "RECOVERY_BOUND_INVALID")
-            for value in _sequence(diagnosed, "RECOVERY_BOUND_INVALID")
+    diagnosed_ids = tuple(
+        _text(value, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+        for value in _sequence(
+            diagnosed, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
         )
-        if set(diagnosed_ids) != set(stale_ids):
-            _reject("RECOVERY_BOUND_INVALID")
+    )
+    if (
+        len(diagnosed_ids) != len(stale_ids)
+        or len(set(diagnosed_ids)) != len(diagnosed_ids)
+        or set(diagnosed_ids) != set(stale_ids)
+    ):
+        _reject("RECOVERY_BOUND_INVALID")
+
+    stale_links = _sequence(
+        proof.get("stale_diagnosis_authorization_links"),
+        "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE",
+    )
+    linked_stale: set[str] = set()
+    stale_link_records: list[tuple[str, str]] = []
+    for raw in stale_links:
+        link = _mapping(raw, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+        ticket_ref = _text(
+            link.get("ticket_key"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
+        )
+        ticket_key = _ticket_key_from_ref(ticket_ref)
+        if ticket_key in aliases:
+            ticket_key = aliases[ticket_key]
+        if ticket_key not in ROOT_TICKET_KEYS:
+            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+        binding_id = _text(
+            link.get("binding_id"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
+        )
+        _text(link.get("diagnosis_id"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+        _text(
+            link.get("diagnosis_digest"),
+            "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE",
+        )
+        if link.get("authorized") is not True:
+            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+        linked_stale.add(binding_id)
+        stale_link_records.append((ticket_key, binding_id))
+    if (
+        len(stale_link_records) != len(stale_ids)
+        or len(linked_stale) != len(stale_link_records)
+        or linked_stale != set(stale_ids)
+    ):
+        _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
     stale_bounded = True
 
     binding_values = _sequence(
@@ -568,19 +788,108 @@ def _validate_recovery_proof(
     if set(counts) != set(ROOT_TICKET_KEYS):
         _reject("RECOVERY_BOUND_INVALID")
 
-    terminal = proof.get("terminal_replacement_receipt_digests", ())
+    binding_ids_values = _sequence(
+        proof.get("binding_ids_by_ticket"), "RECOVERY_BOUND_INVALID"
+    )
+    binding_ids_by_ticket: dict[str, tuple[str, ...]] = {}
+    for item in binding_ids_values:
+        pair = _sequence(item, "RECOVERY_BOUND_INVALID")
+        if len(pair) != 2:
+            _reject("RECOVERY_BOUND_INVALID")
+        key = _ticket_key_from_ref(pair[0])
+        if key in aliases:
+            key = aliases[key]
+        if key not in ROOT_TICKET_KEYS or key in binding_ids_by_ticket:
+            _reject("RECOVERY_BOUND_INVALID")
+        binding_ids = tuple(
+            _text(value, "RECOVERY_BOUND_INVALID")
+            for value in _sequence(pair[1], "RECOVERY_BOUND_INVALID")
+        )
+        if len(binding_ids) != counts[key] or len(set(binding_ids)) != len(binding_ids):
+            _reject("RECOVERY_BOUND_INVALID")
+        binding_ids_by_ticket[key] = binding_ids
+    if set(binding_ids_by_ticket) != set(ROOT_TICKET_KEYS):
+        _reject("RECOVERY_BOUND_INVALID")
+    for ticket_key, binding_id in permission_link_records:
+        if binding_id not in binding_ids_by_ticket[ticket_key]:
+            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
+    for ticket_key, binding_id in stale_link_records:
+        if binding_id not in binding_ids_by_ticket[ticket_key]:
+            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+    if not set(stale_ids).issubset(
+        {binding for values in binding_ids_by_ticket.values() for binding in values}
+    ):
+        _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
+
+    terminal = proof.get("terminal_replacement_receipt_digests")
     terminal_digests = tuple(
-        _text(value, "RECOVERY_BOUND_INVALID")
-        for value in _sequence(terminal, "RECOVERY_BOUND_INVALID")
+        _text(value, "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        for value in _sequence(
+            () if terminal is None else terminal,
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
     )
     if len(terminal_digests) > 1 or len(set(terminal_digests)) != len(terminal_digests):
-        _reject("RECOVERY_BOUND_INVALID")
+        _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+
+    terminal_links = _sequence(
+        proof.get("terminal_replacement_authorization_links"),
+        "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+    )
+    linked_terminal: list[str] = []
+    linked_terminal_tickets: set[str] = set()
+    for raw in terminal_links:
+        link = _mapping(raw, "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        ticket_ref = _text(
+            link.get("ticket_key"),
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
+        ticket_key = _ticket_key_from_ref(ticket_ref)
+        if ticket_key in aliases:
+            ticket_key = aliases[ticket_key]
+        if ticket_key not in ROOT_TICKET_KEYS:
+            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        old_binding = _text(
+            link.get("old_binding_id"),
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
+        new_binding = _text(
+            link.get("new_binding_id"),
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
+        _text(
+            link.get("terminal_binding_evidence_digest"),
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
+        replacement_digest = _text(
+            link.get("replacement_receipt_digest"),
+            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
+        )
+        if link.get("authorized") is not True or old_binding == new_binding:
+            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        if counts.get(ticket_key) != 2:
+            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        if old_binding not in binding_ids_by_ticket[ticket_key] or new_binding not in binding_ids_by_ticket[ticket_key]:
+            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        if replacement_digest in linked_terminal:
+            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        linked_terminal.append(replacement_digest)
+        linked_terminal_tickets.add(ticket_key)
+    expected_terminal_tickets = {
+        key for key, count in counts.items() if count == 2
+    }
+    if (
+        set(linked_terminal) != set(terminal_digests)
+        or linked_terminal_tickets != expected_terminal_tickets
+    ):
+        _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
     terminal_bounded = True
     return (
         peak,
         set(refill) == set(ROOT_TICKET_KEYS),
         permission_same,
-        stale_bounded and terminal_bounded,
+        stale_bounded,
+        terminal_bounded,
         terminal_digests,
         tuple(sorted(counts)),
     )
@@ -609,9 +918,7 @@ def _candidate_records(
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         if key in by_key:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        assurance = _text(
-            candidate.get("assurance"), "ASSURANCE_SHAPE_INVALID"
-        ).lower()
+        assurance = _candidate_assurance(candidate, key)
         expected = "strict" if key == STRICT_TICKET_KEY else "standard"
         if assurance != expected:
             _reject("ASSURANCE_SHAPE_INVALID")
@@ -621,22 +928,42 @@ def _candidate_records(
             "receipt_digest",
         )
         nested = candidate.get("candidate_receipt")
-        if nested is not None:
-            nested_mapping = _mapping(nested, "CANDIDATE_RECEIPT_INCOMPLETE")
-            nested_digest = _readback_digest(
-                nested_mapping, "candidate_receipt_digest", "receipt_digest"
-            )
-            if nested_digest is None:
-                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-            if digest is not None and digest != nested_digest:
-                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-            digest = nested_digest
+        nested_mapping = _mapping(nested, "CANDIDATE_RECEIPT_INCOMPLETE")
+        nested_digest = _readback_digest(
+            nested_mapping, "candidate_receipt_digest", "receipt_digest"
+        )
+        if nested_digest is None:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if digest is not None and digest != nested_digest:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        digest = nested_digest
         if digest is None:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         by_key[key] = candidate
     if set(by_key) != set(ROOT_TICKET_KEYS):
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     return tuple(by_key[key] for key in ROOT_TICKET_KEYS)
+
+
+def _candidate_assurance(candidate: Mapping[str, object], key: str) -> str:
+    """Read semantic assurance and bind it to the manifest's delta key."""
+
+    expected = "strict" if key == STRICT_TICKET_KEY else "standard"
+    records: list[Mapping[str, object]] = [candidate]
+    for name in ("candidate_receipt", "accepted_candidate_receipt"):
+        value = candidate.get(name)
+        if value is not None:
+            records.append(_mapping(value, "ASSURANCE_SHAPE_INVALID"))
+    for record in records:
+        value = record.get("assurance")
+        if value is None:
+            requirement = record.get("assurance_requirement")
+            if type(requirement) is dict:
+                value = requirement.get("mode")
+        if value is not None:
+            if _text(value, "ASSURANCE_SHAPE_INVALID").lower() != expected:
+                _reject("ASSURANCE_SHAPE_INVALID")
+    return expected
 
 
 def _validate_candidate_links(
@@ -648,35 +975,47 @@ def _validate_candidate_links(
     policy_witness_digest: str,
 ) -> None:
     for candidate in candidates:
-        nested = candidate.get("candidate_receipt")
-        if nested is not None:
-            receipt = _mapping(nested, "CANDIDATE_RECEIPT_INCOMPLETE")
-            for field, expected in (
-                ("repository", repository),
-                ("campaign_key", campaign_key),
-                ("plan_revision_digest", plan_revision_digest),
-            ):
-                actual = receipt.get(field)
-                if actual is not None and actual != expected:
-                    _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-            candidate_digest = _readback_digest(
-                candidate, "candidate_receipt_digest", "receipt_digest"
-            )
-            if _readback_digest(receipt, "receipt_digest") != candidate_digest:
+        receipt = _mapping(
+            candidate.get("candidate_receipt"), "CANDIDATE_RECEIPT_INCOMPLETE"
+        )
+        candidate_ticket = _text(
+            candidate.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE"
+        )
+        for field, expected in (
+            ("repository", repository),
+            ("campaign_key", campaign_key),
+            ("plan_revision_digest", plan_revision_digest),
+            ("ticket_key", candidate_ticket),
+            ("policy_witness_digest", policy_witness_digest),
+        ):
+            if receipt.get(field) != expected:
                 _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        candidate_digest = _readback_digest(
+            candidate, "candidate_receipt_digest", "receipt_digest"
+        )
+        if _readback_digest(receipt, "receipt_digest") != candidate_digest:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
 
     for key, accepted_receipt in accepted.items():
         for field, expected, code in (
+            ("repository", repository, "CANDIDATE_RECEIPT_INCOMPLETE"),
             ("campaign_key", campaign_key, "CANDIDATE_RECEIPT_INCOMPLETE"),
             ("plan_revision_digest", plan_revision_digest, "CANDIDATE_RECEIPT_INCOMPLETE"),
             ("policy_witness_digest", policy_witness_digest, "POLICY_EVIDENCE_INCOMPLETE"),
         ):
             actual = accepted_receipt.get(field)
-            if actual is not None and actual != expected:
+            if actual != expected:
                 _reject(code)
-        authority = accepted_receipt.get("authority_subtree_digest")
-        if authority is not None:
-            _text(authority, "AUTHORITY_EVIDENCE_INCOMPLETE")
+        _text(
+            accepted_receipt.get("authority_subtree_digest"),
+            "AUTHORITY_EVIDENCE_INCOMPLETE",
+        )
+        expected_ticket = _text(
+            candidates[ROOT_TICKET_KEYS.index(key)].get("ticket_key"),
+            "CANDIDATE_RECEIPT_INCOMPLETE",
+        )
+        if accepted_receipt.get("ticket_key") != expected_ticket:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         candidate_digest = _readback_digest(
             accepted_receipt,
             "candidate_receipt_digest",
@@ -692,6 +1031,16 @@ def _validate_candidate_links(
             _reject("FINDING_LEDGER_INCOMPLETE")
         if key not in ROOT_TICKET_KEYS:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        nested_accepted = candidates[ROOT_TICKET_KEYS.index(key)].get(
+            "accepted_candidate_receipt"
+        )
+        nested_mapping = _mapping(
+            nested_accepted, "CANDIDATE_RECEIPT_INCOMPLETE"
+        )
+        if canonical_json_bytes(nested_mapping) != canonical_json_bytes(
+            accepted_receipt
+        ):
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
 
 
 def _review_records(
@@ -701,20 +1050,7 @@ def _review_records(
 ) -> tuple[dict[str, object], ...]:
     raw_reviews = bundle.get("reviews")
     if raw_reviews is None:
-        if set(accepted) != set(ROOT_TICKET_KEYS):
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        raw_reviews = [
-            {
-                "ticket_key": ticket_key,
-                "open_finding_ids": [],
-                "finding_ledger_digest": _readback_digest(
-                    accepted[ticket_key],
-                    "review_finding_ledger_digest",
-                    "finding_ledger_digest",
-                ),
-            }
-            for ticket_key in ROOT_TICKET_KEYS
-        ]
+        _reject("FINDING_LEDGER_INCOMPLETE")
     values = _sequence(raw_reviews, "FINDING_LEDGER_INCOMPLETE")
     if len(values) != 4:
         _reject("FINDING_LEDGER_INCOMPLETE")
@@ -746,15 +1082,33 @@ def _review_records(
         )
         if finding_digest is None:
             _reject("FINDING_LEDGER_INCOMPLETE")
+        expected_finding = _readback_digest(
+            accepted.get(key, {}),
+            "review_finding_ledger_digest",
+            "finding_ledger_digest",
+        )
+        if expected_finding is None or finding_digest != expected_finding:
+            _reject("FINDING_LEDGER_INCOMPLETE")
         candidate_digest = _readback_digest(
             review, "candidate_receipt_digest", "candidate_digest"
         )
-        if candidate_digest is not None:
-            expected = _readback_digest(
-                accepted.get(key, {}), "candidate_receipt_digest", "receipt_digest"
-            )
-            if expected is not None and candidate_digest != expected:
-                _reject("FINDING_LEDGER_INCOMPLETE")
+        expected = _readback_digest(
+            accepted.get(key, {}), "candidate_receipt_digest", "receipt_digest"
+        )
+        if candidate_digest is None or expected is None or candidate_digest != expected:
+            _reject("FINDING_LEDGER_INCOMPLETE")
+        ledger = _mapping(
+            review.get("finding_ledger"), "FINDING_LEDGER_INCOMPLETE"
+        )
+        if (
+            ledger.get("ticket_key") != ticket_ref
+            or ledger.get("candidate_receipt_digest") != candidate_digest
+            or _readback_digest(ledger, "ledger_digest", "digest") != finding_digest
+        ):
+            _reject("FINDING_LEDGER_INCOMPLETE")
+        ledger_open = ledger.get("open_finding_ids", ledger.get("open_findings"))
+        if type(ledger_open) not in {list, tuple} or ledger_open:
+            _reject("FINDING_LEDGER_INCOMPLETE")
         by_key[key] = review
     if set(by_key) != set(ROOT_TICKET_KEYS):
         _reject("FINDING_LEDGER_INCOMPLETE")
@@ -867,7 +1221,10 @@ def _integration_readback(batch: Mapping[str, object]) -> None:
 
 
 def _target_readback(
-    batch: Mapping[str, object], batch_sha: str, expected_target_sha: str | None
+    batch: Mapping[str, object],
+    batch_sha: str,
+    pull_request_number: int,
+    expected_target_sha: str | None,
 ) -> str:
     target = batch.get("target_readback")
     if target is None:
@@ -881,6 +1238,12 @@ def _target_readback(
             "remote_target_sha": batch.get(
                 "remote_target_sha", batch.get("target_head_sha")
             ),
+            "pull_request_number": batch.get("pull_request_number"),
+            "pull_request_head_sha": batch.get("pull_request_head_sha"),
+            "pull_request_merge_target_sha": batch.get(
+                "pull_request_merge_target_sha"
+            ),
+            "merge_commit_sha": batch.get("integrated_target_sha"),
         }
         target = direct
     mapping = _mapping(target, "TARGET_SHA_INCOMPLETE")
@@ -895,6 +1258,17 @@ def _target_readback(
         "remote_target_sha", mapping.get("target_head_sha")
     )
     remote_target = _text(remote_target, "TARGET_SHA_INCOMPLETE")
+    target_pr_number = mapping.get(
+        "pull_request_number", mapping.get("pr_number")
+    )
+    if target_pr_number != pull_request_number:
+        _reject("TARGET_SHA_MISMATCH")
+    if mapping.get("pull_request_head_sha") != batch_sha:
+        _reject("TARGET_SHA_MISMATCH")
+    if mapping.get("pull_request_merge_target_sha") != remote_target:
+        _reject("TARGET_SHA_MISMATCH")
+    if mapping.get("merge_commit_sha") != remote_target:
+        _reject("TARGET_SHA_MISMATCH")
     integrated = batch.get("integrated_target_sha")
     if integrated is not None and integrated != remote_target:
         _reject("TARGET_SHA_MISMATCH")
@@ -908,6 +1282,8 @@ def _target_readback(
 def _batch_records(
     bundle: Mapping[str, object],
     aliases: Mapping[str, str],
+    campaign_key: str,
+    plan_revision_digest: str,
     expected_target_sha: str | None,
 ) -> tuple[VerifiedBatch, VerifiedBatch]:
     raw_batches = _sequence(bundle.get("batches"), "BATCH_READBACK_INCOMPLETE")
@@ -943,6 +1319,12 @@ def _batch_records(
             _reject("BATCH_MEMBERS_INVALID")
         batch_id = _text(batch.get("batch_id"), "BATCH_READBACK_INCOMPLETE")
         batch_sha = _text(batch.get("batch_sha"), "BATCH_READBACK_INCOMPLETE")
+        if (
+            batch.get("repository") != ROOT_REPOSITORY
+            or batch.get("campaign_key") != campaign_key
+            or batch.get("plan_revision_digest") != plan_revision_digest
+        ):
+            _reject("BATCH_READBACK_INCOMPLETE")
         for section_name in (
             "local_suite",
             "local_check",
@@ -982,23 +1364,156 @@ def _batch_records(
         pull_request_number = _pull_request_readback(batch, batch_sha)
         hosted_run_id = _hosted_readback(batch, batch_sha)
         _integration_readback(batch)
-        _target_readback(batch, batch_sha, expected_target_sha)
+        target_sha = _target_readback(
+            batch, batch_sha, pull_request_number, expected_target_sha
+        )
         by_kind[kind] = VerifiedBatch(
             batch_id=batch_id,
             member_count=len(normalised_members),
             pull_request_number=pull_request_number,
             hosted_run_id=hosted_run_id,
             batch_sha=batch_sha,
+            target_sha=target_sha,
             receipt_digest=receipt_digest,
         )
     if set(by_kind) != {"multi", "singleton"}:
         _reject("BATCH_READBACK_INCOMPLETE")
     if (
-        by_kind["multi"].pull_request_number == by_kind["singleton"].pull_request_number
+        by_kind["multi"].batch_id == by_kind["singleton"].batch_id
+        or by_kind["multi"].batch_sha == by_kind["singleton"].batch_sha
+        or by_kind["multi"].receipt_digest == by_kind["singleton"].receipt_digest
+        or by_kind["multi"].target_sha == by_kind["singleton"].target_sha
+        or by_kind["multi"].pull_request_number
+        == by_kind["singleton"].pull_request_number
         or by_kind["multi"].hosted_run_id == by_kind["singleton"].hosted_run_id
     ):
         _reject("BATCH_BOUNDARY_COLLAPSED")
     return by_kind["multi"], by_kind["singleton"]
+
+
+def _validate_batch_crosslinks(
+    bundle: Mapping[str, object],
+    aliases: Mapping[str, str],
+    candidates: tuple[dict[str, object], ...],
+    reviews: tuple[dict[str, object], ...],
+) -> None:
+    candidate_by_key: dict[str, str] = {}
+    for candidate in candidates:
+        ref = _text(candidate.get("ticket_key"), "BATCH_READBACK_INCOMPLETE")
+        key = aliases.get(ref, ref)
+        digest = _readback_digest(
+            candidate, "candidate_receipt_digest", "receipt_digest"
+        )
+        if key not in ROOT_TICKET_KEYS or digest is None:
+            _reject("BATCH_READBACK_INCOMPLETE")
+        if key in candidate_by_key:
+            _reject("BATCH_READBACK_INCOMPLETE")
+        candidate_by_key[key] = digest
+    finding_by_key: dict[str, str] = {}
+    for review in reviews:
+        ref = _text(review.get("ticket_key"), "BATCH_READBACK_INCOMPLETE")
+        key = aliases.get(ref, ref)
+        digest = _readback_digest(
+            review,
+            "finding_ledger_digest",
+            "review_finding_ledger_digest",
+            "ledger_digest",
+        )
+        if key not in ROOT_TICKET_KEYS or digest is None:
+            _reject("BATCH_READBACK_INCOMPLETE")
+        if key in finding_by_key:
+            _reject("BATCH_READBACK_INCOMPLETE")
+        finding_by_key[key] = digest
+
+    raw_batches = _sequence(bundle.get("batches"), "BATCH_READBACK_INCOMPLETE")
+    for raw in raw_batches:
+        batch = _mapping(raw, "BATCH_READBACK_INCOMPLETE")
+        members = _sequence(
+            batch.get("member_ticket_keys"), "BATCH_MEMBERS_INVALID"
+        )
+        keys: list[str] = []
+        for member in members:
+            ref = _ticket_key_from_ref(member)
+            key = aliases.get(ref, ref)
+            if key not in ROOT_TICKET_KEYS:
+                _reject("BATCH_MEMBERS_INVALID")
+            keys.append(key)  # type: ignore[arg-type]
+        expected_candidates = [candidate_by_key[key] for key in keys]
+        actual_candidates = _sequence(
+            batch.get("candidate_receipt_digests"),
+            "BATCH_READBACK_INCOMPLETE",
+        )
+        if tuple(actual_candidates) != tuple(expected_candidates):
+            _reject("BATCH_READBACK_INCOMPLETE")
+        expected_findings = [finding_by_key[key] for key in keys]
+        actual_findings = _sequence(
+            batch.get("finding_ledger_digests"), "BATCH_READBACK_INCOMPLETE"
+        )
+        if tuple(actual_findings) != tuple(expected_findings):
+            _reject("BATCH_READBACK_INCOMPLETE")
+
+
+def _authoritative_evidence(
+    bundle: Mapping[str, object],
+    proof: Mapping[str, object],
+    tickets: tuple[dict[str, object], ...],
+    candidates: tuple[dict[str, object], ...],
+    accepted: Mapping[str, dict[str, object]],
+    reviews: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    """Capture the complete readbacks covered by the acceptance digest."""
+
+    raw_batches = _sequence(bundle.get("batches"), "BATCH_READBACK_INCOMPLETE")
+    batches = [
+        _mapping(value, "BATCH_READBACK_INCOMPLETE") for value in raw_batches
+    ]
+    target_readbacks: list[dict[str, object]] = []
+    for batch in batches:
+        target = batch.get("target_readback", batch.get("target"))
+        if target is None:
+            target = {
+                "merge_method": batch.get("merge_method"),
+                "batch_sha_is_ancestor": batch.get(
+                    "batch_sha_is_ancestor", batch.get("target_contains_batch_sha")
+                ),
+                "remote_target_sha": batch.get(
+                    "remote_target_sha", batch.get("target_head_sha")
+                ),
+                "pull_request_number": batch.get("pull_request_number"),
+                "pull_request_head_sha": batch.get("pull_request_head_sha"),
+                "pull_request_merge_target_sha": batch.get(
+                    "pull_request_merge_target_sha"
+                ),
+                "merge_commit_sha": batch.get("integrated_target_sha"),
+            }
+        target_readbacks.append(_mapping(target, "TARGET_SHA_INCOMPLETE"))
+    return {
+        "tickets": copy.deepcopy(list(tickets)),
+        "candidates": copy.deepcopy(list(candidates)),
+        "accepted_candidate_receipts": copy.deepcopy(
+            [accepted[key] for key in ROOT_TICKET_KEYS]
+        ),
+        "reviews": copy.deepcopy(list(reviews)),
+        "batches": copy.deepcopy(batches),
+        "target_readbacks": copy.deepcopy(target_readbacks),
+        "recovery": copy.deepcopy(dict(proof)),
+        "effects": copy.deepcopy(
+            {
+                "semantic_effect_ids": proof.get("semantic_effect_ids"),
+                "external_effect_ids": proof.get("external_effect_ids"),
+                "semantic_effect_records": proof.get("semantic_effect_records"),
+                "external_effect_records": proof.get("external_effect_records"),
+                "duplicate_effect_ids": proof.get("duplicate_effect_ids"),
+                "effect_history": proof.get("effect_history"),
+            }
+        ),
+        "policy_witness": copy.deepcopy(bundle.get("policy_witness")),
+        "authority_root": copy.deepcopy(bundle.get("authority_root")),
+        "runtime_selector": copy.deepcopy(bundle.get("runtime_selector")),
+        "fault_journal": copy.deepcopy(bundle.get("fault_journal")),
+        "diagnostics": copy.deepcopy(bundle.get("diagnostics")),
+        "result_integrities": copy.deepcopy(bundle.get("result_integrities")),
+    }
 
 
 def _accepted_candidate_records(
@@ -1008,7 +1523,7 @@ def _accepted_candidate_records(
 ) -> dict[str, dict[str, object]]:
     raw_values = bundle.get("accepted_candidate_receipts")
     if raw_values is None:
-        return {}
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     values = _sequence(raw_values, "CANDIDATE_RECEIPT_INCOMPLETE")
     if len(values) != 4:
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
@@ -1046,6 +1561,8 @@ def _accepted_candidate_records(
         )
         if ledger is None:
             _reject("FINDING_LEDGER_INCOMPLETE")
+        if item.get("ticket_key") != candidate_by_key[key].get("ticket_key"):
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         accepted[key] = item
     if set(accepted) != set(ROOT_TICKET_KEYS):
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
@@ -1064,6 +1581,15 @@ def _validate_result_integrity(
     if len(values) != 4:
         _reject("BATCH_READBACK_INCOMPLETE")
     batch_by_id = {batch.batch_id: batch for batch in batches}
+    accepted_digests = {
+        _readback_digest(value, "candidate_receipt_digest", "receipt_digest")
+        for value in _sequence(
+            bundle.get("accepted_candidate_receipts"),
+            "BATCH_READBACK_INCOMPLETE",
+        )
+    }
+    if None in accepted_digests:
+        _reject("BATCH_READBACK_INCOMPLETE")
     seen: set[str] = set()
     for raw in values:
         result = _mapping(raw, "BATCH_READBACK_INCOMPLETE")
@@ -1072,6 +1598,8 @@ def _validate_result_integrity(
             "BATCH_READBACK_INCOMPLETE",
         )
         if accepted_digest in seen:
+            _reject("BATCH_READBACK_INCOMPLETE")
+        if accepted_digest not in accepted_digests:
             _reject("BATCH_READBACK_INCOMPLETE")
         seen.add(accepted_digest)
         batch_id = _text(result.get("batch_id"), "BATCH_READBACK_INCOMPLETE")
@@ -1116,23 +1644,38 @@ def _merge_ticket_manifest(
     manifest_tickets = manifest.get("tickets")
     if manifest_tickets is None:
         _reject("ROOT_TICKET_MANIFEST_INVALID")
+    manifest_values = _sequence(manifest_tickets, "ROOT_TICKET_MANIFEST_INVALID")
     merged = dict(bundle)
     existing = bundle.get("tickets")
     if existing is not None:
         existing_values = _sequence(existing, "TICKET_READBACK_MISMATCH")
-        manifest_values = _sequence(manifest_tickets, "ROOT_TICKET_MANIFEST_INVALID")
         if len(existing_values) != len(manifest_values):
             _reject("TICKET_READBACK_MISMATCH")
         for left, right in zip(existing_values, manifest_values, strict=True):
             left_mapping = _mapping(left, "TICKET_READBACK_MISMATCH")
             right_mapping = _mapping(right, "TICKET_READBACK_MISMATCH")
-            for field in ("key", "ticket_key", "contract_digest"):
-                if left_mapping.get(field) != right_mapping.get(field):
-                    _reject("TICKET_READBACK_MISMATCH")
+            try:
+                left_digest = digest_value(left_mapping)
+                right_digest = digest_value(right_mapping)
+                _ticket_contract_payload(left_mapping, "TICKET_READBACK_MISMATCH")
+                _ticket_contract_payload(right_mapping, "TICKET_READBACK_MISMATCH")
+            except RootCanaryVerificationError as error:
+                if error.code == "TICKET_READBACK_MISMATCH":
+                    raise
+                _reject("TICKET_READBACK_MISMATCH")
+            if left_digest != right_digest:
+                _reject("TICKET_READBACK_MISMATCH")
     merged["repository"] = repository
-    merged["tickets"] = manifest_tickets
+    # Keep the already-read diagnostics projection.  The Task 1 manifest is a
+    # second authoritative readback, not a lossy replacement for it.
+    merged["tickets"] = list(existing_values) if existing is not None else manifest_tickets
     ready_refs = manifest.get("ready_refs")
     if ready_refs is not None:
+        if "ready_refs" in bundle:
+            if canonical_json_bytes(bundle["ready_refs"]) != canonical_json_bytes(
+                ready_refs
+            ):
+                _reject("TICKET_READBACK_MISMATCH")
         merged["ready_refs"] = ready_refs
     return merged
 
@@ -1141,45 +1684,65 @@ def _adapt_current_readback_shape(bundle: dict[str, object]) -> dict[str, object
     """Flatten the current inspect/evidence projection without inventing proof."""
 
     facts = bundle.get("facts")
-    facts_mapping = facts if type(facts) is dict else {}
+    facts_mapping = (
+        {} if facts is None else _mapping(facts, "DIAGNOSTICS_INVALID")
+    )
     readback = bundle.get("readback")
     if readback is None:
         readback = facts_mapping.get("readback")
-    readback_mapping = readback if type(readback) is dict else {}
+    readback_mapping = (
+        {} if readback is None else _mapping(readback, "DIAGNOSTICS_INVALID")
+    )
 
     campaign = bundle.get("campaign")
-    if type(campaign) is dict:
+    if campaign is not None:
+        campaign = _mapping(campaign, "DIAGNOSTICS_INVALID")
         bundle.setdefault("campaign_key", campaign.get("campaign_key"))
         bundle.setdefault("repository", campaign.get("repository"))
     facts_campaign = facts_mapping.get("campaign")
-    if type(facts_campaign) is dict:
+    if facts_campaign is not None:
+        facts_campaign = _mapping(facts_campaign, "DIAGNOSTICS_INVALID")
         bundle.setdefault("campaign_key", facts_campaign.get("campaign_key"))
     plan_revision = facts_mapping.get("plan_revision")
-    if type(plan_revision) is dict:
+    if plan_revision is not None:
+        plan_revision = _mapping(plan_revision, "DIAGNOSTICS_INVALID")
         bundle.setdefault("plan_revision_digest", plan_revision.get("digest"))
 
     accepted_values = readback_mapping.get("accepted_candidate_receipts")
     accepted_by_ticket: dict[str, dict[str, object]] = {}
-    if type(accepted_values) in {list, tuple}:
-        for value in accepted_values:
-            if type(value) is dict and type(value.get("ticket_key")) is str:
-                accepted_by_ticket[value["ticket_key"]] = value
+    if accepted_values is not None:
+        for raw_value in _sequence(accepted_values, "DIAGNOSTICS_INVALID"):
+            value = _mapping(raw_value, "DIAGNOSTICS_INVALID")
+            ticket_key = _text(value.get("ticket_key"), "DIAGNOSTICS_INVALID")
+            if ticket_key in accepted_by_ticket:
+                _reject("DIAGNOSTICS_INVALID")
+            accepted_by_ticket[ticket_key] = value
     candidate_values = readback_mapping.get("candidate_receipts")
-    if "candidates" not in bundle and type(candidate_values) in {list, tuple}:
+    candidate_readbacks: tuple[dict[str, object], ...] | None = None
+    if candidate_values is not None:
+        candidate_readbacks = tuple(
+            _mapping(raw_value, "DIAGNOSTICS_INVALID")
+            for raw_value in _sequence(candidate_values, "DIAGNOSTICS_INVALID")
+        )
+    if candidate_readbacks is not None and "candidates" not in bundle:
         candidates: list[dict[str, object]] = []
-        for value in candidate_values:
-            if type(value) is not dict:
-                continue
+        for value in candidate_readbacks:
             ticket_key = value.get("ticket_key")
             accepted = accepted_by_ticket.get(ticket_key, {})
             candidates.append(
                 {
                     "ticket_key": ticket_key,
-                    "assurance": (
-                        "strict" if ticket_key == "issue:104" else "standard"
-                    ),
                     "candidate_receipt_digest": value.get("receipt_digest"),
                     "candidate_receipt": value,
+                    **(
+                        {"assurance": value["assurance"]}
+                        if value.get("assurance") is not None
+                        else (
+                            {"assurance": accepted["assurance"]}
+                            if accepted.get("assurance") is not None
+                            else {}
+                        )
+                    ),
                     **(
                         {"diff_record_digest": value.get("diff_record_digest")}
                         if value.get("diff_record_digest") is not None
@@ -1194,7 +1757,9 @@ def _adapt_current_readback_shape(bundle: dict[str, object]) -> dict[str, object
             )
         bundle["candidates"] = candidates
     if "accepted_candidate_receipts" not in bundle and accepted_values is not None:
-        bundle["accepted_candidate_receipts"] = accepted_values
+        bundle["accepted_candidate_receipts"] = list(
+            _sequence(accepted_values, "DIAGNOSTICS_INVALID")
+        )
     if "reviews" not in bundle and accepted_by_ticket:
         bundle["reviews"] = [
             {
@@ -1209,17 +1774,32 @@ def _adapt_current_readback_shape(bundle: dict[str, object]) -> dict[str, object
 
     current_batches = facts_mapping.get("batches")
     delivery_values = readback_mapping.get("delivery_proofs")
-    if "batches" not in bundle and type(current_batches) in {list, tuple}:
+    if delivery_values is not None:
+        delivery_values = _sequence(delivery_values, "DIAGNOSTICS_INVALID")
+    if current_batches is not None and "batches" not in bundle:
+        current_batches = _sequence(current_batches, "DIAGNOSTICS_INVALID")
         proofs_by_batch: dict[object, dict[str, object]] = {}
-        if type(delivery_values) in {list, tuple}:
-            for value in delivery_values:
-                if type(value) is dict and value.get("batch_id") not in proofs_by_batch:
-                    proofs_by_batch[value.get("batch_id")] = value
+        if delivery_values is not None:
+            for raw_value in delivery_values:
+                value = _mapping(raw_value, "DIAGNOSTICS_INVALID")
+                batch_id = _text(value.get("batch_id"), "DIAGNOSTICS_INVALID")
+                if batch_id in proofs_by_batch:
+                    _reject("DIAGNOSTICS_INVALID")
+                proofs_by_batch[batch_id] = value
         batches: list[dict[str, object]] = []
-        for value in current_batches:
-            if type(value) is not dict:
-                continue
-            proof = proofs_by_batch.get(value.get("batch_id"), {})
+        for raw_value in current_batches:
+            value = _mapping(raw_value, "DIAGNOSTICS_INVALID")
+            batch_id = _text(value.get("batch_id"), "DIAGNOSTICS_INVALID")
+            proof = proofs_by_batch.get(batch_id, {})
+            member_ticket_keys = _sequence(
+                value.get("member_ticket_keys"), "DIAGNOSTICS_INVALID"
+            )
+            finding_digests = [
+                accepted_by_ticket.get(ticket_key, {}).get(
+                    "review_finding_ledger_digest"
+                )
+                for ticket_key in member_ticket_keys
+            ]
             delivery_digests = value.get("delivery_receipt_digests")
             receipt_digest = (
                 delivery_digests[0]
@@ -1229,14 +1809,24 @@ def _adapt_current_readback_shape(bundle: dict[str, object]) -> dict[str, object
             batch = {
                 "batch_kind": value.get("group"),
                 "batch_id": value.get("batch_id"),
-                "member_ticket_keys": value.get("member_ticket_keys"),
+                "repository": bundle.get("repository"),
+                "campaign_key": bundle.get("campaign_key"),
+                "plan_revision_digest": bundle.get("plan_revision_digest"),
+                "member_ticket_keys": list(member_ticket_keys),
+                "candidate_receipt_digests": value.get(
+                    "candidate_receipt_digests"
+                ),
+                "finding_ledger_digests": value.get(
+                    "finding_ledger_digests", finding_digests
+                ),
                 "batch_sha": value.get("batch_sha"),
                 "local_check_receipt_digest": proof.get(
                     "local_check_receipt_digest"
                 ),
-                "pull_request": {
+                    "pull_request": {
                     "number": proof.get("pull_request_number"),
                     "head_sha": proof.get("pull_request_head_sha"),
+                    "repository": bundle.get("repository"),
                 },
                 "hosted_result_receipt_digest": proof.get(
                     "hosted_result_receipt_digest"
@@ -1248,6 +1838,13 @@ def _adapt_current_readback_shape(bundle: dict[str, object]) -> dict[str, object
                         "target_contains_batch_sha"
                     ),
                     "remote_target_sha": proof.get("target_head_sha"),
+                    "target_branch": proof.get("target_branch"),
+                    "pull_request_number": proof.get("pull_request_number"),
+                    "pull_request_head_sha": proof.get("pull_request_head_sha"),
+                    "pull_request_merge_target_sha": proof.get(
+                        "pull_request_merge_target_sha"
+                    ),
+                    "merge_commit_sha": proof.get("target_head_sha"),
                 },
                 "integrated_target_sha": proof.get("target_head_sha"),
                 "receipt_digest": receipt_digest,
@@ -1261,12 +1858,19 @@ def _bundle_from_diagnostics(raw: Mapping[str, object]) -> dict[str, object]:
     acceptance_bundle = raw.get("acceptance_bundle")
     if acceptance_bundle is not None:
         bundle = dict(_mapping(acceptance_bundle, "ACCEPTANCE_BUNDLE_INVALID"))
+        if "diagnostics" not in bundle and (
+            "status" in raw or "public_status" in raw or "proof" in raw
+        ):
+            bundle["diagnostics"] = {
+                "status": raw.get("status", raw.get("public_status")),
+                "proof": raw.get("proof"),
+            }
     else:
         bundle = dict(raw)
     return _adapt_current_readback_shape(bundle)
 
 
-def verify_root_canary(
+def _verify_root_canary(
     bundle: Mapping[str, object],
     *,
     expected_target_sha: str | None = None,
@@ -1362,13 +1966,24 @@ def verify_root_canary(
     if any(not digest for _key, digest in finding_digests):
         _reject("FINDING_LEDGER_INCOMPLETE")
 
-    peak, refill_proven, permission_same, recovery_bounded, terminal_digests, _ = (
-        _validate_recovery_proof(proof, aliases)
-    )
+    (
+        peak,
+        refill_proven,
+        permission_same,
+        stale_bounded,
+        terminal_bounded,
+        terminal_digests,
+        _,
+    ) = _validate_recovery_proof(proof, aliases)
     duplicate_effect_ids = _validate_effects(proof)
     standard_batch, strict_batch = _batch_records(
-        bundle, aliases, expected_target_sha
+        bundle,
+        aliases,
+        campaign_key,
+        plan_revision_digest,
+        expected_target_sha,
     )
+    _validate_batch_crosslinks(bundle, aliases, candidates, reviews)
     _validate_result_integrity(bundle, aliases, (standard_batch, strict_batch))
 
     proof_candidate_digests = _proof_digest_values(
@@ -1405,6 +2020,9 @@ def verify_root_canary(
         ("multi", standard_batch.receipt_digest),
         ("singleton", strict_batch.receipt_digest),
     )
+    authoritative_evidence = _authoritative_evidence(
+        bundle, proof, tickets, candidates, accepted, reviews
+    )
 
     receipt = RootCanaryAcceptanceReceiptV1(
         repository=repository,
@@ -1419,8 +2037,8 @@ def verify_root_canary(
         peak_worker_slots=peak,
         refill_proven=refill_proven,
         permission_same_binding=permission_same,
-        stale_diagnosis_bounded=recovery_bounded,
-        terminal_replacement_bounded=recovery_bounded,
+        stale_diagnosis_bounded=stale_bounded,
+        terminal_replacement_bounded=terminal_bounded,
         terminal_replacement_receipt_digests=terminal_digests,
         duplicate_effect_ids=duplicate_effect_ids,
         ticket_contract_digests=ticket_contract_digests,
@@ -1432,9 +2050,27 @@ def verify_root_canary(
         batch_receipt_digests=batch_receipt_digests,
         fault_journal_digest=fault_journal_digest,
         canary_target_sha=canary_target_sha,
+        authoritative_evidence=authoritative_evidence,
         receipt_digest="",
     )
     return replace(receipt, receipt_digest=digest_value(receipt.canonical_digest_payload()))
+
+
+def verify_root_canary(
+    bundle: Mapping[str, object],
+    *,
+    expected_target_sha: str | None = None,
+) -> RootCanaryAcceptanceReceiptV1:
+    """Verify a bundle and turn malformed nested data into a named rejection."""
+
+    try:
+        return _verify_root_canary(
+            bundle, expected_target_sha=expected_target_sha
+        )
+    except RootCanaryVerificationError:
+        raise
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+        raise RootCanaryVerificationError("ACCEPTANCE_BUNDLE_INVALID") from error
 
 
 def write_acceptance_document(
@@ -1469,6 +2105,7 @@ def write_acceptance_document(
         "terminal_replacement_receipt_digests": receipt.terminal_replacement_receipt_digests,
         "duplicate_effect_ids": receipt.duplicate_effect_ids,
         "canary_target_sha": receipt.canary_target_sha,
+        "authoritative_evidence": receipt.authoritative_evidence,
         "receipt_digest": receipt.receipt_digest,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
