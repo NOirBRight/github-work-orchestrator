@@ -1,0 +1,16 @@
+{
+  "schema": "gwo-v8-root-policy.v1",
+  "assurance": {
+    "standard_path_prefixes": [
+      "docs/canary/"
+    ],
+    "strict_path_prefixes": [
+      "docs/canary/protected/"
+    ]
+  },
+  "delivery": {
+    "target_branch": "main",
+    "batch_member_limit": 4,
+    "strict_requires_singleton": true
+  }
+}

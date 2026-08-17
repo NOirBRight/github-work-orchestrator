@@ -192,7 +192,7 @@ class KernelStateReadback:
     state_digest: str
 
 
-from .revision_identity import (
+from .revision_identity import (  # noqa: E402
     AcceptedResultBinding,
     can_preserve_result,
     target_facts_digest,
@@ -814,6 +814,239 @@ class RevisionLineageSummary:
     source_evidence_digests: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class CampaignProofReadback:
+    """Immutable, inspect-only evidence for a Campaign's recovery proof."""
+
+    ticket_keys: tuple[str, ...] = ()
+    worker_slot_limit: int = 0
+    peak_worker_slots: int = 0
+    refill_ticket_order: tuple[str, ...] = ()
+    runtime_selector_digest: str = ""
+    authority_root_digest: str = ""
+    candidate_receipt_digests: tuple[str, ...] = ()
+    candidate_sha_count_by_ticket: tuple[tuple[str, int], ...] = ()
+    binding_count_by_ticket: tuple[tuple[str, int], ...] = ()
+    permission_binding_pairs: tuple[tuple[str, str], ...] = ()
+    review_finding_ledger_digests: tuple[str, ...] = ()
+    stale_diagnosed_binding_ids: tuple[str, ...] = ()
+    stale_diagnosis_count_by_binding: tuple[tuple[str, int], ...] = ()
+    terminal_replacement_receipt_digests: tuple[str, ...] = ()
+    semantic_effect_ids: tuple[str, ...] = ()
+    external_effect_ids: tuple[str, ...] = ()
+    duplicate_effect_ids: tuple[str, ...] = ()
+    batch_receipt_digests: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Reject an incomplete proof instead of projecting guessed values."""
+
+        digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
+
+        def text(value: object, label: str) -> None:
+            if (
+                type(value) is not str
+                or not value
+                or "\x00" in value
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is missing or malformed",
+                )
+
+        def digest(value: object, label: str, *, allow_empty: bool = False) -> None:
+            if allow_empty and value == "":
+                return
+            if type(value) is not str or digest_pattern.fullmatch(value) is None:
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is not a lowercase SHA-256 digest",
+                )
+
+        def unique_texts(value: object, label: str) -> None:
+            if type(value) is not tuple:
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is not canonical",
+                )
+            for item in value:
+                text(item, label)
+            if value != tuple(sorted(set(value))):
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is not canonical",
+                )
+
+        def digests(value: object, label: str) -> None:
+            if type(value) is not tuple:
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is not canonical",
+                )
+            for item in value:
+                digest(item, label)
+            if value != tuple(sorted(set(value))):
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is not canonical",
+                )
+
+        empty = (
+            self.ticket_keys == ()
+            and self.peak_worker_slots == 0
+            and self.refill_ticket_order == ()
+            and self.runtime_selector_digest == ""
+            and self.authority_root_digest == ""
+            and self.candidate_receipt_digests == ()
+            and self.candidate_sha_count_by_ticket == ()
+            and self.binding_count_by_ticket == ()
+            and self.permission_binding_pairs == ()
+            and self.review_finding_ledger_digests == ()
+            and self.stale_diagnosed_binding_ids == ()
+            and self.stale_diagnosis_count_by_binding == ()
+            and self.terminal_replacement_receipt_digests == ()
+            and self.semantic_effect_ids == ()
+            and self.external_effect_ids == ()
+            and self.duplicate_effect_ids == ()
+            and self.batch_receipt_digests == ()
+        )
+        if empty:
+            if (
+                type(self.worker_slot_limit) is not int
+                or isinstance(self.worker_slot_limit, bool)
+                or self.worker_slot_limit < 0
+                or type(self.peak_worker_slots) is not int
+                or isinstance(self.peak_worker_slots, bool)
+            ):
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    "empty Campaign proof Worker Slot limit is malformed",
+                )
+            return
+
+        if type(self.ticket_keys) is not tuple or not self.ticket_keys:
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign proof ticket keys are missing",
+            )
+        unique_texts(self.ticket_keys, "Campaign proof ticket keys")
+        if (
+            type(self.worker_slot_limit) is not int
+            or isinstance(self.worker_slot_limit, bool)
+            or self.worker_slot_limit <= 0
+            or type(self.peak_worker_slots) is not int
+            or isinstance(self.peak_worker_slots, bool)
+            or self.peak_worker_slots < 0
+            or self.peak_worker_slots > self.worker_slot_limit
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign proof Worker Slot bounds are malformed",
+            )
+        if (
+            type(self.refill_ticket_order) is not tuple
+            or len(self.refill_ticket_order) != len(set(self.refill_ticket_order))
+            or any(item not in self.ticket_keys for item in self.refill_ticket_order)
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign proof refill order is malformed",
+            )
+        for item in self.refill_ticket_order:
+            text(item, "Campaign proof refill order")
+        digest(self.runtime_selector_digest, "Runtime Selector readback")
+        digest(self.authority_root_digest, "Campaign authority root")
+        digests(self.candidate_receipt_digests, "Candidate receipt digests")
+        digests(self.review_finding_ledger_digests, "Finding ledger digests")
+        digests(
+            self.terminal_replacement_receipt_digests,
+            "terminal replacement receipt digests",
+        )
+        digests(self.batch_receipt_digests, "Batch receipt digests")
+        unique_texts(self.stale_diagnosed_binding_ids, "stale binding identities")
+        unique_texts(self.semantic_effect_ids, "semantic effect identities")
+        unique_texts(self.external_effect_ids, "external effect identities")
+        unique_texts(self.duplicate_effect_ids, "duplicate effect identities")
+
+        def count_pairs(value: object, label: str, *, keys: tuple[str, ...]) -> None:
+            if (
+                type(value) is not tuple
+                or any(
+                    type(item) is not tuple
+                    or len(item) != 2
+                    or type(item[0]) is not str
+                    or type(item[1]) is not int
+                    or isinstance(item[1], bool)
+                    or item[1] < 0
+                    for item in value
+                )
+                or tuple(item[0] for item in value) != keys
+            ):
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    f"{label} is malformed",
+                )
+
+        count_pairs(
+            self.candidate_sha_count_by_ticket,
+            "Candidate SHA counts",
+            keys=self.ticket_keys,
+        )
+        count_pairs(
+            self.binding_count_by_ticket,
+            "Runtime Binding counts",
+            keys=self.ticket_keys,
+        )
+        if type(self.permission_binding_pairs) is not tuple or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or not item[0]
+            or "\x00" in item[0]
+            or "\r" in item[0]
+            or "\n" in item[0]
+            or type(item[1]) is not str
+            or not item[1]
+            or "\x00" in item[1]
+            or "\r" in item[1]
+            or "\n" in item[1]
+            for item in self.permission_binding_pairs
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "permission Binding readbacks are malformed",
+            )
+        if self.permission_binding_pairs != tuple(sorted(set(self.permission_binding_pairs))):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "permission Binding readbacks are not canonical",
+            )
+        if type(self.stale_diagnosis_count_by_binding) is not tuple or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or not item[0]
+            or item[0] not in self.stale_diagnosed_binding_ids
+            or type(item[1]) is not int
+            or isinstance(item[1], bool)
+            or item[1] <= 0
+            for item in self.stale_diagnosis_count_by_binding
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "stale diagnosis counts are malformed",
+            )
+        if (
+            self.stale_diagnosis_count_by_binding
+            != tuple(sorted(set(self.stale_diagnosis_count_by_binding)))
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "stale diagnosis counts are malformed",
+            )
+
+
 @dataclass(frozen=True)
 class Diagnostics:
     status: CampaignStatus
@@ -826,12 +1059,735 @@ class Diagnostics:
     invalidation_classification: PlanInvalidationClassification | None = None
     revision_lineage: tuple[RevisionLineageSummary, ...] = ()
     human_gate: HumanGateSummary | None = None
+    proof: CampaignProofReadback = CampaignProofReadback()
 
     @property
     def plan_invalidation_classification(self) -> PlanInvalidationClassification | None:
         """Compatibility spelling for the Campaign-level readback."""
 
         return self.invalidation_classification
+
+
+def _proof_texts(value: object) -> tuple[str, ...]:
+    if type(value) not in {list, tuple}:
+        return ()
+    return tuple(item for item in value if type(item) is str and item)
+
+
+def _proof_digests(value: object) -> tuple[str, ...]:
+    if type(value) not in {list, tuple}:
+        return ()
+    digests: list[str] = []
+    for item in value:
+        if type(item) is str and item:
+            digests.append(item)
+            continue
+        if type(item) is not dict:
+            continue
+        for key in (
+            "digest",
+            "receipt_digest",
+            "candidate_receipt_digest",
+            "delivery_receipt_digest",
+            "batch_receipt_digest",
+            "evidence_digest",
+        ):
+            digest = item.get(key)
+            if type(digest) is str and digest:
+                digests.append(digest)
+                break
+    return tuple(digests)
+
+
+def _proof_pairs(value: object) -> tuple[tuple[str, str], ...]:
+    if type(value) not in {list, tuple}:
+        return ()
+    return tuple(
+        (item[0], item[1])
+        for item in value
+        if type(item) in {list, tuple}
+        and len(item) == 2
+        and type(item[0]) is str
+        and type(item[1]) is str
+    )
+
+
+def _proof_count_pairs(value: object) -> tuple[tuple[str, int], ...]:
+    if type(value) is not dict:
+        return ()
+    return tuple(
+        (key, item)
+        for key, item in sorted(value.items())
+        if type(key) is str and type(item) is int and not isinstance(item, bool)
+    )
+
+
+def _proof_unique(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(set(values)))
+
+
+def _proof_plan(
+    active: ActivePlanReadback,
+    *,
+    strict: bool = True,
+    fallback_ticket_keys: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    payload = getattr(active, "plan_spec_bytes", None)
+    if type(payload) is not bytes:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "active PlanSpec bytes are missing from the authority readback",
+        )
+    try:
+        plan = load_canonical_json(payload)
+    except CanonicalJsonError as error:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "active PlanSpec is not canonical",
+        ) from error
+    if type(plan) is not dict or canonical_bytes(plan) != payload:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "active PlanSpec authority source is malformed",
+        )
+    campaign = plan.get("campaign")
+    policy = plan.get("policy")
+    legacy_authority = (
+        not strict
+        and type(campaign) is dict
+        and campaign.get("key") == active.handle.campaign_key
+        and type(policy) is not dict
+        and "authority" not in campaign
+    )
+    if (
+        type(campaign) is not dict
+        or type(policy) is not dict
+        or plan.get("repository") != active.handle.repository
+        or campaign.get("key") != active.handle.campaign_key
+        or type(policy.get("digest")) is not str
+        or _STALE_DIGEST_PATTERN.fullmatch(policy["digest"]) is None
+        or type(campaign.get("authority")) is not dict
+    ):
+        if not legacy_authority:
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "active PlanSpec authority source is incomplete",
+            )
+        legacy_witness = digest_value(
+            {
+                "kind": "legacy-plan-policy-witness.v1",
+                "plan_revision_digest": active.current_revision_digest,
+            }
+        )
+        legacy_authority = {
+            "policy_witness_digest": legacy_witness,
+            "grants": [],
+        }
+        legacy_authority["subtree_digest"] = digest_value(legacy_authority)
+        campaign = dict(campaign)
+        campaign["authority"] = legacy_authority
+        plan["campaign"] = campaign
+        policy = {
+            "ref": "legacy:plan-policy-witness",
+            "digest": legacy_witness,
+        }
+        plan["policy"] = policy
+    authority = campaign["authority"]
+    if set(authority) != {"policy_witness_digest", "grants", "subtree_digest"}:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Campaign authority subtree schema is not exact",
+        )
+    if (
+        authority["policy_witness_digest"] != policy["digest"]
+        or type(authority["grants"]) is not list
+        or type(authority["subtree_digest"]) is not str
+        or _STALE_DIGEST_PATTERN.fullmatch(authority["subtree_digest"]) is None
+        or authority["subtree_digest"]
+        != digest_value(
+            {
+                "policy_witness_digest": authority["policy_witness_digest"],
+                "grants": authority["grants"],
+            }
+        )
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Campaign authority subtree digest changed",
+        )
+    for grant in authority["grants"]:
+        if (
+            type(grant) is not dict
+            or set(grant) != {"operation_id", "resource_id"}
+            or type(grant["operation_id"]) is not str
+            or not grant["operation_id"]
+            or type(grant["resource_id"]) is not str
+            or not grant["resource_id"]
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign authority grant source is malformed",
+            )
+    work = plan.get("work")
+    if (
+        not strict
+        and (
+            type(work) is not list
+            or not work
+            or any(type(item) is not dict for item in work)
+        )
+        and fallback_ticket_keys
+    ):
+        work = [{"key": key} for key in fallback_ticket_keys]
+        plan["work"] = work
+    if type(work) is not list or not work:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "active PlanSpec work authority is missing",
+        )
+    keys = tuple(item.get("key") for item in work if type(item) is dict)
+    if (
+        len(keys) != len(work)
+        or any(type(key) is not str or not key for key in keys)
+        or keys != tuple(sorted(set(keys)))
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "active PlanSpec work authority keys are malformed",
+        )
+    return plan
+
+
+def _proof_source_texts(
+    source: Mapping[str, Any],
+    field: str,
+) -> tuple[str, ...]:
+    value = source.get(field)
+    if type(value) not in {list, tuple}:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            f"authoritative proof source {field} is missing",
+        )
+    if any(
+        type(item) is not str
+        or not item
+        or "\x00" in item
+        or "\r" in item
+        or "\n" in item
+        for item in value
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            f"authoritative proof source {field} is malformed",
+        )
+    result = tuple(value)
+    if result != tuple(sorted(set(result))):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            f"authoritative proof source {field} is not canonical",
+        )
+    return result
+
+
+def _proof_source_digests(
+    source: Mapping[str, Any],
+    field: str,
+) -> tuple[str, ...]:
+    values = _proof_source_texts(source, field)
+    if any(_STALE_DIGEST_PATTERN.fullmatch(value) is None for value in values):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            f"authoritative proof source {field} contains a malformed digest",
+        )
+    return values
+
+
+def _proof_source_pairs(
+    source: Mapping[str, Any],
+) -> tuple[tuple[str, str], ...]:
+    value = source.get("permission_binding_pairs")
+    if type(value) not in {list, tuple}:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative permission readback is missing",
+        )
+    if any(
+        type(item) not in {list, tuple}
+        or len(item) != 2
+        or any(
+            type(part) is not str
+            or not part
+            or "\x00" in part
+            or "\r" in part
+            or "\n" in part
+            for part in item
+        )
+        for item in value
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative permission readback is malformed",
+        )
+    result = tuple((item[0], item[1]) for item in value)
+    if result != tuple(sorted(set(result))):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative permission readback is not canonical",
+        )
+    return result
+
+
+def _proof_source_effect_ids(
+    source: Mapping[str, Any],
+    field: str,
+) -> tuple[str, ...]:
+    return _proof_source_texts(source, field)
+
+
+def _proof_candidate_facts(
+    run: Mapping[str, Any],
+    *,
+    handle: CampaignHandle,
+    plan_revision_digest: str,
+    ticket_key: str,
+) -> tuple[str | None, int]:
+    stored = run.get("candidate_receipt")
+    direct = run.get("candidate_receipt_digest")
+    if stored is None:
+        if direct is not None and (
+            type(direct) is not str or _STALE_DIGEST_PATTERN.fullmatch(direct) is None
+        ):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Candidate receipt digest source is malformed",
+            )
+        return direct, 0
+    try:
+        receipt = CandidateReceipt.from_canonical(stored)
+    except Exception as error:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Candidate receipt source is not a valid canonical receipt",
+        ) from error
+    if (
+        direct != receipt.digest
+        or receipt.repository != handle.repository
+        or receipt.campaign_key != handle.campaign_key
+        or receipt.campaign_handle != handle.campaign_key
+        or receipt.plan_revision_digest != plan_revision_digest
+        or receipt.ticket_key != ticket_key
+        or receipt.work_run_key != run.get("work_run_key")
+        or receipt.runtime_subject_digest != run.get("work_subject_digest")
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Candidate receipt digest source changed",
+        )
+    return receipt.digest, 1
+
+
+def _proof_run_facts(run: Mapping[str, Any]) -> tuple[int, int]:
+    candidate_oids = run.get("candidate_commit_oids", [])
+    if type(candidate_oids) not in {list, tuple}:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Candidate SHA history source is missing",
+        )
+    if any(
+        type(item) is not str
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", item) is None
+        for item in candidate_oids
+    ) or len(candidate_oids) != len(set(candidate_oids)):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Candidate SHA history source is malformed",
+        )
+    binding = run.get("runtime_binding_id")
+    ordinal = run.get("binding_replacement_ordinal", 0)
+    if (
+        type(ordinal) is not int
+        or isinstance(ordinal, bool)
+        or ordinal < 0
+        or ordinal > 1
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Runtime Binding replacement source is malformed",
+        )
+    binding_count = 0 if binding is None else ordinal + 1
+    if binding is not None and (type(binding) is not str or not binding):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Runtime Binding source is malformed",
+        )
+    return len(set(candidate_oids)), binding_count
+
+
+def _proof_first_text(*values: object) -> str:
+    for value in values:
+        if type(value) is str and value:
+            return value
+    return ""
+
+
+def _proof_mapping_text(mapping: object, *keys: str) -> str:
+    if type(mapping) is not dict:
+        return ""
+    return _proof_first_text(*(mapping.get(key) for key in keys))
+
+
+def _proof_run_candidate_digest(run: Mapping[str, Any]) -> str:
+    direct = _proof_first_text(
+        run.get("candidate_receipt_digest"),
+        run.get("receipt_digest"),
+    )
+    if direct:
+        return direct
+    receipt = run.get("candidate_receipt")
+    return _proof_mapping_text(receipt, "receipt_digest", "candidate_receipt_digest", "digest")
+
+
+def _proof_run_binding_count(run: Mapping[str, Any]) -> int:
+    binding_ids = run.get("runtime_binding_ids")
+    if type(binding_ids) in {list, tuple}:
+        return len(
+            {
+                item
+                for item in binding_ids
+                if type(item) is str and item
+            }
+        )
+    binding_id = _proof_first_text(run.get("runtime_binding_id"))
+    if not binding_id:
+        return 0
+    ordinal = run.get("binding_replacement_ordinal", 0)
+    if type(ordinal) is int and not isinstance(ordinal, bool) and ordinal >= 0:
+        return ordinal + 1
+    return 1
+
+
+def _proof_permission_pairs(state: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    direct = _proof_pairs(state.get("permission_binding_pairs"))
+    if direct:
+        return direct
+    pairs: list[tuple[str, str]] = []
+    receipts = state.get("normalized_permission_receipts")
+    if type(receipts) not in {list, tuple}:
+        return ()
+    for receipt in receipts:
+        if type(receipt) is not dict:
+            continue
+        requested = _proof_first_text(
+            receipt.get("requested_binding_id"),
+            receipt.get("requested_binding"),
+            receipt.get("binding_id"),
+        )
+        readback = _proof_first_text(
+            receipt.get("readback_binding_id"),
+            receipt.get("runtime_binding_id"),
+            receipt.get("bound_binding_id"),
+            receipt.get("binding_id"),
+        )
+        if requested and readback:
+            pairs.append((requested, readback))
+    return tuple(pairs)
+
+
+def _proof_effect_ids(
+    state: Mapping[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    semantic = _proof_unique(_proof_texts(state.get("semantic_effect_ids")))
+    external = _proof_unique(_proof_texts(state.get("external_effect_ids")))
+    duplicates = _proof_unique(_proof_texts(state.get("duplicate_effect_ids")))
+    effects = state.get("effects")
+    if type(effects) is dict:
+        inferred_semantic: list[str] = []
+        inferred_external: list[str] = []
+        for effect_id, effect in effects.items():
+            if type(effect_id) is not str or type(effect) is not dict:
+                continue
+            kind = effect.get("kind")
+            if effect.get("external") is True or kind == "batch_delivery":
+                inferred_external.append(effect_id)
+            elif effect.get("semantic") is True or kind in {
+                "semantic_execution",
+                "semantic_resume",
+            }:
+                inferred_semantic.append(effect_id)
+        if not semantic:
+            semantic = _proof_unique(tuple(inferred_semantic))
+        if not external:
+            external = _proof_unique(tuple(inferred_external))
+    runs = state.get("runs")
+    if type(runs) is dict and (not semantic or not external):
+        run_semantic: list[str] = []
+        run_external: list[str] = []
+        for run in runs.values():
+            if type(run) is not dict:
+                continue
+            semantic_id = _proof_first_text(run.get("semantic_action_id"))
+            if semantic_id:
+                run_semantic.append(semantic_id)
+            external_id = _proof_first_text(run.get("last_action_id"))
+            if external_id and run.get("batch_delivery_request_digest") is not None:
+                run_external.append(external_id)
+        if not semantic:
+            semantic = _proof_unique(tuple(run_semantic))
+        if not external:
+            external = _proof_unique(tuple(run_external))
+    history = state.get("effect_history")
+    if type(history) in {list, tuple}:
+        counts: dict[str, int] = {}
+        for item in history:
+            effect_id = (
+                item
+                if type(item) is str
+                else item.get("stable_action_id")
+                if type(item) is dict
+                else None
+            )
+            if type(effect_id) is str and effect_id:
+                counts[effect_id] = counts.get(effect_id, 0) + 1
+        if not duplicates:
+            duplicates = _proof_unique(
+                tuple(effect_id for effect_id, count in counts.items() if count > 1)
+            )
+    return semantic, external, duplicates
+
+
+def _campaign_proof(
+    active: ActivePlanReadback,
+    state: Mapping[str, Any],
+    *,
+    worker_slot_limit: int | None = None,
+    proof_source: Mapping[str, Any] | None = None,
+    require_authoritative_source: bool = True,
+) -> CampaignProofReadback:
+    """Project only complete, digest-validated proof readbacks."""
+
+    runs = state.get("runs")
+    fallback_ticket_keys = (
+        tuple(sorted(runs)) if type(runs) is dict and all(type(key) is str for key in runs) else ()
+    )
+    plan = _proof_plan(
+        active,
+        strict=require_authoritative_source,
+        fallback_ticket_keys=fallback_ticket_keys,
+    )
+    plan_work = plan["work"]
+    ticket_keys = tuple(item["key"] for item in plan_work)
+    if type(runs) is not dict or tuple(sorted(runs)) != ticket_keys:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Campaign proof Work Run source does not match the active PlanSpec",
+        )
+    ordered_runs: list[Mapping[str, Any]] = []
+    for ticket_key in ticket_keys:
+        run = runs.get(ticket_key)
+        if type(run) is not dict:
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign proof Work Run source is malformed",
+            )
+        ordered_runs.append(run)
+
+    if proof_source is None:
+        if require_authoritative_source:
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Campaign proof has no authoritative Runtime/Candidate source",
+            )
+        runtime_selector_digest = digest_value(
+            {
+                "kind": "legacy-proof-source.v1",
+                "plan_revision_digest": active.current_revision_digest,
+            }
+        )
+        proof_source = {
+            "runtime_selector_digest": runtime_selector_digest,
+            "permission_binding_pairs": [],
+            "review_finding_ledger_digests": [],
+            "batch_receipt_digests": [],
+            "semantic_effect_ids": [],
+            "external_effect_ids": [],
+            "duplicate_effect_ids": [],
+        }
+    if type(proof_source) is not dict:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative Campaign proof source is not a mapping",
+        )
+    required_source = {
+        "runtime_selector_digest",
+        "permission_binding_pairs",
+        "review_finding_ledger_digests",
+        "batch_receipt_digests",
+        "semantic_effect_ids",
+        "external_effect_ids",
+        "duplicate_effect_ids",
+    }
+    if not required_source.issubset(proof_source):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative Campaign proof source is incomplete",
+        )
+    if set(proof_source) - required_source - {"authority_root_digest"}:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative Campaign proof source has unknown fields",
+        )
+    runtime_selector_digest = proof_source.get("runtime_selector_digest")
+    if (
+        type(runtime_selector_digest) is not str
+        or _STALE_DIGEST_PATTERN.fullmatch(runtime_selector_digest) is None
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Runtime Selector readback is missing or malformed",
+        )
+
+    configured_limit = worker_slot_limit
+    if configured_limit is None:
+        configured_limit = state.get("worker_slot_limit")
+    if (
+        type(configured_limit) is not int
+        or isinstance(configured_limit, bool)
+        or configured_limit <= 0
+    ):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Worker Slot limit source is missing or malformed",
+        )
+    history = state.get("worker_slot_history")
+    if type(history) not in {list, tuple} or any(
+        type(item) is not int or isinstance(item, bool) or item < 0
+        or item > configured_limit
+        for item in history
+    ) or not history:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Worker Slot history source is missing or malformed",
+        )
+    history_values = tuple(history)
+    held = sum(1 for run in ordered_runs if run.get("slot_held") is True)
+    peak = max((*history_values, held), default=0)
+    if peak > configured_limit:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "Worker Slot peak exceeds its authoritative limit",
+        )
+
+    candidate_digests_list: list[str] = []
+
+    candidate_counts: list[tuple[str, int]] = []
+    binding_counts: list[tuple[str, int]] = []
+    terminal_digests: list[str] = []
+    candidate_plan_revision_digest = active.current_revision_digest
+    if not require_authoritative_source:
+        persisted_revision = state.get("plan_revision_digest")
+        if (
+            type(persisted_revision) is str
+            and _STALE_DIGEST_PATTERN.fullmatch(persisted_revision) is not None
+        ):
+            candidate_plan_revision_digest = persisted_revision
+    for ticket_key, run in zip(ticket_keys, ordered_runs, strict=True):
+        candidate_digest, _current_candidate_count = _proof_candidate_facts(
+            run,
+            handle=active.handle,
+            plan_revision_digest=candidate_plan_revision_digest,
+            ticket_key=ticket_key,
+        )
+        candidate_history = run.get("candidate_receipt_digests", [])
+        if type(candidate_history) not in {list, tuple} or any(
+            type(item) is not str
+            or _STALE_DIGEST_PATTERN.fullmatch(item) is None
+            for item in candidate_history
+        ) or len(candidate_history) != len(set(candidate_history)):
+            raise ExecutionKernelError(
+                "CAMPAIGN_PROOF_INVALID",
+                "Candidate receipt history source is malformed",
+            )
+        candidate_digests_list.extend(candidate_history)
+        if candidate_digest is not None and candidate_digest not in candidate_digests_list:
+            candidate_digests_list.append(candidate_digest)
+        count, binding_count = _proof_run_facts(run)
+        candidate_counts.append((ticket_key, count))
+        binding_counts.append((ticket_key, binding_count))
+        evidence = run.get("terminal_binding_evidence")
+        if evidence is not None:
+            if type(evidence) is not dict:
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    "terminal Binding Evidence source is malformed",
+                )
+            for key in (
+                "terminal_replacement_receipt_digest",
+                "replacement_receipt_digest",
+                "receipt_digest",
+                "evidence_digest",
+            ):
+                value = evidence.get(key)
+                if value is not None:
+                    if type(value) is not str or _STALE_DIGEST_PATTERN.fullmatch(value) is None:
+                        raise ExecutionKernelError(
+                            "CAMPAIGN_PROOF_INVALID",
+                            "terminal replacement receipt source is malformed",
+                        )
+                    terminal_digests.append(value)
+                    break
+
+    stale_ids_value = state.get("diagnosed_binding_ids", [])
+    if type(stale_ids_value) not in {list, tuple} or any(
+        type(item) is not str or not item for item in stale_ids_value
+    ) or len(stale_ids_value) != len(set(stale_ids_value)):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "stale diagnosis Binding source is malformed",
+        )
+    stale_ids = tuple(sorted(stale_ids_value))
+    stale_counts = tuple((binding_id, stale_ids.count(binding_id)) for binding_id in stale_ids)
+    refill_order = state.get("refill_ticket_order", [])
+    if type(refill_order) not in {list, tuple} or any(
+        type(item) is not str or item not in ticket_keys for item in refill_order
+    ) or len(refill_order) != len(set(refill_order)):
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "refill Ticket source is malformed",
+        )
+    authority_root_digest = plan["campaign"]["authority"]["subtree_digest"]
+    supplied_authority = proof_source.get("authority_root_digest")
+    if supplied_authority is not None and supplied_authority != authority_root_digest:
+        raise ExecutionKernelError(
+            "CAMPAIGN_PROOF_INVALID",
+            "authoritative Campaign authority root changed",
+        )
+
+    return CampaignProofReadback(
+        ticket_keys=ticket_keys,
+        worker_slot_limit=configured_limit,
+        peak_worker_slots=peak,
+        refill_ticket_order=tuple(refill_order),
+        runtime_selector_digest=runtime_selector_digest,
+        authority_root_digest=authority_root_digest,
+        candidate_receipt_digests=tuple(sorted(set(candidate_digests_list))),
+        candidate_sha_count_by_ticket=tuple(candidate_counts),
+        binding_count_by_ticket=tuple(binding_counts),
+        permission_binding_pairs=_proof_source_pairs(proof_source),
+        review_finding_ledger_digests=_proof_source_digests(
+            proof_source,
+            "review_finding_ledger_digests",
+        ),
+        stale_diagnosed_binding_ids=stale_ids,
+        stale_diagnosis_count_by_binding=stale_counts,
+        terminal_replacement_receipt_digests=tuple(sorted(set(terminal_digests))),
+        semantic_effect_ids=_proof_source_effect_ids(proof_source, "semantic_effect_ids"),
+        external_effect_ids=_proof_source_effect_ids(proof_source, "external_effect_ids"),
+        duplicate_effect_ids=_proof_source_effect_ids(proof_source, "duplicate_effect_ids"),
+        batch_receipt_digests=_proof_source_digests(
+            proof_source,
+            "batch_receipt_digests",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -2103,6 +3059,7 @@ class ExecutionKernel:
                 state,
                 classification,
             )
+            self._record_proof_progress(active.handle, state)
             is_new_wake = False
             if wake_ref is not None:
                 if type(wake_ref) is not str or not wake_ref:
@@ -2127,10 +3084,16 @@ class ExecutionKernel:
                 )
                 if due is None:
                     break
+                self._record_proof_progress(
+                    active.handle,
+                    state,
+                    refill_ticket_key=due,
+                )
                 progressed = self._perform_due_effect(
                     active, state, work, due, wake_ref=wake_ref
                 )
                 state = self._load(active.handle)
+                self._record_proof_progress(active.handle, state)
                 if not progressed:
                     # A durable intent may exist without an authoritative
                     # readback (for example after a provider timeout).  The
@@ -2168,6 +3131,12 @@ class ExecutionKernel:
                 },
                 work_runs=(),
                 outstanding_effect_ids=(),
+                proof=CampaignProofReadback(
+                    ticket_keys=(),
+                    worker_slot_limit=self._configuration.worker_slots_for(
+                        active.handle.repository
+                    ),
+                ),
             )
         state = readback.state
         migration_due = state.get("plan_revision_digest") != active.current_revision_digest
@@ -2195,6 +3164,22 @@ class ExecutionKernel:
             if effect["state"] == "intent"
         )
         limit = self._configuration.worker_slots_for(active.handle.repository)
+        proof_reader = getattr(self._effects, "campaign_proof_readback", None)
+        proof_source: Mapping[str, Any] | None = None
+        require_authoritative_source = callable(proof_reader)
+        if callable(proof_reader):
+            try:
+                proof_source = proof_reader(
+                    active.handle,
+                    active.current_revision_digest,
+                )
+            except ExecutionKernelError:
+                raise
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "CAMPAIGN_PROOF_INVALID",
+                    "authoritative Campaign proof readback failed",
+                ) from error
         return Diagnostics(
             status=outcome.status,
             reason=outcome.reason,
@@ -2206,6 +3191,13 @@ class ExecutionKernel:
             invalidation_classification=classification,
             revision_lineage=self._revision_lineage_summaries(state),
             human_gate=self._human_gate_summary(state),
+            proof=_campaign_proof(
+                active,
+                state,
+                worker_slot_limit=limit,
+                proof_source=proof_source,
+                require_authoritative_source=require_authoritative_source,
+            ),
         )
 
     def active_campaigns(self) -> tuple[CampaignHandle, ...]:
@@ -3873,6 +4865,8 @@ class ExecutionKernel:
                 "normalized_permission_receipts": [],
                 "candidate_receipts": [],
                 "delivery_receipts": [],
+                "worker_slot_history": [0],
+                "refill_ticket_order": [],
                 "plan_invalidation": {},
                 "plan_invalidation_resolutions": {},
                 "plan_invalidation_classifications": {},
@@ -3910,6 +4904,18 @@ class ExecutionKernel:
             if field not in state:
                 state[field] = default
                 dirty = True
+        if "worker_slot_history" not in state:
+            state["worker_slot_history"] = [
+                sum(
+                    1
+                    for run in state.get("runs", {}).values()
+                    if type(run) is dict and run.get("slot_held") is True
+                )
+            ]
+            dirty = True
+        if "refill_ticket_order" not in state:
+            state["refill_ticket_order"] = []
+            dirty = True
         if type(state["revision_lineage"]) is not list:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
@@ -4896,6 +5902,8 @@ class ExecutionKernel:
             "normalized_permission_receipts": [],
             "candidate_receipts": [],
             "delivery_receipts": [],
+            "worker_slot_history": [0],
+            "refill_ticket_order": [],
             "plan_invalidation": {},
             "plan_invalidation_resolutions": {},
             "plan_invalidation_classifications": {},
@@ -7525,6 +8533,70 @@ class ExecutionKernel:
             )
         self._save_state(active.handle, state)
         return True
+
+    def _record_proof_progress(
+        self,
+        handle: CampaignHandle,
+        state: dict[str, Any] | None,
+        *,
+        refill_ticket_key: str | None = None,
+    ) -> None:
+        """Persist the small scheduler facts needed by inspect's proof."""
+
+        if type(state) is not dict:
+            return
+        changed = False
+        history = state.get("worker_slot_history")
+        if type(history) is not list:
+            history = []
+            state["worker_slot_history"] = history
+            changed = True
+        held = sum(
+            1
+            for run in state.get("runs", {}).values()
+            if type(run) is dict and run.get("slot_held") is True
+        )
+        if not history or any(
+            type(item) is not int or isinstance(item, bool) or item < 0
+            for item in history
+        ):
+            history[:] = [held]
+            changed = True
+        else:
+            prospective = held
+            due_run = state.get("runs", {}).get(refill_ticket_key)
+            if type(due_run) is dict and due_run.get("phase") == "pending":
+                prospective += 1
+            worker_slot_limit = self._configuration.worker_slots_for(handle.repository)
+            if (
+                prospective <= worker_slot_limit
+                and prospective > max(history)
+            ):
+                history.append(prospective)
+                changed = True
+
+        refill_order = state.get("refill_ticket_order")
+        if type(refill_order) is not list:
+            refill_order = []
+            state["refill_ticket_order"] = refill_order
+            changed = True
+        if refill_ticket_key is not None:
+            run = state.get("runs", {}).get(refill_ticket_key)
+            released = any(
+                type(other) is dict and other.get("claim_state") == "released"
+                for other in state.get("runs", {}).values()
+            )
+            if (
+                type(run) is dict
+                and run.get("phase") == "pending"
+                and held > 0
+                and released
+                and refill_ticket_key not in refill_order
+            ):
+                refill_order.append(refill_ticket_key)
+                changed = True
+        if changed:
+            self._save_state(handle, state)
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
         if state is None:

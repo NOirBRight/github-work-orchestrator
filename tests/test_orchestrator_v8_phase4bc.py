@@ -1143,8 +1143,10 @@ def test_shadow_uses_live_kernel_planner_without_mutating_store(
     assert destination.read_bytes() == before
 
 
-def _accepted_canary() -> CanaryRunReadback:
-    repository = "local/gwo-v8-canary"
+def _accepted_canary(
+    *,
+    repository: str = "local/gwo-v8-canary",
+) -> CanaryRunReadback:
     nodes = ("node:1", "node:2", "node:3")
     scenario_evidence = {
         scenario: _capture(

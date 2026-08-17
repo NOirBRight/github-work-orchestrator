@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Protocol, Sequence
+from typing import Callable, Literal, Protocol, Sequence
 
 from .campaign_watchdog import CampaignWatchdog, WatchdogCampaignSnapshot
 from .execution_kernel import (
@@ -41,6 +41,10 @@ class ProductionHostConfiguration:
     preview_mode: Literal["beta2_isolated_preview"] = "beta2_isolated_preview"
     target_isolation_root: Path | None = None
     writer_activation_enabled: Literal[False] = False
+    fault_admission_mode: Literal["named_canary"] | None = None
+    approved_run_root: Path | None = None
+    fault_plan_path: Path | None = None
+    fault_journal_path: Path | None = None
 
 
 class WriterGenerationReader(Protocol):
@@ -98,6 +102,14 @@ class ProductionGwoHost:
         writer_generation_reader: WriterGenerationReader,
         target_path: Path,
         effects: object | None = None,
+        fault_plan_path: Path | None = None,
+        journal_path: Path | None = None,
+        worker_command: Callable[[object], object] | None = None,
+        review_command: Callable[[object], object] | None = None,
+        delivery_command: Callable[[object], object] | None = None,
+        wake_command: Callable[[object], object] | None = None,
+        permission_command: Callable[[object], object] | None = None,
+        runtime_command: Callable[[object], object] | None = None,
     ) -> None:
         self._start_host = start_host
         self._kernel = kernel
@@ -105,6 +117,26 @@ class ProductionGwoHost:
         self._effects = effects
         self._writer_generation_reader = writer_generation_reader
         self._target_path = target_path.resolve()
+        self._fault_plan_path = (
+            None if fault_plan_path is None else Path(fault_plan_path).resolve()
+        )
+        self._journal_path = (
+            None if journal_path is None else Path(journal_path).resolve()
+        )
+        self.worker_command = worker_command
+        self.review_command = review_command
+        self.delivery_command = delivery_command
+        self.wake_command = wake_command
+        self.permission_command = permission_command
+        self.runtime_command = runtime_command
+
+    @property
+    def fault_plan_path(self) -> Path | None:
+        return self._fault_plan_path
+
+    @property
+    def journal_path(self) -> Path | None:
+        return self._journal_path
 
     @classmethod
     def install(
@@ -120,6 +152,18 @@ class ProductionGwoHost:
         watchdog: CampaignWatchdog,
         writer_generation_reader: WriterGenerationReader,
         batch_integrator: object | None = None,
+        fault_admission_mode: Literal["named_canary"] | None = None,
+        admission_mode: Literal["named_canary"] | None = None,
+        approved_run_root: Path | None = None,
+        fault_plan_path: Path | None = None,
+        journal_path: Path | None = None,
+        fault_journal_path: Path | None = None,
+        worker_command: Callable[[object], object] | None = None,
+        review_command: Callable[[object], object] | None = None,
+        delivery_command: Callable[[object], object] | None = None,
+        wake_command: Callable[[object], object] | None = None,
+        permission_command: Callable[[object], object] | None = None,
+        runtime_command: Callable[[object], object] | None = None,
     ) -> "ProductionGwoHost":
         root = host_configuration.target_isolation_root
         try:
@@ -149,6 +193,30 @@ class ProductionGwoHost:
         _validate_batch_integrator(configured_batch_integrator)
         if batch_integrator is not None:
             effects._batch_integrator = batch_integrator
+        configured_fault_mode = (
+            fault_admission_mode
+            if fault_admission_mode is not None
+            else admission_mode
+            if admission_mode is not None
+            else host_configuration.fault_admission_mode
+        )
+        configured_run_root = (
+            approved_run_root
+            if approved_run_root is not None
+            else host_configuration.approved_run_root
+        )
+        configured_fault_plan = (
+            fault_plan_path
+            if fault_plan_path is not None
+            else host_configuration.fault_plan_path
+        )
+        configured_journal = (
+            journal_path
+            if journal_path is not None
+            else fault_journal_path
+            if fault_journal_path is not None
+            else host_configuration.fault_journal_path
+        )
         writer_generation_reader.read()
         kernel = start_host.install_execution_kernel(
             store_path=store_path,
@@ -162,6 +230,20 @@ class ProductionGwoHost:
             effects=effects,
             writer_generation_reader=writer_generation_reader,
             target_path=target,
+            fault_plan_path=None,
+            journal_path=None,
+            worker_command=worker_command,
+            review_command=review_command,
+            delivery_command=delivery_command,
+            wake_command=wake_command,
+            permission_command=permission_command,
+            runtime_command=runtime_command,
+        )
+        host._bind_fault_proxy(
+            admission_mode=configured_fault_mode,
+            approved_run_root=configured_run_root,
+            fault_plan_path=configured_fault_plan,
+            journal_path=configured_journal,
         )
         bind_advancer = getattr(watchdog, "bind_advancer", None)
         if callable(bind_advancer):
@@ -169,6 +251,84 @@ class ProductionGwoHost:
         elif getattr(watchdog, "_advancer", None) is kernel:
             watchdog._advancer = _ForwardingWatchdogAdvancer(host)
         return host
+
+    def _bind_fault_proxy(
+        self,
+        *,
+        admission_mode: Literal["named_canary"] | None,
+        approved_run_root: Path | None,
+        fault_plan_path: Path | None,
+        journal_path: Path | None,
+    ) -> None:
+        if (
+            admission_mode is None
+            and approved_run_root is None
+            and fault_plan_path is None
+            and journal_path is None
+        ):
+            return
+        if admission_mode != "named_canary" or approved_run_root is None or fault_plan_path is None:
+            raise ProductionCompositionError(
+                "ROOT_CANARY_FAULT_CONFIGURATION_INVALID",
+                "named Canary fault injection requires an approved run root and plan",
+            )
+        try:
+            from scripts.v8_root_canary_fault_proxy import FaultProxy, _require_child
+        except ModuleNotFoundError:
+            from v8_root_canary_fault_proxy import FaultProxy, _require_child
+
+        try:
+            plan_path = _require_child(Path(fault_plan_path), Path(approved_run_root))
+            proxy_journal_path = _require_child(
+                Path(journal_path)
+                if journal_path is not None
+                else Path(approved_run_root) / "fault-proxy-journal.json",
+                Path(approved_run_root),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            code = (
+                str(error)
+                if str(error) == "ROOT_CANARY_FAULT_PATH_OUTSIDE_RUN_ROOT"
+                else "ROOT_CANARY_FAULT_PATH_INVALID"
+            )
+            raise ProductionCompositionError(code, "fault plan and journal must be under the run root") from error
+
+        try:
+            proxy = FaultProxy.from_files(
+                plan_path,
+                proxy_journal_path,
+                run_root=Path(approved_run_root),
+            )
+        except ValueError as error:
+            raise ProductionCompositionError(
+                "ROOT_CANARY_FAULT_PATH_INVALID",
+                "fault plan or journal durable record is invalid",
+            ) from error
+        self._fault_plan_path = plan_path
+        self._journal_path = proxy_journal_path
+        bind_effect_proxy = getattr(self._effects, "bind_fault_proxy", None)
+        if callable(bind_effect_proxy):
+            bind_effect_proxy(proxy)
+        for role, name in (
+            ("worker", "worker_command"),
+            ("review", "review_command"),
+            ("delivery", "delivery_command"),
+            ("wake", "wake_command"),
+            ("permission", "permission_command"),
+            ("runtime", "runtime_command"),
+        ):
+            command = getattr(self, name)
+            if command is None:
+                continue
+
+            def invoke(request: object, *, _role=role, _command=command):
+                effective = replace(request, role=_role)
+                return proxy.execute(
+                    effective,
+                    run_command=lambda _argv: _command(effective),
+                )
+
+            setattr(self, name, invoke)
 
     def start(
         self,

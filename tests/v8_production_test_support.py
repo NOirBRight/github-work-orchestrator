@@ -11,7 +11,6 @@ import sqlite3
 import subprocess
 import tempfile
 from typing import Sequence
-import sqlite3
 
 import pytest
 
@@ -70,12 +69,6 @@ from gwo_v8.plan_control import (
     frozen_ticket_contract_digest,
 )
 from gwo_v8.plan_control_host import ProductionPlanControlStartHost, install_plan_control_start
-from gwo_v8.campaign_watchdog import (
-    CampaignWatchdog,
-    WatchdogCampaignSnapshot,
-    WatchdogWake,
-    WatchdogWakePage,
-)
 from gwo_v8.runtime_gateway import (
     CapabilityPolicy,
     CapabilityPolicyProof,
@@ -84,7 +77,6 @@ from gwo_v8.runtime_gateway import (
     ProfileMapping,
     PlanningReceipt,
     RuntimeConfiguration,
-    RuntimeGateway,
     PlanningPreflightReceipt,
     RuntimeProgressReceipt,
     RuntimeRepositoryContext,
@@ -97,8 +89,10 @@ from gwo_v8.production_host import (
     ProductionCompositionError,
     ProductionGwoHost,
     ProductionHostConfiguration,
+    WriterGenerationReader,
 )
 from gwo_v8.production_effects import (
+    BatchRequestSource,
     BatchIntegratorPort,
     CandidateGateParentSource,
     CandidateGatePort,
@@ -106,12 +100,12 @@ from gwo_v8.production_effects import (
     ProductionWorkRunEffects,
     RuntimeGatewayFactory,
     RuntimeStaleReadbackPort,
+    WorkRunEffectObservation,
     WorkRunSubjectSource,
 )
 from v8_successor_test_support import (
     _StaticPlanReader,
     _minimal_active_campaign,
-    active_plan_spec,
     three_ticket_source_snapshot,
 )
 
@@ -263,6 +257,28 @@ class OneCandidateOnlyEffects:
                 "parent Batch request binding is only valid for Batch delivery"
             )
         return "0" * 64
+
+    def campaign_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        return {
+            "runtime_selector_digest": digest_value(
+                {
+                    "kind": "test-runtime-selector-readback.v1",
+                    "repository": campaign.repository,
+                    "campaign_key": campaign.campaign_key,
+                    "plan_revision_digest": plan_revision_digest,
+                }
+            ),
+            "permission_binding_pairs": [],
+            "review_finding_ledger_digests": [],
+            "batch_receipt_digests": [],
+            "semantic_effect_ids": [],
+            "external_effect_ids": [],
+            "duplicate_effect_ids": [],
+        }
 
     def execute(
         self,
@@ -507,6 +523,23 @@ class RecordingRuntimeGateway:
                 }
             ),
         )
+
+    def campaign_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        return {
+            "runtime_selector_digest": digest_value(
+                {
+                    "kind": "recording-runtime-selector-readback.v1",
+                    "repository": campaign.repository,
+                    "campaign_key": campaign.campaign_key,
+                    "plan_revision_digest": plan_revision_digest,
+                }
+            ),
+            "permission_binding_pairs": [],
+        }
 
     def progress(
         self,
@@ -1439,6 +1472,23 @@ def reinstall_production_host(
 @dataclass
 class ReopenedRuntimeGateway:
     calls: list[str] = field(default_factory=list)
+
+    def campaign_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        return {
+            "runtime_selector_digest": digest_value(
+                {
+                    "kind": "reopened-137-runtime-selector-readback.v1",
+                    "repository": campaign.repository,
+                    "campaign_key": campaign.campaign_key,
+                    "plan_revision_digest": plan_revision_digest,
+                }
+            ),
+            "permission_binding_pairs": [],
+        }
 
     def progress(
         self,
@@ -2519,7 +2569,7 @@ class ProductionCompositionHarness:
     ready_refs: tuple[str, ...]
     handle: CampaignHandle
     target: Path
-    batch: RecordingBatchIntegrator
+    batch: DurableRecordingBatchIntegrator
     advance_calls: list[tuple[CampaignHandle, str | None]]
     runtime_wake_source: RecordingWakeSource
     hosted_check_source: RecordingWakeSource
@@ -2638,7 +2688,7 @@ class ProductionCompositionHarness:
             auto_accept=True,
             actions=action_book,
         )
-        batch = RecordingBatchIntegrator(
+        batch = DurableRecordingBatchIntegrator(
             store_path=evidence_dir / "batch-integrator.sqlite3",
             target_path=target_path,
         )
@@ -2738,6 +2788,8 @@ class CompositionCrash(RuntimeError):
 class BatchCallbackSuppressed(RuntimeError):
     """Test-only interruption for a lost callback before Batch execution."""
 
+    provider_dispatched = False
+
 
 @dataclass
 class CrashController:
@@ -2758,7 +2810,7 @@ class CrashController:
 
 
 @dataclass
-class RecordingBatchIntegrator:
+class DurableRecordingBatchIntegrator:
     store_path: Path
     target_path: Path
     action: BatchDeliveryAction | None = None
@@ -3106,7 +3158,7 @@ class RecordingBatchIntegrator:
 
 @dataclass
 class CrashReadbackBatchIntegrator:
-    inner: RecordingBatchIntegrator
+    inner: DurableRecordingBatchIntegrator
     crashes: CrashController
 
     def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
@@ -3165,11 +3217,13 @@ class CrashInjectingProductionWorkRunEffects(ProductionWorkRunEffects):
         observation: WorkRunEffectObservation,
         *,
         accepted_candidate: AcceptedCandidateReceipt | None = None,
+        claim_owner: str,
     ) -> WorkRunEffectObservation:
         saved = super()._record(
             action,
             observation,
             accepted_candidate=accepted_candidate,
+            claim_owner=claim_owner,
         )
         self._crash_controller.hit("after_effect_ledger_write")
         return saved
