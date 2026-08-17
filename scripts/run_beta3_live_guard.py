@@ -352,7 +352,7 @@ class RunnerConfig:
         ),
         (
             "orchestrator",
-            "53d92c1c5b63589724bb8c8abed57aecf5e34c1b09f982b02160b5c4c6b6dec8",
+            "f3851d306c0f08c6d84bb3eb194b9b7fbfaf5622292f6f10e806a5219338865b",
         ),
     )
     gateway_store_path: Path = GATEWAY_STORE_PATH
