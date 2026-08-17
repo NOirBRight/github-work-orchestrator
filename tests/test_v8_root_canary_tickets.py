@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+import scripts.provision_v8_root_canary as provision_module
 from scripts.provision_v8_root_canary import (
     APPROVAL,
     GhIssuePort,
@@ -23,6 +24,19 @@ from scripts.provision_v8_root_canary import (
     write_ticket_manifest,
     write_ticket_runbook,
 )
+
+
+def test_gh_cli_json_readback_decodes_utf8_bytes(monkeypatch):
+    calls = []
+
+    def fake_check_output(command):
+        calls.append(command)
+        return '[{"title":"Café"}]'.encode("utf-8")
+
+    monkeypatch.setattr(provision_module.subprocess, "check_output", fake_check_output)
+
+    assert provision_module._run_gh_json(("api", "issues")) == [{"title": "Café"}]
+    assert calls == [("gh", "api", "issues")]
 
 
 ROOT = Path(__file__).parents[1]

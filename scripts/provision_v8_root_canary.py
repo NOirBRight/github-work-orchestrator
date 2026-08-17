@@ -1048,6 +1048,21 @@ def write_ticket_runbook(path: Path) -> None:
     path.write_text("\n".join(sections) + "\n", encoding="utf-8")
 
 
+def _run_gh_bytes(command: tuple[str, ...]) -> bytes:
+    value = subprocess.check_output(("gh", *command))
+    if type(value) is not bytes:
+        raise TypeError("gh output must be raw bytes")
+    return value
+
+
+def _run_gh_json(command: tuple[str, ...]) -> object:
+    return json.loads(_run_gh_bytes(command).decode("utf-8"))
+
+
+def _run_gh_text(command: tuple[str, ...]) -> str:
+    return _run_gh_bytes(command).decode("utf-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
@@ -1057,13 +1072,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--read-only", action="store_true")
     args = parser.parse_args(argv)
 
-    def run_gh_json(command: tuple[str, ...]) -> object:
-        return json.loads(subprocess.check_output(("gh", *command), text=True))
-
-    def run_gh_text(command: tuple[str, ...]) -> str:
-        return subprocess.check_output(("gh", *command), text=True)
-
-    github = GhIssuePort(run_gh_json=run_gh_json, run_gh_text=run_gh_text)
+    github = GhIssuePort(run_gh_json=_run_gh_json, run_gh_text=_run_gh_text)
     approval = None if args.read_only else args.approval
     entries = provision_root_tickets(
         github,
