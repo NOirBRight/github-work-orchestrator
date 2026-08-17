@@ -45,6 +45,8 @@ DYNAMIC_METADATA_FIELDS = frozenset(
 _STATIC_RECORD_FIELDS = frozenset(
     {
         "activation_receipt_digest",
+        "activation_id",
+        "campaign_key",
         "canary_receipt_digest",
         "canary_target_sha",
         "default_writer_receipt_digest",
@@ -52,6 +54,7 @@ _STATIC_RECORD_FIELDS = frozenset(
         "post_canary_changed_paths",
         "repository",
         "version",
+        "writer_generation",
     }
 )
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -100,6 +103,9 @@ class GaReleaseRecord:
     activation_receipt_digest: str
     default_writer_receipt_digest: str
     post_canary_changed_paths: tuple[str, ...] = ALLOWED_METADATA_PATHS
+    campaign_key: str | None = None
+    activation_id: str | None = None
+    writer_generation: str | None = None
 
     def __post_init__(self) -> None:
         if self.version != GA_VERSION:
@@ -115,6 +121,9 @@ class GaReleaseRecord:
             _require_text(digest, "GA_STATIC_RECEIPT_INVALID")
         if tuple(self.post_canary_changed_paths) != ALLOWED_METADATA_PATHS:
             raise ReleaseGateError("GA_METADATA_PATH_ALLOWLIST_INVALID")
+        for value in (self.campaign_key, self.activation_id, self.writer_generation):
+            if value is not None:
+                _require_text(value, "GA_STATIC_IDENTITY_INVALID")
 
     @classmethod
     def from_fixture(cls, fixture: object) -> "GaReleaseRecord":
@@ -131,6 +140,9 @@ class GaReleaseRecord:
                 default_writer_receipt_digest=str(
                     getattr(fixture, "default_writer_receipt_digest")
                 ),
+                campaign_key=getattr(fixture, "campaign_key", None),
+                activation_id=getattr(fixture, "activation_id", None),
+                writer_generation=getattr(fixture, "writer_generation", None),
             )
         except AttributeError as error:
             raise ReleaseGateError("GA_STATIC_RECORD_FIELDS_MISSING") from error
@@ -148,7 +160,12 @@ class GaReleaseRecord:
         unknown = set(raw) - allowed
         if unknown:
             raise ReleaseGateError("GA_STATIC_RECORD_FIELDS_INVALID")
-        required = _STATIC_RECORD_FIELDS - {"post_canary_changed_paths"}
+        required = _STATIC_RECORD_FIELDS - {
+            "activation_id",
+            "campaign_key",
+            "post_canary_changed_paths",
+            "writer_generation",
+        }
         if required - set(raw):
             raise ReleaseGateError("GA_STATIC_RECORD_FIELDS_MISSING")
         paths = raw.get("post_canary_changed_paths", ALLOWED_METADATA_PATHS)
@@ -165,6 +182,9 @@ class GaReleaseRecord:
                 activation_receipt_digest=raw["activation_receipt_digest"],  # type: ignore[arg-type]
                 default_writer_receipt_digest=raw["default_writer_receipt_digest"],  # type: ignore[arg-type]
                 post_canary_changed_paths=normalized_paths,
+                campaign_key=raw.get("campaign_key"),  # type: ignore[arg-type]
+                activation_id=raw.get("activation_id"),  # type: ignore[arg-type]
+                writer_generation=raw.get("writer_generation"),  # type: ignore[arg-type]
             )
         except KeyError as error:
             raise ReleaseGateError("GA_STATIC_RECORD_FIELDS_MISSING") from error
@@ -301,6 +321,21 @@ def clean_install_and_smoke(source: Path, run_root: Path) -> CleanInstallResult:
     for root in roots:
         install.extend(("--install-root", str(root)))
         check.extend(("--install-root", str(root)))
+
+    # Check the source manifest without allowing the installer to regenerate
+    # it, then check any existing installed package before replacement. A
+    # fresh surface has no package to verify and is installed below.
+    run([*common, "--check"], cwd=run_root)
+    existing_roots = tuple(
+        root
+        for root in roots
+        if any((root / skill).exists() for skill in ("implement-gwo", "orchestrator"))
+    )
+    if existing_roots:
+        existing_check = [*common, "--check"]
+        for root in existing_roots:
+            existing_check.extend(("--install-root", str(root)))
+        run(existing_check, cwd=run_root)
     run(install, cwd=run_root)
     run(check, cwd=run_root)
     for root in roots:
@@ -329,6 +364,9 @@ class ReleaseGateReceipt:
     canary_receipt_digest: str
     activation_receipt_digest: str
     default_writer_receipt_digest: str
+    campaign_key: str
+    activation_id: str
+    writer_generation: str
 
     @classmethod
     def from_exact(
@@ -339,13 +377,23 @@ class ReleaseGateReceipt:
         admission: object,
         ci: object,
         main_sha: str,
+        *,
+        canary_target_sha: str | None = None,
+        campaign_key: str | None = None,
+        activation_id: str | None = None,
+        writer_generation: str | None = None,
     ) -> "ReleaseGateReceipt":
-        del admission
+        if canary_target_sha is None:
+            if isinstance(canary, Mapping):
+                canary_target_sha = str(canary["canary_target_sha"])
+            else:
+                canary_target_sha = str(getattr(canary, "canary_target_sha"))
+        del activation, admission
         return cls(
             version=record.version,
             repository=record.repository,
             evidence_base_sha=record.evidence_base_sha,
-            canary_target_sha=str(getattr(canary, "canary_target_sha")),
+            canary_target_sha=canary_target_sha,
             tag_candidate_sha=main_sha,
             ci_run_id=int(getattr(ci, "run_id")),
             ci_head_sha=str(getattr(ci, "head_sha")),
@@ -353,10 +401,17 @@ class ReleaseGateReceipt:
             canary_receipt_digest=record.canary_receipt_digest,
             activation_receipt_digest=record.activation_receipt_digest,
             default_writer_receipt_digest=record.default_writer_receipt_digest,
+            campaign_key=campaign_key or record.campaign_key or "",
+            activation_id=activation_id or record.activation_id or "",
+            writer_generation=writer_generation or record.writer_generation or "",
         )
 
 
 class GitAncestryReadback(Protocol):
+    repository: str
+
+    def current_origin_main_sha(self) -> str: ...
+
     def is_ancestor(self, ancestor: str, descendant: str) -> bool: ...
 
     def changed_paths(self, ancestor: str, descendant: str) -> tuple[str, ...]: ...
@@ -369,86 +424,243 @@ def _attribute(value: object, name: str, code: str) -> object:
         raise ReleaseGateError(code) from error
 
 
+def _canonical_readback_payload(
+    value: object, code: str
+) -> tuple[dict[str, object], str]:
+    try:
+        if isinstance(value, Mapping):
+            payload = dict(value)
+        elif dataclasses.is_dataclass(value):
+            payload = dataclasses.asdict(value)
+        elif hasattr(value, "__dict__"):
+            payload = dict(vars(value))
+        else:
+            raise TypeError("readback has no canonical object payload")
+        claimed = payload.pop("receipt_digest")
+        if type(claimed) is not str or claimed != digest_value(payload):
+            raise ValueError("receipt digest is not the canonical payload digest")
+        canonical_json_bytes(payload)
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise ReleaseGateError(code) from error
+    return payload, claimed
+
+
+def _required_readback_field(
+    payload: Mapping[str, object], name: str, code: str
+) -> object:
+    try:
+        return payload[name]
+    except KeyError as error:
+        raise ReleaseGateError(code) from error
+
+
+def _required_readback_text(payload: Mapping[str, object], name: str, code: str) -> str:
+    value = _required_readback_field(payload, name, code)
+    if type(value) is not str or not value.strip():
+        raise ReleaseGateError(code)
+    return value
+
+
+_IDENTITY_ALIASES = {
+    "repository": frozenset({"repository", "repo"}),
+    "campaign_key": frozenset({"campaign_key", "campaign", "campaign_id"}),
+    "activation_id": frozenset({"activation_id", "activation"}),
+    "writer_generation": frozenset({"writer_generation", "writer"}),
+}
+
+
+def _assert_nested_identity(
+    value: object,
+    expected: Mapping[str, str],
+    code: str,
+) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized = (
+                re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
+                .replace("-", "_")
+                .lower()
+            )
+            for field, aliases in _IDENTITY_ALIASES.items():
+                if normalized in aliases and field in expected:
+                    if isinstance(child, str) and child != expected[field]:
+                        raise ReleaseGateError(code)
+            _assert_nested_identity(child, expected, code)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _assert_nested_identity(child, expected, code)
+
+
 def verify_pre_tag(
     record: GaReleaseRecord,
     *,
-    main_sha: str,
+    main_sha: str | None,
     canary: object,
     activation: object,
     admission: object,
     ci: CiReadback,
     git: GitAncestryReadback,
 ) -> ReleaseGateReceipt:
-    try:
-        ci_run_id = int(_attribute(ci, "run_id", "GA_EXACT_CI_REQUIRED"))
-        ci_head_sha = str(_attribute(ci, "head_sha", "GA_EXACT_CI_REQUIRED"))
-        conclusion = str(_attribute(ci, "conclusion", "GA_EXACT_CI_REQUIRED"))
-        pytest_pass_count = int(
-            _attribute(ci, "pytest_pass_count", "GA_EXACT_CI_REQUIRED")
+    if any(
+        type(value) is not str or not value.strip()
+        for value in (
+            record.campaign_key,
+            record.activation_id,
+            record.writer_generation,
         )
+    ):
+        raise ReleaseGateError("GA_STATIC_IDENTITY_INVALID")
+    repository = _attribute(git, "repository", "GA_REPOSITORY_READBACK_INVALID")
+    if repository != record.repository:
+        raise ReleaseGateError("GA_REPOSITORY_READBACK_INVALID")
+    try:
+        current_main_sha = git.current_origin_main_sha()
+    except (AttributeError, OSError, subprocess.CalledProcessError) as error:
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_REQUIRED") from error
+    if (
+        not isinstance(current_main_sha, str)
+        or _SHA.fullmatch(current_main_sha) is None
+    ):
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_INVALID")
+    if main_sha is not None and main_sha != current_main_sha:
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_MISMATCH")
+    main_sha = current_main_sha
+
+    try:
+        ci_run_id = _attribute(ci, "run_id", "GA_EXACT_CI_REQUIRED")
+        ci_head_sha = _attribute(ci, "head_sha", "GA_EXACT_CI_REQUIRED")
+        conclusion = _attribute(ci, "conclusion", "GA_EXACT_CI_REQUIRED")
+        pytest_pass_count = _attribute(ci, "pytest_pass_count", "GA_EXACT_CI_REQUIRED")
     except (TypeError, ValueError) as error:
         raise ReleaseGateError("GA_EXACT_CI_REQUIRED") from error
     if (
-        not isinstance(main_sha, str)
-        or _SHA.fullmatch(main_sha) is None
+        type(ci_run_id) is not int
+        or ci_run_id < 1
+        or type(ci_head_sha) is not str
         or _SHA.fullmatch(ci_head_sha) is None
+        or type(conclusion) is not str
         or main_sha != ci_head_sha
         or conclusion != "success"
-        or ci_run_id < 1
+        or type(pytest_pass_count) is not int
         or pytest_pass_count < 1
     ):
         raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
 
+    canary_payload, canary_receipt_digest = _canonical_readback_payload(
+        canary, "GA_CANARY_RECEIPT_INVALID"
+    )
+    activation_payload, activation_receipt_digest = _canonical_readback_payload(
+        activation, "GA_ACTIVATION_READBACK_INVALID"
+    )
+    admission_payload, default_writer_receipt_digest = _canonical_readback_payload(
+        admission, "GA_DEFAULT_WRITER_READBACK_INVALID"
+    )
+
+    canary_repository = _required_readback_text(
+        canary_payload, "repository", "GA_CANARY_RECEIPT_MISMATCH"
+    )
+    canary_campaign = _required_readback_text(
+        canary_payload, "campaign_key", "GA_CANARY_RECEIPT_MISMATCH"
+    )
+    canary_target_sha = _required_readback_field(
+        canary_payload, "canary_target_sha", "GA_CANARY_RECEIPT_MISMATCH"
+    )
     if (
-        _attribute(canary, "canary_target_sha", "GA_CANARY_RECEIPT_MISMATCH")
-        != record.canary_target_sha
-        or _attribute(canary, "receipt_digest", "GA_CANARY_RECEIPT_MISMATCH")
-        != record.canary_receipt_digest
+        canary_repository != record.repository
+        or canary_receipt_digest != record.canary_receipt_digest
+        or canary_target_sha != record.canary_target_sha
+        or canary_campaign != record.campaign_key
     ):
         raise ReleaseGateError("GA_CANARY_RECEIPT_MISMATCH")
-
-    activation_fields = (
-        _attribute(activation, "receipt_digest", "GA_ACTIVATION_READBACK_INVALID"),
-        _attribute(activation, "repository", "GA_ACTIVATION_READBACK_INVALID"),
-        _attribute(activation, "writer_generation", "GA_ACTIVATION_READBACK_INVALID"),
+    expected_campaign = record.campaign_key
+    canary_identity = {
+        "repository": record.repository,
+        "campaign_key": expected_campaign,
+    }
+    canary_activation_id = _required_readback_text(
+        canary_payload, "activation_id", "GA_CANARY_RECEIPT_MISMATCH"
     )
-    if activation_fields != (
-        record.activation_receipt_digest,
-        record.repository,
-        "v8",
+    canary_identity["activation_id"] = canary_activation_id
+    _assert_nested_identity(
+        canary_payload, canary_identity, "GA_CANARY_RECEIPT_MISMATCH"
+    )
+
+    activation_repository = _required_readback_text(
+        activation_payload, "repository", "GA_ACTIVATION_READBACK_INVALID"
+    )
+    activation_campaign = _required_readback_text(
+        activation_payload, "campaign_key", "GA_ACTIVATION_READBACK_INVALID"
+    )
+    activation_id = _required_readback_text(
+        activation_payload, "activation_id", "GA_ACTIVATION_READBACK_INVALID"
+    )
+    writer_generation = _required_readback_text(
+        activation_payload, "writer_generation", "GA_ACTIVATION_READBACK_INVALID"
+    )
+    if (
+        activation_receipt_digest != record.activation_receipt_digest
+        or activation_repository != record.repository
+        or activation_campaign != expected_campaign
+        or activation_id != record.activation_id
+        or writer_generation != record.writer_generation
+        or writer_generation != "v8"
     ):
         raise ReleaseGateError("GA_ACTIVATION_READBACK_INVALID")
-    activation_id = _attribute(
-        activation, "activation_id", "GA_ACTIVATION_READBACK_INVALID"
+    _assert_nested_identity(
+        activation_payload,
+        {
+            "repository": record.repository,
+            "campaign_key": expected_campaign,
+            "activation_id": activation_id,
+            "writer_generation": writer_generation,
+        },
+        "GA_ACTIVATION_READBACK_INVALID",
     )
-    if not isinstance(activation_id, str) or not activation_id:
-        raise ReleaseGateError("GA_ACTIVATION_READBACK_INVALID")
+    if canary_activation_id != activation_id:
+        raise ReleaseGateError("GA_CANARY_RECEIPT_MISMATCH")
 
-    admission_fields = (
-        getattr(
-            getattr(admission, "mode", None), "value", getattr(admission, "mode", None)
-        ),
-        _attribute(admission, "repository", "GA_DEFAULT_WRITER_READBACK_INVALID"),
-        _attribute(
-            admission, "writer_generation", "GA_DEFAULT_WRITER_READBACK_INVALID"
-        ),
-        _attribute(admission, "activation_id", "GA_DEFAULT_WRITER_READBACK_INVALID"),
-        _attribute(
-            admission,
-            "acceptance_receipt_digest",
-            "GA_DEFAULT_WRITER_READBACK_INVALID",
-        ),
-        _attribute(admission, "receipt_digest", "GA_DEFAULT_WRITER_READBACK_INVALID"),
+    admission_mode = _required_readback_field(
+        admission_payload, "mode", "GA_DEFAULT_WRITER_READBACK_INVALID"
     )
-    if admission_fields != (
-        "default_v8",
-        record.repository,
-        "v8",
-        activation_id,
-        record.canary_receipt_digest,
-        record.default_writer_receipt_digest,
+    admission_repository = _required_readback_text(
+        admission_payload, "repository", "GA_DEFAULT_WRITER_READBACK_INVALID"
+    )
+    admission_campaign = _required_readback_text(
+        admission_payload, "campaign_key", "GA_DEFAULT_WRITER_READBACK_INVALID"
+    )
+    admission_writer_generation = _required_readback_text(
+        admission_payload, "writer_generation", "GA_DEFAULT_WRITER_READBACK_INVALID"
+    )
+    admission_activation_id = _required_readback_text(
+        admission_payload, "activation_id", "GA_DEFAULT_WRITER_READBACK_INVALID"
+    )
+    admission_acceptance_digest = _required_readback_text(
+        admission_payload,
+        "acceptance_receipt_digest",
+        "GA_DEFAULT_WRITER_READBACK_INVALID",
+    )
+    if (
+        admission_mode != "default_v8"
+        or admission_repository != record.repository
+        or admission_campaign != expected_campaign
+        or admission_writer_generation != writer_generation
+        or admission_activation_id != activation_id
+        or admission_acceptance_digest != record.canary_receipt_digest
+        or default_writer_receipt_digest != record.default_writer_receipt_digest
+        or admission_activation_id != record.activation_id
+        or admission_writer_generation != record.writer_generation
     ):
         raise ReleaseGateError("GA_DEFAULT_WRITER_READBACK_INVALID")
+    _assert_nested_identity(
+        admission_payload,
+        {
+            "repository": record.repository,
+            "campaign_key": expected_campaign,
+            "activation_id": activation_id,
+            "writer_generation": writer_generation,
+        },
+        "GA_DEFAULT_WRITER_READBACK_INVALID",
+    )
 
     try:
         if not git.is_ancestor(
@@ -470,7 +682,16 @@ def verify_pre_tag(
         raise ReleaseGateError("GA_POST_CANARY_DELTA_NOT_METADATA_ONLY")
 
     return ReleaseGateReceipt.from_exact(
-        record, canary, activation, admission, ci, main_sha
+        record,
+        canary,
+        activation,
+        admission,
+        ci,
+        main_sha,
+        canary_target_sha=str(canary_target_sha),
+        campaign_key=expected_campaign,
+        activation_id=activation_id,
+        writer_generation=writer_generation,
     )
 
 
@@ -484,6 +705,15 @@ def parse_pytest_count(log: str) -> int:
 @dataclass(frozen=True, slots=True)
 class GitCliReadback:
     repository: str
+
+    def current_origin_main_sha(self) -> str:
+        output = subprocess.check_output(
+            ("git", "rev-parse", "--verify", "refs/remotes/origin/main"),
+            text=True,
+        ).strip()
+        if _SHA.fullmatch(output) is None:
+            raise ReleaseGateError("GA_MAIN_SHA_READBACK_INVALID")
+        return output
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         return (
@@ -544,10 +774,10 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
             record = load_ga_release_record(
                 _required_path(args.record, "GA_RELEASE_RECORD_REQUIRED")
             )
-            main_sha = args.main_sha
             ci_run_id = args.ci_run
-            if not isinstance(main_sha, str) or ci_run_id is None:
+            if ci_run_id is None:
                 raise ReleaseGateError("GA_PRE_TAG_INPUTS_REQUIRED")
+            git = GitCliReadback(args.repository)
             run_json = json.loads(
                 subprocess.check_output(
                     (
@@ -556,13 +786,22 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                         "view",
                         str(ci_run_id),
                         "--repo",
-                        args.repository,
+                        git.repository,
                         "--json",
-                        "headSha,conclusion",
+                        "databaseId,headSha,conclusion",
                     ),
                     text=True,
                 )
             )
+            if not isinstance(run_json, Mapping):
+                raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
+            try:
+                if int(run_json["databaseId"]) != ci_run_id:
+                    raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
+                ci_head_sha = run_json["headSha"]
+                ci_conclusion = run_json["conclusion"]
+            except (KeyError, TypeError, ValueError) as error:
+                raise ReleaseGateError("GA_EXACT_CI_REQUIRED") from error
             log = subprocess.check_output(
                 (
                     "gh",
@@ -570,20 +809,20 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                     "view",
                     str(ci_run_id),
                     "--repo",
-                    args.repository,
+                    git.repository,
                     "--log",
                 ),
                 text=True,
             )
             ci = CiReadback(
                 run_id=ci_run_id,
-                head_sha=str(run_json["headSha"]),
-                conclusion=str(run_json["conclusion"]),
+                head_sha=ci_head_sha,
+                conclusion=ci_conclusion,
                 pytest_pass_count=parse_pytest_count(log),
             )
             receipt = verify_pre_tag(
                 record,
-                main_sha=main_sha,
+                main_sha=args.main_sha,
                 canary=_snapshot(
                     _required_path(args.canary, "GA_CANARY_RECEIPT_REQUIRED")
                 ),
@@ -597,7 +836,7 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                     )
                 ),
                 ci=ci,
-                git=GitCliReadback(args.repository),
+                git=git,
             )
             _write_json(
                 _required_path(args.output, "GA_OUTPUT_REQUIRED"),
@@ -642,19 +881,26 @@ RELEASE_CONTRACT = """# GWO V8 GA Release Contract
 Schema: `gwo-v8-ga-release-record.v1`
 
 The committed record freezes `evidence_base_sha`, `canary_target_sha`, the
+repository/campaign/activation/default-writer identity, the
 Canary/Activation/default-writer receipt digests, and the exact metadata path
 allow-list. It deliberately contains no tag-candidate SHA, final metadata commit SHA,
-CI run ID, or pytest count. The pre-tag command obtains those
-dynamic values only from exact merged-main and CI readback, then writes a
+CI run ID, or pytest count. The pre-tag command obtains those dynamic values
+only from the current `origin/main` and exact CI readback, then writes a
 separate `ReleaseGateReceipt`.
 
-The pre-tag gate fails closed unless the CI head SHA equals the tag-candidate
-SHA, the CI conclusion is `success`, a pytest pass count is read from the
-exact CI log, both static SHAs are ancestors of the candidate, and the
-post-Canary delta is exactly the metadata allow-list. The post-release gate
-archives the tag into an isolated temporary source and installs both Skill
-packages into temporary `.agents`, `.codex`, and `.claude` surfaces before
-smoking only the public `start`, `advance`, and `inspect` operations.
+Every pre-tag receipt input is canonicalized and its complete payload digest is
+recomputed; a claimed `receipt_digest` is never accepted by itself. The gate
+also binds all readbacks to the committed repository, campaign, activation,
+and default-writer identity. It fails closed unless the exact CI run readback
+has the same head as the current `origin/main`, the conclusion is `success`,
+a pytest pass count is read from that run's log, both static SHAs are
+ancestors of the candidate, and the post-Canary delta is exactly the metadata
+allow-list. The renderer rejects dynamic SHA/CI fields at any nesting or alias
+and publishes its three documents all-or-nothing. The post-release gate
+checks existing package manifests before any regeneration, then archives the
+tag into an isolated temporary source and installs both Skill packages into
+temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only the
+public `start`, `advance`, and `inspect` operations.
 """
 
 
