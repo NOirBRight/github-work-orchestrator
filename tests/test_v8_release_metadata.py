@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import io
 import json
+import math
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -95,6 +98,7 @@ def _canonical_pre_tag_case(
     git = SimpleNamespace(
         repository=repository,
         current_origin_main_sha=lambda: main_sha,
+        tree_sha=lambda commit: "a" * 40,
         is_ancestor=lambda ancestor, descendant: True,
         changed_paths=lambda base, candidate: (
             "CHANGELOG.md",
@@ -133,7 +137,7 @@ def test_static_ga_record_rejects_dynamic_fields(tmp_path):
     path = write_ga_release_record(tmp_path / "ga-record.json", fixture)
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["tag_candidate_sha"] = "3" * 40
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.write_bytes(verifier.canonical_json_bytes(payload))
 
     with pytest.raises(ReleaseGateError) as error:
         load_ga_release_record(path)
@@ -158,6 +162,147 @@ def test_pre_tag_receipt_binds_dynamic_tag_candidate_and_exact_ci():
     assert receipt.ci_head_sha == ci.head_sha
     assert receipt.ci_run_id == 987
     assert receipt.pytest_pass_count == 42
+    assert receipt.tag_candidate_tree_sha == "a" * 40
+
+
+def test_pre_tag_accepts_default_v8_readback_with_no_campaign_key():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    admission_body = dict(vars(admission))
+    admission_body.pop("receipt_digest")
+    admission_body["campaign_key"] = None
+    admission_body["readback"] = {
+        "repository": record.repository,
+        "campaign_key": None,
+    }
+    admission = SimpleNamespace(
+        **admission_body,
+        receipt_digest=digest_value(admission_body),
+    )
+    record = replace(record, default_writer_receipt_digest=admission.receipt_digest)
+
+    receipt = verify_pre_tag(
+        record,
+        main_sha=ci.head_sha,
+        canary=canary,
+        activation=activation,
+        admission=admission,
+        ci=ci,
+        git=git,
+    )
+
+    assert receipt.campaign_key == record.campaign_key
+
+
+def test_pre_tag_rejects_origin_main_drift_before_success():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    main_readbacks = iter((ci.head_sha, "4" * 40))
+    git.current_origin_main_sha = lambda: next(main_readbacks)
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=ci.head_sha,
+            canary=canary,
+            activation=activation,
+            admission=admission,
+            ci=ci,
+            git=git,
+        )
+
+    assert error.value.code == "GA_MAIN_SHA_READBACK_MISMATCH"
+
+
+def test_git_readback_is_bound_to_explicit_checkout_and_origin_repository(
+    tmp_path, monkeypatch
+):
+    calls = []
+    repository = "NOirBRight/github-work-orchestrator"
+
+    def fake_check_output(arguments, *, cwd=None, text=True):
+        calls.append((arguments, cwd))
+        if arguments == ("git", "remote", "get-url", "origin"):
+            return "https://github.com/NOirBRight/github-work-orchestrator.git\n"
+        if arguments == (
+            "git",
+            "rev-parse",
+            "--verify",
+            "refs/remotes/origin/main",
+        ):
+            return "3" * 40 + "\n"
+        if arguments == ("git", "rev-parse", "--verify", "3" * 40 + "^{tree}"):
+            return "a" * 40 + "\n"
+        if arguments == (
+            "git",
+            "diff",
+            "--name-only",
+            "1" * 40 + ".." + "3" * 40,
+        ):
+            return "CHANGELOG.md\n"
+        raise AssertionError(arguments)
+
+    def fake_run(arguments, *, cwd=None, check=False):
+        calls.append((arguments, cwd))
+        assert arguments == (
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            "1" * 40,
+            "3" * 40,
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(verifier.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(verifier.subprocess, "run", fake_run)
+
+    git = GitCliReadback(repository, checkout=tmp_path)
+
+    assert git.current_origin_main_sha() == "3" * 40
+    assert git.tree_sha("3" * 40) == "a" * 40
+    assert git.is_ancestor("1" * 40, "3" * 40)
+    assert git.changed_paths("1" * 40, "3" * 40) == ("CHANGELOG.md",)
+    assert calls
+    assert all(cwd == tmp_path for _arguments, cwd in calls)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"repository":"repo","repository":"other"}',
+        b'{ "repository": "repo" }\n',
+    ],
+)
+def test_snapshot_rejects_duplicate_or_noncanonical_json(tmp_path, raw):
+    path = tmp_path / "readback.json"
+    path.write_bytes(raw)
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier._snapshot(path)
+
+    assert error.value.code == "GA_RECEIPT_UNREADABLE"
+
+
+def test_pre_tag_rejects_non_string_nested_identity():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    payload = dict(vars(canary))
+    payload.pop("receipt_digest")
+    payload["subject"] = {
+        "repository": 17,
+        "campaign_key": record.campaign_key,
+    }
+    tampered = SimpleNamespace(**payload, receipt_digest=digest_value(payload))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=ci.head_sha,
+            canary=tampered,
+            activation=activation,
+            admission=admission,
+            ci=ci,
+            git=git,
+        )
+
+    assert error.value.code == "GA_CANARY_RECEIPT_MISMATCH"
 
 
 def test_pre_tag_rejects_ci_for_a_different_main_sha():
@@ -327,10 +472,12 @@ def test_pre_tag_cli_rejects_ci_run_id_that_does_not_match_exact_readback(
         (activation_path, activation),
         (admission_path, admission),
     ):
-        path.write_bytes(json.dumps(vars(value)).encode("utf-8"))
+        path.write_bytes(verifier.canonical_json_bytes(vars(value)))
 
-    def fake_check_output(arguments, *, text=True):
-        del text
+    def fake_check_output(arguments, *, text=True, cwd=None):
+        del text, cwd
+        if arguments == ("git", "remote", "get-url", "origin"):
+            return "https://github.com/NOirBRight/github-work-orchestrator.git\n"
         if arguments[:3] == ("git", "rev-parse", "--verify"):
             return ci.head_sha
         if arguments[0:3] == ("gh", "run", "view") and "--json" in arguments:
@@ -433,6 +580,7 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
     [
         {"nested": {"tag_candidate_sha": "6" * 40}},
         {"ciEnvelope": {"headSha": "7" * 40}},
+        {"nested": {"commitHash": "8" * 40}},
     ],
 )
 def test_renderer_rejects_nested_or_aliased_dynamic_metadata(tmp_path, dynamic_payload):
@@ -456,6 +604,149 @@ def test_renderer_rejects_nested_or_aliased_dynamic_metadata(tmp_path, dynamic_p
         )
 
     assert error.value.code == "GA_DYNAMIC_METADATA_INPUT"
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_renderer_rejects_nonstandard_json_numbers(tmp_path, value):
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"metric": value}]},
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:root",
+                "canary_target_sha": "5" * 40,
+                "receipt_digest": "canary:1",
+            },
+            named_admission={"receipt_digest": "named:1"},
+            default_writer={
+                "receipt_digest": "default:1",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            },
+        )
+
+    assert error.value.code == "GA_METADATA_INPUT_INVALID"
+
+
+def test_renderer_cross_binds_named_admission_identity(tmp_path):
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:root",
+                "canary_target_sha": "5" * 40,
+                "receipt_digest": "canary:1",
+            },
+            named_admission={
+                "repository": "foreign/repository",
+                "receipt_digest": "named:1",
+            },
+            default_writer={
+                "receipt_digest": "default:1",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            },
+        )
+
+    assert error.value.code == "GA_METADATA_IDENTITY_MISMATCH"
+
+
+def test_renderer_syncs_staged_documents_before_publication(tmp_path, monkeypatch):
+    fsync_calls = []
+    monkeypatch.setattr(renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+
+    render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        acceptance={
+            "repository": "NOirBRight/github-work-orchestrator",
+            "campaign_key": "campaign:root",
+            "canary_target_sha": "5" * 40,
+            "receipt_digest": "canary:1",
+        },
+        named_admission={"receipt_digest": "named:1"},
+        default_writer={
+            "receipt_digest": "default:1",
+            "activation_id": "activation:1",
+            "writer_generation": "v8",
+        },
+    )
+
+    assert fsync_calls
+
+
+def test_post_release_rejects_tag_tree_different_from_pre_tag_subject(
+    tmp_path, monkeypatch
+):
+    repository = "NOirBRight/github-work-orchestrator"
+    pre_tag = tmp_path / "pre-tag.json"
+    pre_tag.write_bytes(
+        verifier.canonical_json_bytes(
+            {
+                "version": "8.0.0",
+                "repository": repository,
+                "evidence_base_sha": "1" * 40,
+                "canary_target_sha": "2" * 40,
+                "tag_candidate_sha": "3" * 40,
+                "tag_candidate_tree_sha": "4" * 40,
+                "ci_run_id": 987,
+                "ci_head_sha": "3" * 40,
+                "pytest_pass_count": 42,
+                "canary_receipt_digest": "canary:1",
+                "activation_receipt_digest": "activation:1",
+                "default_writer_receipt_digest": "default:1",
+                "campaign_key": "campaign:root",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            }
+        )
+    )
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w"):
+        pass
+
+    def fake_check_output(arguments, *, text=True, cwd=None):
+        if arguments == ("git", "remote", "get-url", "origin"):
+            return "https://github.com/NOirBRight/github-work-orchestrator.git\n"
+        if arguments == ("git", "rev-parse", "--verify", "refs/tags/v8.0.0^{commit}"):
+            return "3" * 40 + "\n"
+        if arguments == ("git", "rev-parse", "--verify", "refs/tags/v8.0.0^{tree}"):
+            return "5" * 40 + "\n"
+        if arguments[:2] == ("git", "archive"):
+            return archive_buffer.getvalue()
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(verifier.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(
+        verifier,
+        "clean_install_and_smoke",
+        lambda source, run_root: (_ for _ in ()).throw(
+            AssertionError("tag mismatch must fail before installation")
+        ),
+    )
+
+    result = verify_main(
+        [
+            "--post-release",
+            "--tag",
+            "v8.0.0",
+            "--pre-tag-receipt",
+            str(pre_tag),
+            "--run-root",
+            str(tmp_path / "run"),
+            "--output",
+            str(tmp_path / "result.json"),
+        ]
+    )
+
+    assert result == 2
+    assert not (tmp_path / "result.json").exists()
 
 
 def test_renderer_retains_legitimate_nested_receipt_values(tmp_path):

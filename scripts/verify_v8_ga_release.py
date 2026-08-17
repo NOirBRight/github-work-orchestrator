@@ -70,13 +70,57 @@ class ReleaseGateError(RuntimeError):
 
 
 def canonical_json_bytes(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def digest_value(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _strict_json_loads(raw: bytes | str, *, require_canonical: bool) -> object:
+    def reject_constant(token: str) -> None:
+        raise ValueError(f"non-standard JSON number: {token}")
+
+    def reject_duplicate(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, child in pairs:
+            if key in value:
+                raise _DuplicateJsonKey(key)
+            value[key] = child
+        return value
+
+    try:
+        text = raw.decode("utf-8") if type(raw) is bytes else raw
+        if type(text) is not str:
+            raise TypeError("JSON input must be UTF-8 bytes or text")
+        value = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate,
+            parse_constant=reject_constant,
+        )
+        if require_canonical and canonical_json_bytes(value) != (
+            raw if type(raw) is bytes else raw.encode("utf-8")
+        ):
+            raise ValueError("JSON is not canonical")
+        return value
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ReleaseGateError("GA_CANONICAL_JSON_INVALID") from error
+
+
+def _strict_canonical_json_loads(raw: bytes | str) -> object:
+    return _strict_json_loads(raw, require_canonical=True)
 
 
 def _require_sha(value: object, code: str) -> str:
@@ -171,8 +215,10 @@ class GaReleaseRecord:
         paths = raw.get("post_canary_changed_paths", ALLOWED_METADATA_PATHS)
         if not isinstance(paths, (list, tuple)):
             raise ReleaseGateError("GA_METADATA_PATH_ALLOWLIST_INVALID")
+        if not all(type(path) is str for path in paths):
+            raise ReleaseGateError("GA_METADATA_PATH_ALLOWLIST_INVALID")
         try:
-            normalized_paths = tuple(str(path) for path in paths)
+            normalized_paths = tuple(paths)
             return cls(
                 version=raw["version"],  # type: ignore[arg-type]
                 repository=raw["repository"],  # type: ignore[arg-type]
@@ -203,8 +249,8 @@ def write_ga_release_record(path: Path, fixture: object) -> Path:
 
 def load_ga_release_record(path: Path) -> GaReleaseRecord:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raw = _strict_canonical_json_loads(path.read_bytes())
+    except (OSError, UnicodeError, ReleaseGateError) as error:
         raise ReleaseGateError("GA_RELEASE_RECORD_UNREADABLE") from error
     if not isinstance(raw, Mapping) or raw.get("schema") != GA_RELEASE_RECORD_SCHEMA:
         raise ReleaseGateError("GA_RELEASE_RECORD_SCHEMA_INVALID")
@@ -358,6 +404,7 @@ class ReleaseGateReceipt:
     evidence_base_sha: str
     canary_target_sha: str
     tag_candidate_sha: str
+    tag_candidate_tree_sha: str
     ci_run_id: int
     ci_head_sha: str
     pytest_pass_count: int
@@ -367,6 +414,32 @@ class ReleaseGateReceipt:
     campaign_key: str
     activation_id: str
     writer_generation: str
+
+    def __post_init__(self) -> None:
+        if self.version != GA_VERSION:
+            raise ReleaseGateError("GA_VERSION_INVALID")
+        _require_text(self.repository, "GA_REPOSITORY_INVALID")
+        for value in (
+            self.evidence_base_sha,
+            self.canary_target_sha,
+            self.tag_candidate_sha,
+            self.tag_candidate_tree_sha,
+            self.ci_head_sha,
+        ):
+            _require_sha(value, "GA_RELEASE_RECEIPT_SHA_INVALID")
+        if type(self.ci_run_id) is not int or self.ci_run_id < 1:
+            raise ReleaseGateError("GA_RELEASE_RECEIPT_CI_INVALID")
+        if type(self.pytest_pass_count) is not int or self.pytest_pass_count < 1:
+            raise ReleaseGateError("GA_RELEASE_RECEIPT_CI_INVALID")
+        for value in (
+            self.canary_receipt_digest,
+            self.activation_receipt_digest,
+            self.default_writer_receipt_digest,
+            self.campaign_key,
+            self.activation_id,
+            self.writer_generation,
+        ):
+            _require_text(value, "GA_RELEASE_RECEIPT_IDENTITY_INVALID")
 
     @classmethod
     def from_exact(
@@ -378,6 +451,7 @@ class ReleaseGateReceipt:
         ci: object,
         main_sha: str,
         *,
+        main_tree_sha: str,
         canary_target_sha: str | None = None,
         campaign_key: str | None = None,
         activation_id: str | None = None,
@@ -395,6 +469,7 @@ class ReleaseGateReceipt:
             evidence_base_sha=record.evidence_base_sha,
             canary_target_sha=canary_target_sha,
             tag_candidate_sha=main_sha,
+            tag_candidate_tree_sha=main_tree_sha,
             ci_run_id=int(getattr(ci, "run_id")),
             ci_head_sha=str(getattr(ci, "head_sha")),
             pytest_pass_count=int(getattr(ci, "pytest_pass_count")),
@@ -406,11 +481,23 @@ class ReleaseGateReceipt:
             writer_generation=writer_generation or record.writer_generation or "",
         )
 
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> "ReleaseGateReceipt":
+        fields = {field.name for field in dataclasses.fields(cls)}
+        if set(raw) != fields:
+            raise ReleaseGateError("GA_PRE_TAG_RECEIPT_FIELDS_INVALID")
+        try:
+            return cls(**raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as error:
+            raise ReleaseGateError("GA_PRE_TAG_RECEIPT_INVALID") from error
+
 
 class GitAncestryReadback(Protocol):
     repository: str
 
     def current_origin_main_sha(self) -> str: ...
+
+    def tree_sha(self, commit: str) -> str: ...
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool: ...
 
@@ -461,6 +548,17 @@ def _required_readback_text(payload: Mapping[str, object], name: str, code: str)
     return value
 
 
+def _optional_readback_text(
+    payload: Mapping[str, object], name: str, code: str
+) -> str | None:
+    value = _required_readback_field(payload, name, code)
+    if value is None:
+        return None
+    if type(value) is not str or not value.strip():
+        raise ReleaseGateError(code)
+    return value
+
+
 _IDENTITY_ALIASES = {
     "repository": frozenset({"repository", "repo"}),
     "campaign_key": frozenset({"campaign_key", "campaign", "campaign_id"}),
@@ -473,22 +571,33 @@ def _assert_nested_identity(
     value: object,
     expected: Mapping[str, str],
     code: str,
+    *,
+    allow_none: frozenset[str] = frozenset(),
 ) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            normalized = (
-                re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
-                .replace("-", "_")
-                .lower()
-            )
+            normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
+            normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
             for field, aliases in _IDENTITY_ALIASES.items():
                 if normalized in aliases and field in expected:
-                    if isinstance(child, str) and child != expected[field]:
+                    if child is None and field in allow_none:
+                        continue
+                    if type(child) is not str or child != expected[field]:
                         raise ReleaseGateError(code)
-            _assert_nested_identity(child, expected, code)
+            _assert_nested_identity(child, expected, code, allow_none=allow_none)
     elif isinstance(value, (list, tuple)):
         for child in value:
-            _assert_nested_identity(child, expected, code)
+            _assert_nested_identity(child, expected, code, allow_none=allow_none)
+
+
+def _read_origin_main_sha(git: GitAncestryReadback) -> str:
+    try:
+        value = git.current_origin_main_sha()
+    except (AttributeError, OSError, subprocess.CalledProcessError) as error:
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_REQUIRED") from error
+    if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_INVALID")
+    return value
 
 
 def verify_pre_tag(
@@ -513,15 +622,7 @@ def verify_pre_tag(
     repository = _attribute(git, "repository", "GA_REPOSITORY_READBACK_INVALID")
     if repository != record.repository:
         raise ReleaseGateError("GA_REPOSITORY_READBACK_INVALID")
-    try:
-        current_main_sha = git.current_origin_main_sha()
-    except (AttributeError, OSError, subprocess.CalledProcessError) as error:
-        raise ReleaseGateError("GA_MAIN_SHA_READBACK_REQUIRED") from error
-    if (
-        not isinstance(current_main_sha, str)
-        or _SHA.fullmatch(current_main_sha) is None
-    ):
-        raise ReleaseGateError("GA_MAIN_SHA_READBACK_INVALID")
+    current_main_sha = _read_origin_main_sha(git)
     if main_sha is not None and main_sha != current_main_sha:
         raise ReleaseGateError("GA_MAIN_SHA_READBACK_MISMATCH")
     main_sha = current_main_sha
@@ -625,7 +726,7 @@ def verify_pre_tag(
     admission_repository = _required_readback_text(
         admission_payload, "repository", "GA_DEFAULT_WRITER_READBACK_INVALID"
     )
-    admission_campaign = _required_readback_text(
+    admission_campaign = _optional_readback_text(
         admission_payload, "campaign_key", "GA_DEFAULT_WRITER_READBACK_INVALID"
     )
     admission_writer_generation = _required_readback_text(
@@ -642,7 +743,10 @@ def verify_pre_tag(
     if (
         admission_mode != "default_v8"
         or admission_repository != record.repository
-        or admission_campaign != expected_campaign
+        or (
+            admission_campaign is not None
+            and admission_campaign != expected_campaign
+        )
         or admission_writer_generation != writer_generation
         or admission_activation_id != activation_id
         or admission_acceptance_digest != record.canary_receipt_digest
@@ -660,6 +764,7 @@ def verify_pre_tag(
             "writer_generation": writer_generation,
         },
         "GA_DEFAULT_WRITER_READBACK_INVALID",
+        allow_none=frozenset({"campaign_key"}),
     )
 
     try:
@@ -681,6 +786,15 @@ def verify_pre_tag(
     ):
         raise ReleaseGateError("GA_POST_CANARY_DELTA_NOT_METADATA_ONLY")
 
+    try:
+        main_tree_sha = git.tree_sha(main_sha)
+    except (AttributeError, OSError, subprocess.CalledProcessError) as error:
+        raise ReleaseGateError("GA_GIT_TREE_READBACK_REQUIRED") from error
+    if not isinstance(main_tree_sha, str) or _SHA.fullmatch(main_tree_sha) is None:
+        raise ReleaseGateError("GA_GIT_TREE_READBACK_INVALID")
+    if _read_origin_main_sha(git) != main_sha:
+        raise ReleaseGateError("GA_MAIN_SHA_READBACK_MISMATCH")
+
     return ReleaseGateReceipt.from_exact(
         record,
         canary,
@@ -688,6 +802,7 @@ def verify_pre_tag(
         admission,
         ci,
         main_sha,
+        main_tree_sha=main_tree_sha,
         canary_target_sha=str(canary_target_sha),
         campaign_key=expected_campaign,
         activation_id=activation_id,
@@ -702,44 +817,128 @@ def parse_pytest_count(log: str) -> int:
     return int(matches[-1])
 
 
+def _repository_from_remote(remote: str) -> str:
+    value = remote.strip()
+    if value.startswith("git@github.com:"):
+        repository = value.removeprefix("git@github.com:")
+    elif value.startswith(("https://github.com/", "http://github.com/")):
+        repository = value.split("github.com/", 1)[1]
+    elif value.startswith("ssh://git@github.com/"):
+        repository = value.removeprefix("ssh://git@github.com/")
+    else:
+        raise ReleaseGateError("GA_GIT_REMOTE_INVALID")
+    repository = repository.removesuffix(".git").strip("/")
+    if repository.count("/") != 1 or any(not part for part in repository.split("/")):
+        raise ReleaseGateError("GA_GIT_REMOTE_INVALID")
+    return repository
+
+
 @dataclass(frozen=True, slots=True)
 class GitCliReadback:
     repository: str
+    checkout: Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.repository, "GA_REPOSITORY_INVALID")
+        checkout = (
+            self.checkout
+            if self.checkout is not None
+            else Path(__file__).resolve().parents[1]
+        ).resolve()
+        if not checkout.is_dir():
+            raise ReleaseGateError("GA_GIT_CHECKOUT_INVALID")
+        object.__setattr__(self, "checkout", checkout)
+        try:
+            remote = subprocess.check_output(
+                ("git", "remote", "get-url", "origin"),
+                cwd=checkout,
+                text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ReleaseGateError("GA_GIT_REMOTE_READBACK_REQUIRED") from error
+        if _repository_from_remote(remote) != self.repository:
+            raise ReleaseGateError("GA_GIT_REMOTE_REPOSITORY_MISMATCH")
+
+    def _check_output(self, arguments: Sequence[str]) -> str:
+        return subprocess.check_output(
+            tuple(arguments),
+            cwd=self.checkout,
+            text=True,
+        )
 
     def current_origin_main_sha(self) -> str:
-        output = subprocess.check_output(
-            ("git", "rev-parse", "--verify", "refs/remotes/origin/main"),
-            text=True,
+        output = self._check_output(
+            ("git", "rev-parse", "--verify", "refs/remotes/origin/main")
         ).strip()
         if _SHA.fullmatch(output) is None:
             raise ReleaseGateError("GA_MAIN_SHA_READBACK_INVALID")
+        return output
+
+    def tree_sha(self, commit: str) -> str:
+        output = self._check_output(
+            ("git", "rev-parse", "--verify", f"{commit}^{{tree}}")
+        ).strip()
+        if _SHA.fullmatch(output) is None:
+            raise ReleaseGateError("GA_GIT_TREE_READBACK_INVALID")
         return output
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         return (
             subprocess.run(
                 ("git", "merge-base", "--is-ancestor", ancestor, descendant),
+                cwd=self.checkout,
                 check=False,
             ).returncode
             == 0
         )
 
     def changed_paths(self, ancestor: str, descendant: str) -> tuple[str, ...]:
-        output = subprocess.check_output(
-            ("git", "diff", "--name-only", f"{ancestor}..{descendant}"),
-            text=True,
+        output = self._check_output(
+            ("git", "diff", "--name-only", f"{ancestor}..{descendant}")
         )
         return tuple(line for line in output.splitlines() if line)
+
+    def tag_subject(self, tag: str) -> tuple[str, str]:
+        commit = self._check_output(
+            ("git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}")
+        ).strip()
+        tree = self._check_output(
+            ("git", "rev-parse", "--verify", f"refs/tags/{tag}^{{tree}}")
+        ).strip()
+        if _SHA.fullmatch(commit) is None or _SHA.fullmatch(tree) is None:
+            raise ReleaseGateError("GA_TAG_READBACK_INVALID")
+        return commit, tree
+
+    def archive_tag(self, tag: str) -> bytes:
+        return subprocess.check_output(
+            ("git", "archive", "--format=tar", tag),
+            cwd=self.checkout,
+        )
 
 
 def _snapshot(path: Path) -> SimpleNamespace:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        payload = _strict_canonical_json_loads(path.read_bytes())
+    except (OSError, UnicodeError, ReleaseGateError) as error:
         raise ReleaseGateError("GA_RECEIPT_UNREADABLE") from error
     if not isinstance(payload, Mapping):
         raise ReleaseGateError("GA_RECEIPT_NOT_OBJECT")
     return SimpleNamespace(**payload)
+
+
+def _load_release_gate_receipt(path: Path) -> ReleaseGateReceipt:
+    try:
+        payload = _strict_canonical_json_loads(path.read_bytes())
+    except (OSError, UnicodeError, ReleaseGateError) as error:
+        raise ReleaseGateError("GA_PRE_TAG_RECEIPT_INVALID") from error
+    if not isinstance(payload, Mapping):
+        raise ReleaseGateError("GA_PRE_TAG_RECEIPT_INVALID")
+    try:
+        return ReleaseGateReceipt.from_mapping(payload)
+    except ReleaseGateError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise ReleaseGateError("GA_PRE_TAG_RECEIPT_INVALID") from error
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -765,8 +964,10 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--default-writer", type=Path)
     parser.add_argument("--ci-run", type=int)
     parser.add_argument("--repository", default="NOirBRight/github-work-orchestrator")
+    parser.add_argument("--checkout", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tag")
+    parser.add_argument("--pre-tag-receipt", type=Path)
     parser.add_argument("--run-root", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -777,8 +978,8 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
             ci_run_id = args.ci_run
             if ci_run_id is None:
                 raise ReleaseGateError("GA_PRE_TAG_INPUTS_REQUIRED")
-            git = GitCliReadback(args.repository)
-            run_json = json.loads(
+            git = GitCliReadback(args.repository, checkout=args.checkout)
+            run_json = _strict_json_loads(
                 subprocess.check_output(
                     (
                         "gh",
@@ -791,7 +992,8 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                         "databaseId,headSha,conclusion",
                     ),
                     text=True,
-                )
+                ),
+                require_canonical=False,
             )
             if not isinstance(run_json, Mapping):
                 raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
@@ -850,14 +1052,36 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(tag, str) or not tag:
                 raise ReleaseGateError("GA_TAG_REQUIRED")
             output = _required_path(args.output, "GA_OUTPUT_REQUIRED")
+            pre_tag = _load_release_gate_receipt(
+                _required_path(args.pre_tag_receipt, "GA_PRE_TAG_RECEIPT_REQUIRED")
+            )
+            if pre_tag.repository != args.repository:
+                raise ReleaseGateError("GA_REPOSITORY_READBACK_INVALID")
+            git = GitCliReadback(args.repository, checkout=args.checkout)
+            tag_commit_sha, tag_tree_sha = git.tag_subject(tag)
+            if (
+                tag_commit_sha != pre_tag.tag_candidate_sha
+                or tag_tree_sha != pre_tag.tag_candidate_tree_sha
+            ):
+                raise ReleaseGateError("GA_TAG_RELEASE_SUBJECT_MISMATCH")
             run_root.mkdir(parents=True, exist_ok=True)
             source = run_root / "tag-source"
             source.mkdir(parents=True, exist_ok=True)
-            archive = subprocess.check_output(("git", "archive", "--format=tar", tag))
+            archive = git.archive_tag(tag)
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
                 tar.extractall(source, filter="data")
             result = clean_install_and_smoke(source, run_root)
-            _write_json(output, dataclasses.asdict(result))
+            _write_json(
+                output,
+                {
+                    **dataclasses.asdict(result),
+                    "tag": tag,
+                    "tag_commit_sha": tag_commit_sha,
+                    "tag_tree_sha": tag_tree_sha,
+                    "pre_tag_tag_candidate_sha": pre_tag.tag_candidate_sha,
+                    "pre_tag_tag_candidate_tree_sha": pre_tag.tag_candidate_tree_sha,
+                },
+            )
             return 0
         return 3
     except (
@@ -888,17 +1112,21 @@ CI run ID, or pytest count. The pre-tag command obtains those dynamic values
 only from the current `origin/main` and exact CI readback, then writes a
 separate `ReleaseGateReceipt`.
 
-Every pre-tag receipt input is canonicalized and its complete payload digest is
-recomputed; a claimed `receipt_digest` is never accepted by itself. The gate
-also binds all readbacks to the committed repository, campaign, activation,
-and default-writer identity. It fails closed unless the exact CI run readback
-has the same head as the current `origin/main`, the conclusion is `success`,
-a pytest pass count is read from that run's log, both static SHAs are
-ancestors of the candidate, and the post-Canary delta is exactly the metadata
-allow-list. The renderer rejects dynamic SHA/CI fields at any nesting or alias
-and publishes its three documents all-or-nothing. The post-release gate
-checks existing package manifests before any regeneration, then archives the
-tag into an isolated temporary source and installs both Skill packages into
+Every pre-tag receipt input is strict canonical JSON: duplicate names,
+non-canonical bytes, and `NaN`/`Infinity` are rejected. Its complete payload
+digest is recomputed; a claimed `receipt_digest` is never accepted by itself.
+The gate also binds all readbacks to the committed repository, campaign,
+activation, and default-writer identity; the default-v8 readback may carry
+`campaign_key: null` because it is not campaign-scoped. Git readback runs in
+the requested canonical checkout, proves its `origin` remote is the requested
+repository, and rereads `origin/main` before success. The pre-tag receipt
+freezes the candidate commit and tree. The renderer rejects dynamic SHA/CI
+fields at any nesting or alias, cross-binds its input identities, and uses a
+durable staged publication journal with flushed files, atomic replacement,
+directory sync, and exact final readback. The post-release gate requires that
+pre-tag receipt and rejects a tag whose peeled commit or tree differs before
+archiving it into an isolated temporary source. It checks existing package
+manifests before any regeneration, then installs both Skill packages into
 temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only the
 public `start`, `advance`, and `inspect` operations.
 """
