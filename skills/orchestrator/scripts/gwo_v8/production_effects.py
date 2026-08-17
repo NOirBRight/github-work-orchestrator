@@ -639,7 +639,7 @@ class ProductionWorkRunEffects:
         self,
         action: WorkRunAction,
         owner: str,
-        dispatched: bool,
+        dispatched: bool | None,
     ) -> None:
         try:
             with _ledger_connection(self._store_path) as connection:
@@ -652,7 +652,7 @@ class ProductionWorkRunEffects:
                        AND state = 'in_flight'
                     """,
                     (
-                        1 if dispatched else 0,
+                        None if dispatched is None else (1 if dispatched else 0),
                         action.stable_action_id,
                         owner,
                     ),
@@ -928,10 +928,11 @@ class ProductionWorkRunEffects:
             if getattr(error, "provider_dispatched", None) is False:
                 self._release_claim(action, owner)
             else:
+                provider_dispatched = getattr(error, "provider_dispatched", None)
                 self._mark_claim_provider_dispatch(
                     action,
                     owner,
-                    getattr(error, "provider_dispatched", None) is True,
+                    True if provider_dispatched is True else None,
                 )
             raise
 

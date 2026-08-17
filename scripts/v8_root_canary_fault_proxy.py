@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field as dataclass_field
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,333 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _JOURNAL_LOCKS_GUARD = threading.Lock()
 _JOURNAL_LOCKS: dict[str, threading.RLock] = {}
 _PathIdentity = tuple[int, int]
+
+
+def _held_filesystem_module():
+    """Load the repository's descriptor-relative filesystem primitives."""
+
+    try:
+        return importlib.import_module("beta3_release_subject")
+    except ModuleNotFoundError as error:
+        if error.name != "beta3_release_subject":
+            raise
+        return importlib.import_module("scripts.beta3_release_subject")
+
+
+@contextmanager
+def _held_directory(path: Path):
+    """Hold every directory component used by a journal operation.
+
+    The release subject primitives open components without following reparse
+    points.  This local lease additionally shares delete on Windows so a
+    boundary regression can exercise a rename while the operation remains
+    anchored to the original handles.  POSIX calls use those handles as
+    directory fds; Windows relative native opens use them as root handles.
+    """
+
+    filesystem = _held_filesystem_module()
+    code = "ROOT_CANARY_FAULT_PATH_INVALID"
+    descriptors: list[int] = []
+    identities: list[dict[str, int | str]] = []
+    try:
+        for index, component in enumerate(filesystem._directory_components(path)):
+            parent = descriptors[-1] if descriptors else None
+            open_path = component if parent is None else Path(component.name)
+            descriptor = filesystem._open_path_handle(
+                open_path,
+                code,
+                directory=True,
+                parent=parent,
+                share_delete=True,
+            )
+            try:
+                identity = filesystem._windows_handle_identity(
+                    descriptor,
+                    code,
+                    directory=True,
+                )
+            except Exception:
+                os.close(descriptor)
+                raise
+            descriptors.append(descriptor)
+            identities.append(dict(identity))
+        if not descriptors:
+            raise ValueError(code)
+        lease = filesystem._DirectoryLease(
+            Path(os.path.abspath(path)),
+            tuple(descriptors),
+            tuple(identities),
+        )
+        descriptors = []
+    except ValueError:
+        filesystem._close_descriptors(descriptors)
+        raise
+    except Exception as error:
+        filesystem._close_descriptors(descriptors)
+        raise ValueError(code) from error
+    try:
+        yield lease
+    finally:
+        lease.close()
+
+
+def _open_held_file(
+    name: str,
+    parent: object,
+    *,
+    create_new: bool = False,
+    writable: bool = False,
+    delete: bool = False,
+    missing_ok: bool = False,
+) -> int | None:
+    """Open one leaf relative to a held parent and revalidate the lease."""
+
+    filesystem = _held_filesystem_module()
+    code = "ROOT_CANARY_FAULT_PATH_INVALID"
+    assert_stable = getattr(parent, "assert_stable", None)
+    handles = getattr(parent, "handles", None)
+    if not callable(assert_stable) or type(handles) is not tuple or not handles:
+        raise ValueError(code)
+    assert_stable()
+    descriptor: int | None = None
+    try:
+        descriptor = filesystem._open_path_handle(
+            Path(name),
+            code,
+            directory=False,
+            parent=handles[-1],
+            create_new=create_new,
+            writable=writable,
+            delete=delete,
+            share_delete=True,
+            missing_ok=missing_ok,
+        )
+    except FileNotFoundError:
+        assert_stable()
+        if missing_ok:
+            return None
+        raise ValueError("FAULT_PROXY_JOURNAL_READ_FAILED")
+    except Exception as error:
+        raise ValueError(code) from error
+    try:
+        assert_stable()
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_held_file(name: str, parent: object) -> bytes:
+    filesystem = _held_filesystem_module()
+    descriptor = _open_held_file(name, parent)
+    assert descriptor is not None
+    try:
+        before = filesystem._windows_handle_identity(
+            descriptor,
+            "FAULT_PROXY_JOURNAL_READ_FAILED",
+            directory=False,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_nlink", 1) != 1:
+            raise ValueError("FAULT_PROXY_JOURNAL_READ_FAILED")
+        raw = filesystem._read_held_bytes(
+            descriptor,
+            "FAULT_PROXY_JOURNAL_READ_FAILED",
+        )
+        after = filesystem._windows_handle_identity(
+            descriptor,
+            "FAULT_PROXY_JOURNAL_READ_FAILED",
+            directory=False,
+        )
+        if (
+            not filesystem._identity_matches(after, before)
+            or after.get("st_size") != len(raw)
+        ):
+            raise ValueError("FAULT_PROXY_JOURNAL_READ_FAILED")
+        parent.assert_stable()
+        return raw
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError("FAULT_PROXY_JOURNAL_READ_FAILED") from error
+    finally:
+        os.close(descriptor)
+
+
+def _open_lock_file(name: str, parent: object) -> int:
+    descriptor = _open_held_file(name, parent, writable=True, missing_ok=True)
+    if descriptor is not None:
+        return descriptor
+    try:
+        descriptor = _open_held_file(
+            name,
+            parent,
+            create_new=True,
+            writable=True,
+        )
+    except ValueError as create_error:
+        try:
+            descriptor = _open_held_file(name, parent, writable=True)
+        except ValueError:
+            raise create_error
+    assert descriptor is not None
+    return descriptor
+
+
+def _windows_rename_by_handle(
+    descriptor: int,
+    parent_descriptor: int,
+    target_name: str,
+) -> None:
+    import ctypes
+    import msvcrt
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_ubyte),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_wchar * len(target_name)),
+        ]
+
+    info = FileRenameInfo(
+        1,
+        ctypes.c_void_p(msvcrt.get_osfhandle(parent_descriptor)),
+        len(target_name) * ctypes.sizeof(ctypes.c_wchar),
+        target_name,
+    )
+    io_status = IoStatusBlock()
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtSetInformationFile.restype = ctypes.c_long
+    ntdll.NtSetInformationFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+    ]
+    status = int(
+        ntdll.NtSetInformationFile(
+            msvcrt.get_osfhandle(descriptor),
+            ctypes.byref(io_status),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            10,
+        )
+    ) & 0xFFFFFFFF
+    if status & 0x80000000:
+        raise OSError(status, "NtSetInformationFile rename failed")
+
+
+def _replace_relative(parent: object, source_name: str, target_name: str) -> None:
+    """Atomically replace one held-parent child without path traversal."""
+
+    filesystem = _held_filesystem_module()
+    handles = getattr(parent, "handles", None)
+    assert_stable = getattr(parent, "assert_stable", None)
+    if type(handles) is not tuple or not handles or not callable(assert_stable):
+        raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+    assert_stable()
+    source = _open_held_file(
+        source_name,
+        parent,
+        delete=True,
+    )
+    assert source is not None
+    try:
+        source_identity = filesystem._windows_handle_identity(
+            source,
+            "FAULT_PROXY_JOURNAL_WRITE_FAILED",
+            directory=False,
+        )
+        if os.name != "nt":
+            os.replace(
+                Path(source_name),
+                Path(target_name),
+                src_dir_fd=handles[-1],
+                dst_dir_fd=handles[-1],
+            )
+        else:
+            _windows_rename_by_handle(source, handles[-1], target_name)
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError("FAULT_PROXY_JOURNAL_WRITE_FAILED") from error
+    finally:
+        os.close(source)
+    target = _open_held_file(target_name, parent)
+    assert target is not None
+    try:
+        target_identity = filesystem._windows_handle_identity(
+            target,
+            "FAULT_PROXY_JOURNAL_WRITE_FAILED",
+            directory=False,
+        )
+        if not filesystem._identity_matches(target_identity, source_identity):
+            raise ValueError("FAULT_PROXY_JOURNAL_WRITE_FAILED")
+    finally:
+        os.close(target)
+
+
+def _delete_relative_if_identity(
+    parent: object,
+    name: str,
+    expected_identity: Mapping[str, object] | None,
+) -> None:
+    """Delete only a child still owned by this operation and held parent."""
+
+    if expected_identity is None:
+        return
+    filesystem = _held_filesystem_module()
+    try:
+        descriptor = _open_held_file(name, parent, delete=True, missing_ok=True)
+    except (FileNotFoundError, ValueError):
+        return
+    if descriptor is None:
+        return
+    try:
+        identity = filesystem._windows_handle_identity(
+            descriptor,
+            "FAULT_PROXY_JOURNAL_WRITE_FAILED",
+            directory=False,
+        )
+        if not filesystem._identity_matches(identity, expected_identity):
+            return
+        if os.name != "nt":
+            handles = getattr(parent, "handles", None)
+            if type(handles) is not tuple or not handles:
+                return
+            os.unlink(Path(name), dir_fd=handles[-1])
+        else:
+            import ctypes
+            import msvcrt
+
+            class FileDispositionInfo(ctypes.Structure):
+                _fields_ = [("delete_file", ctypes.c_int)]
+
+            disposition = FileDispositionInfo(1)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+            kernel32.SetFileInformationByHandle.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            if not kernel32.SetFileInformationByHandle(
+                msvcrt.get_osfhandle(descriptor),
+                4,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle delete failed")
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +521,9 @@ def _path_identity(path: Path, *, directory: bool = False) -> _PathIdentity:
     return (int(info.st_dev), int(info.st_ino))
 
 
-def _safe_read_bytes(path: Path) -> bytes:
+def _safe_read_bytes(path: Path, *, parent: object | None = None) -> bytes:
+    if parent is not None:
+        return _read_held_file(Path(path).name, parent)
     _check_path_components(path, allow_missing=False)
     _validate_regular_leaf(path, allow_missing=False)
     flags = os.O_RDONLY
@@ -218,8 +548,55 @@ def _safe_read_bytes(path: Path) -> bytes:
 
 
 @contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
+def _file_lock(path: Path, *, parent: object | None = None) -> Iterator[None]:
     """Serialize journal read/modify/write across threads and processes."""
+
+    if parent is not None:
+        descriptor = _open_lock_file(Path(path).name, parent)
+        key = str(_absolute_path(path))
+        with _JOURNAL_LOCKS_GUARD:
+            thread_lock = _JOURNAL_LOCKS.setdefault(key, threading.RLock())
+        with thread_lock:
+            try:
+                import fcntl  # type: ignore[import-not-found]
+            except ImportError:
+                fcntl = None
+            try:
+                with os.fdopen(descriptor, "a+b") as stream:
+                    descriptor = -1
+                    info = os.fstat(stream.fileno())
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or getattr(info, "st_nlink", 1) != 1
+                    ):
+                        raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+                    if fcntl is not None:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                    else:
+                        import msvcrt
+
+                        stream.seek(0, os.SEEK_END)
+                        if stream.tell() == 0:
+                            stream.write(b"0")
+                            stream.flush()
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                    try:
+                        parent.assert_stable()
+                        yield
+                    finally:
+                        if fcntl is not None:
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                        else:
+                            import msvcrt
+
+                            stream.seek(0)
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                        parent.assert_stable()
+            finally:
+                if descriptor != -1:
+                    os.close(descriptor)
+        return
 
     _check_path_components(path, allow_missing=True)
     _validate_regular_leaf(path, allow_missing=True)
@@ -376,7 +753,17 @@ class FaultProxy:
         else:
             _check_path_components(Path(plan_path), allow_missing=False)
         try:
-            plan = json.loads(_safe_read_bytes(Path(plan_path)).decode("utf-8"))
+            with _held_directory(Path(plan_path).parent) as parent:
+                plan = json.loads(
+                    _safe_read_bytes(Path(plan_path), parent=parent).decode("utf-8")
+                )
+                parent.assert_stable()
+                if (
+                    run_root is not None
+                    and root_identity is not None
+                    and _path_identity(run_root, directory=True) != root_identity
+                ):
+                    raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("FAULT_PROXY_PLAN_INVALID") from error
         if (
@@ -405,15 +792,23 @@ class FaultProxy:
             ).stdout,
         )
 
-    def _read_unlocked(self) -> dict[str, object]:
+    def _read_unlocked(self, parent: object) -> dict[str, object]:
         journal_path = self._validated_journal_path()
-        if not journal_path.exists():
+        descriptor = _open_held_file(
+            journal_path.name,
+            parent,
+            missing_ok=True,
+        )
+        if descriptor is None:
             return {"effects": {}, "consumed_faults": []}
+        os.close(descriptor)
         try:
-            raw = json.loads(_safe_read_bytes(journal_path).decode("utf-8"))
+            raw = json.loads(
+                _safe_read_bytes(journal_path, parent=parent).decode("utf-8")
+            )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("FAULT_PROXY_JOURNAL_INVALID") from error
-        self._assert_held_path_identity()
+        parent.assert_stable()
         if type(raw) is not dict or set(raw) != {"effects", "consumed_faults"}:
             raise ValueError("FAULT_PROXY_JOURNAL_INVALID")
         effects = raw["effects"]
@@ -430,51 +825,106 @@ class FaultProxy:
 
     def _read(self) -> dict[str, object]:
         journal_path = self._validated_journal_path()
-        with _file_lock(journal_path.with_name(journal_path.name + ".lock")):
+        with _held_directory(journal_path.parent) as parent:
             self._assert_held_path_identity()
-            return self._read_unlocked()
+            with _file_lock(
+                journal_path.with_name(journal_path.name + ".lock"),
+                parent=parent,
+            ):
+                self._assert_held_path_identity()
+                return self._read_unlocked(parent)
 
-    def _write_atomically_unlocked(self, payload: Mapping[str, object]) -> None:
+    def _write_atomically_unlocked(
+        self,
+        payload: Mapping[str, object],
+        parent: object,
+    ) -> None:
+        filesystem = _held_filesystem_module()
         journal_path = self._validated_journal_path()
-        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.run_root is None:
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._assert_held_path_identity()
         journal_path = self._validated_journal_path()
-        temporary = journal_path.with_name(
+        temporary = Path(
             f".{journal_path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
         )
-        temporary = self._validated_child_path(temporary)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags | nofollow, 0o600)
+        descriptor = _open_held_file(
+            temporary.name,
+            parent,
+            create_new=True,
+            writable=True,
+            delete=True,
+        )
+        assert descriptor is not None
+        temporary_identity: Mapping[str, object] | None = None
         try:
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = -1
-                stream.write(_canonical_bytes(payload))
-                stream.flush()
-                os.fsync(stream.fileno())
-            journal_path = self._validated_journal_path()
-            temporary = self._validated_child_path(temporary)
-            os.replace(temporary, journal_path)
+            temporary_identity = filesystem._windows_handle_identity(
+                descriptor,
+                "FAULT_PROXY_JOURNAL_WRITE_FAILED",
+                directory=False,
+            )
+            raw = _canonical_bytes(payload)
+            offset = 0
+            while offset < len(raw):
+                written = os.write(descriptor, raw[offset:])
+                if written <= 0:
+                    raise ValueError("FAULT_PROXY_JOURNAL_WRITE_FAILED")
+                offset += written
+            os.fsync(descriptor)
+            after_identity = filesystem._windows_handle_identity(
+                descriptor,
+                "FAULT_PROXY_JOURNAL_WRITE_FAILED",
+                directory=False,
+            )
+            if not filesystem._identity_matches(after_identity, temporary_identity):
+                raise ValueError("FAULT_PROXY_JOURNAL_WRITE_FAILED")
+            os.close(descriptor)
+            descriptor = -1
+            parent.assert_stable()
+            _replace_relative(parent, temporary.name, journal_path.name)
+            parent.assert_stable()
             self._assert_held_path_identity()
             if os.name != "nt":
-                directory = os.open(journal_path.parent, os.O_RDONLY)
+                handles = getattr(parent, "handles", None)
+                if type(handles) is not tuple or not handles:
+                    raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+                directory = os.open(
+                    ".",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=handles[-1],
+                )
                 try:
                     os.fsync(directory)
                 finally:
                     os.close(directory)
+        except Exception:
+            _delete_relative_if_identity(
+                parent,
+                journal_path.name,
+                temporary_identity,
+            )
+            raise
         finally:
-            if descriptor != -1:
+            if descriptor >= 0:
                 os.close(descriptor)
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+            _delete_relative_if_identity(
+                parent,
+                temporary.name,
+                temporary_identity,
+            )
 
     def _write_atomically(self, payload: Mapping[str, object]) -> None:
         journal_path = self._validated_journal_path()
-        with _file_lock(journal_path.with_name(journal_path.name + ".lock")):
+        if self.run_root is None:
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with _held_directory(journal_path.parent) as parent, _file_lock(
+            journal_path.with_name(journal_path.name + ".lock"),
+            parent=parent,
+        ):
             self._assert_held_path_identity()
-            self._write_atomically_unlocked(payload)
+            self._write_atomically_unlocked(payload, parent)
 
     @staticmethod
     def _event_matches(
@@ -556,9 +1006,14 @@ class FaultProxy:
             raise ValueError("FAULT_REQUEST_PLAN_IDENTITY_INVALID")
         journal_path = self._validated_journal_path()
         lock_path = journal_path.with_name(journal_path.name + ".lock")
-        with _file_lock(lock_path):
+        if self.run_root is None:
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with _held_directory(journal_path.parent) as parent, _file_lock(
+            lock_path,
+            parent=parent,
+        ):
             self._assert_held_path_identity()
-            journal = self._read_unlocked()
+            journal = self._read_unlocked(parent)
             effects = journal["effects"]
             assert type(effects) is dict
             previous = effects.get(request.stable_action_id)
@@ -594,7 +1049,8 @@ class FaultProxy:
                 consumed.append(fault_key)
                 consumed.sort()
             self._write_atomically_unlocked(
-                {"effects": effects, "consumed_faults": consumed}
+                {"effects": effects, "consumed_faults": consumed},
+                parent,
             )
             if inject:
                 raise FaultProxyProcessExit(fault_key)

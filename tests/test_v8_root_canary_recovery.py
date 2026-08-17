@@ -335,7 +335,9 @@ def test_ambiguous_provider_failure_keeps_the_authoritative_effect_claim(
         effects.execute(action)
 
     assert raised.value.code == "EFFECT_EXECUTION_IN_PROGRESS"
-    assert calls == [action.stable_action_id]
+    # The restart path performs one exact Runtime readback before retaining
+    # the duplicate fence; it must not dispatch a second provider effect.
+    assert calls == [action.stable_action_id, action.stable_action_id]
 
 
 @pytest.mark.parametrize(
@@ -519,35 +521,26 @@ def test_fault_proxy_fails_closed_when_parent_swaps_at_temp_create(
             encoding="utf-8",
         )
 
-    original_replace = fault_proxy_module.os.replace
+    original_open_lock = fault_proxy_module._open_lock_file
     boundary_reached = False
     swapped = False
 
-    def replace_after_parent_swap(source, target, *args, **kwargs):
+    def open_lock_after_parent_swap(name, parent):
         nonlocal boundary_reached, swapped
-        if (
-            not boundary_reached
-            and Path(source).name.startswith(".journal.json.")
-        ):
+        if not boundary_reached:
             boundary_reached = True
-            # Model the approved parent now resolving to its replacement at
-            # the actual replace boundary, while retaining real filesystem
-            # I/O for the intercepted operation on Windows.
-            replacement_source = replacement / Path(source).name
-            replacement_source.write_bytes(Path(source).read_bytes())
+            # Swap the actual approved parent immediately before the
+            # descriptor-relative journal lock open.  The held lease must
+            # reject the operation before any journal side effect.
+            approved.rename(tmp_path / "approved-original")
+            replacement.rename(approved)
             swapped = True
-            return original_replace(
-                replacement_source,
-                replacement / Path(target).name,
-                *args,
-                **kwargs,
-            )
-        return original_replace(source, target, *args, **kwargs)
+        return original_open_lock(name, parent)
 
     monkeypatch.setattr(
-        fault_proxy_module.os,
-        "replace",
-        replace_after_parent_swap,
+        fault_proxy_module,
+        "_open_lock_file",
+        open_lock_after_parent_swap,
     )
 
     request = FaultRequest(
