@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import json
 import sys
 import threading
 import time
@@ -12,6 +13,8 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+
+pytest_plugins = ("v8_production_test_support",)
 
 from v8_production_test_support import make_production_effects  # noqa: E402
 
@@ -228,6 +231,72 @@ def test_concurrent_runtime_execution_claims_before_the_provider_boundary(
 
     assert second_observation == first_observation
     assert calls == [action.stable_action_id]
+
+
+def test_restart_recovers_a_dispatched_runtime_effect_without_duplicate_provider_call(
+    tmp_path,
+    action,
+    support,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "gwo_v8.production_effects._EFFECT_CLAIM_WAIT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "gwo_v8.production_effects._EFFECT_CLAIM_POLL_SECONDS",
+        0.001,
+    )
+    support.candidate.result = support.accepted_candidate_result(action)
+    provider_state = tmp_path / "provider-state.json"
+
+    class ProviderAcknowledgementLost(RuntimeError):
+        provider_dispatched = True
+
+    class DurableRuntime:
+        def __init__(self):
+            self.progress_calls = 0
+            self.external_dispatches = 0
+
+        def progress(self, subject, *, wake_cursor=None):
+            self.progress_calls += 1
+            state = (
+                json.loads(provider_state.read_text(encoding="utf-8"))
+                if provider_state.exists()
+                else {"external_dispatches": 0, "terminal": False}
+            )
+            if state["external_dispatches"] == 0:
+                state["external_dispatches"] = 1
+                state["terminal"] = True
+                provider_state.write_text(
+                    json.dumps(state),
+                    encoding="utf-8",
+                )
+                self.external_dispatches += 1
+                raise ProviderAcknowledgementLost(
+                    "provider completed before the local receipt was durable"
+                )
+            assert state["terminal"] is True
+            return support.runtime_completed_receipt(action)
+
+    first_runtime = DurableRuntime()
+    support.runtime_factory.gateway = first_runtime
+    first = make_production_effects(tmp_path, support)
+
+    with pytest.raises(ProviderAcknowledgementLost):
+        first.execute(action)
+
+    restarted_runtime = DurableRuntime()
+    support.runtime_factory.gateway = restarted_runtime
+    restarted = make_production_effects(tmp_path, support)
+
+    observation = restarted.execute(action)
+
+    assert observation.phase == "accepted_awaiting_delivery"
+    assert first_runtime.external_dispatches == 1
+    assert restarted_runtime.external_dispatches == 0
+    assert json.loads(provider_state.read_text(encoding="utf-8"))["external_dispatches"] == 1
+    assert restarted.readback(action) == observation
 
 
 def test_repeated_batch_execution_uses_the_persisted_delivery_readback(

@@ -442,3 +442,62 @@ def test_fault_proxy_rejects_a_hardlinked_durable_record(tmp_path):
 
     with pytest.raises(ValueError):
         _require_child(linked, tmp_path)
+
+
+def test_fault_proxy_fails_closed_when_the_approved_root_is_replaced_after_validation(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import v8_root_canary_fault_proxy as fault_proxy_module
+
+    approved = tmp_path / "approved"
+    replacement = tmp_path / "replacement"
+    approved.mkdir()
+    replacement.mkdir()
+    (approved / "plan.json").write_text(
+        json.dumps({"events": []}),
+        encoding="utf-8",
+    )
+    (replacement / "plan.json").write_text(
+        json.dumps({"events": []}),
+        encoding="utf-8",
+    )
+
+    original_require_child = fault_proxy_module._require_child
+    swapped = False
+
+    def replace_root_after_validation(path, root):
+        nonlocal swapped
+        validated = original_require_child(path, root)
+        if not swapped and Path(path).name == "plan.json":
+            approved.rename(tmp_path / "approved-original")
+            replacement.rename(approved)
+            swapped = True
+        return validated
+
+    monkeypatch.setattr(
+        fault_proxy_module,
+        "_require_child",
+        replace_root_after_validation,
+    )
+
+    request = FaultRequest(
+        "worker",
+        "none",
+        "action:root-race",
+        "payload:root-race",
+        ("echo", "ok"),
+        plan_revision_digest="a" * 64,
+    )
+
+    with pytest.raises(ValueError):
+        proxy = FaultProxy.from_files(
+            approved / "plan.json",
+            approved / "journal.json",
+            run_root=approved,
+        )
+        proxy.execute(request, run_command=lambda _command: "response")
+
+    assert swapped is True
+    assert not (approved / "journal.json").exists()
+    assert not (tmp_path / "approved-original" / "journal.json").exists()
