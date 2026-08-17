@@ -1429,6 +1429,297 @@ def test_cutover_fences_v61_then_authorizes_exact_activation_and_capacity(tmp_pa
     assert len(transitions.history(compiled.repository)) == 2
 
 
+def test_cutover_reconstructs_fresh_store_from_matching_historical_activation(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        rollback_publication,
+        _controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    historical = _compiled(count=4)
+    historical_activation = rollback_publication.publish_and_activate(
+        historical,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    historical_receipt = durable.read_current_activation(compiled.repository)
+    assert historical_receipt is not None
+    assert historical_receipt.activation_id == historical_activation.activation_id
+    assert rollback_publication.read_authoritative_rollback_identity(
+        compiled.repository
+    )[0] == historical_receipt
+
+    fresh_publication = LocalPlanPublication(
+        tmp_path / "fresh-v8.sqlite3",
+        durable=durable,
+        writer_authority=transitions,
+    )
+    controller = WriterCutoverController(
+        legacy=InMemoryLegacyWriterControl(),
+        transitions=transitions,
+        publication=fresh_publication,
+        guard=_controller.guard,
+    )
+
+    outcome = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+
+    assert outcome.status == "cut_over"
+    assert outcome.activation_id != historical_receipt.activation_id
+    current = durable.read_current_activation(compiled.repository)
+    assert current is not None
+    assert current.plan_digest == compiled.digest
+    assert current.expected_previous_digest == historical_receipt.plan_digest
+    assert durable.read_activation(
+        compiled.repository,
+        historical_receipt.activation_id,
+    ) == historical_receipt
+    assert durable.activation_count(compiled.repository) == 2
+
+
+def test_cutover_fails_closed_when_fresh_store_durable_identity_diverges(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        rollback_publication,
+        _controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    historical = _compiled(count=4)
+    rollback_publication.publish_and_activate(
+        historical,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    historical_receipt = durable.read_current_activation(compiled.repository)
+    assert historical_receipt is not None
+    divergent_receipt = replace(
+        historical_receipt,
+        activation_id="activation:divergent",
+    )
+    fresh_durable = _DurableReadbackOverride(
+        durable,
+        current=divergent_receipt,
+    )
+    fresh_publication = LocalPlanPublication(
+        tmp_path / "fresh-v8.sqlite3",
+        durable=fresh_durable,
+        writer_authority=transitions,
+    )
+    legacy = InMemoryLegacyWriterControl()
+    controller = WriterCutoverController(
+        legacy=legacy,
+        transitions=transitions,
+        publication=fresh_publication,
+        guard=_controller.guard,
+    )
+
+    outcome = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+
+    assert outcome.status == "blocked"
+    assert outcome.blockers == ("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH",)
+    assert legacy.readback(compiled.repository).stopped is False
+    assert fresh_publication.read_active(compiled.repository) is None
+    assert durable.read_current_activation(compiled.repository) == historical_receipt
+    assert durable.activation_count(compiled.repository) == 1
+
+
+def test_cutover_validates_guard_token_before_fresh_store_reconstruction(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        rollback_publication,
+        _controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    historical = _compiled(count=4)
+    rollback_publication.publish_and_activate(
+        historical,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    historical_receipt = durable.read_current_activation(compiled.repository)
+    assert historical_receipt is not None
+    fresh_publication = LocalPlanPublication(
+        tmp_path / "fresh-v8.sqlite3",
+        durable=durable,
+        writer_authority=transitions,
+    )
+    legacy = InMemoryLegacyWriterControl()
+    controller = WriterCutoverController(
+        legacy=legacy,
+        transitions=transitions,
+        publication=fresh_publication,
+        guard=_controller.guard,
+    )
+
+    outcome = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=replace(guard_receipt, subject_digest="0" * 64),
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+
+    assert outcome.status == "blocked"
+    assert outcome.blockers == ("CUTOVER_GUARD_TOKEN_STALE",)
+    assert legacy.readback(compiled.repository).stopped is False
+    assert fresh_publication.read_active(compiled.repository) is None
+    assert durable.read_current_activation(compiled.repository) == historical_receipt
+    assert transitions.history(compiled.repository) == ()
+
+
+def test_cutover_does_not_reconstruct_fresh_store_before_legacy_quiescence(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        rollback_publication,
+        _controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    historical = _compiled(count=4)
+    rollback_publication.publish_and_activate(
+        historical,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    historical_receipt = durable.read_current_activation(compiled.repository)
+    assert historical_receipt is not None
+    fresh_store = tmp_path / "fresh-v8.sqlite3"
+    fresh_publication = LocalPlanPublication(
+        fresh_store,
+        durable=durable,
+        writer_authority=transitions,
+    )
+    legacy = InMemoryLegacyWriterControl(active_workers=("still-running",))
+    controller = WriterCutoverController(
+        legacy=legacy,
+        transitions=transitions,
+        publication=fresh_publication,
+        guard=_controller.guard,
+    )
+
+    outcome = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+
+    assert outcome.status == "blocked"
+    assert outcome.blockers == ("V61_EXECUTION_AUTHORITY_ACTIVE",)
+    assert LocalPlanPublication(fresh_store, durable=durable).read_active(
+        compiled.repository
+    ) is None
+    assert durable.read_current_activation(compiled.repository) == historical_receipt
+
+
+def test_cutover_fails_closed_when_fresh_store_lineage_generation_is_present(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        rollback_publication,
+        _controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    historical = _compiled(count=4)
+    rollback_publication.publish_and_activate(
+        historical,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    historical_receipt = durable.read_current_activation(compiled.repository)
+    assert historical_receipt is not None
+    fresh_store = tmp_path / "fresh-v8.sqlite3"
+    fresh_publication = LocalPlanPublication(
+        fresh_store,
+        durable=durable,
+        writer_authority=transitions,
+    )
+    with sqlite3.connect(fresh_store) as connection:
+        connection.execute(
+            """
+            INSERT INTO v8_writer_generations (repository, writer_generation)
+            VALUES (?, ?)
+            """,
+            (compiled.repository, "store:v8:production:20260817T205916Z"),
+        )
+    before = fresh_store.read_bytes()
+    legacy = InMemoryLegacyWriterControl()
+    controller = WriterCutoverController(
+        legacy=legacy,
+        transitions=transitions,
+        publication=fresh_publication,
+        guard=_controller.guard,
+    )
+
+    outcome = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+
+    assert outcome.status == "blocked"
+    assert outcome.blockers == ("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH",)
+    assert legacy.readback(compiled.repository).stopped is False
+    assert LocalPlanPublication(fresh_store, durable=durable).read_active(
+        compiled.repository
+    ) is None
+    assert fresh_store.read_bytes() == before
+    assert durable.read_current_activation(compiled.repository) == historical_receipt
+    assert durable.activation_count(compiled.repository) == 1
+
+
 def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
     tmp_path,
 ):
