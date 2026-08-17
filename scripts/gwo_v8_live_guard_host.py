@@ -20,6 +20,7 @@ from pathlib import Path
 import secrets
 import stat
 import sys
+from threading import Condition, get_ident
 from typing import Callable
 
 
@@ -236,40 +237,102 @@ def _validate_production_paths(
         )
 
 
+class _LiveAttestationSnapshot:
+    __slots__ = ("_bundle", "lease")
+
+    def __init__(self, bundle: object, lease: object) -> None:
+        self._bundle = bundle
+        self.lease = lease
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._bundle, name)
+
+
 class _LiveAttestationCycle:
     """Share one fresh attestation across the four Store/control reads."""
 
+    _FIELDS = ("legacy", "durable_state", "writer_fence", "ownership")
+
     __slots__ = (
         "_capture",
+        "_condition",
+        "_owner",
         "_remaining",
         "_snapshot",
+        "_lease",
+        "_next_field",
     )
 
     def __init__(self, capture: Callable[[], object]) -> None:
         self._capture = capture
+        self._condition = Condition()
+        self._owner: int | None = None
         self._remaining = 0
         self._snapshot: object | None = None
+        self._lease: object | None = None
+        self._next_field = 0
+
+    def _reset(self) -> None:
+        self._owner = None
+        self._remaining = 0
+        self._snapshot = None
+        self._lease = None
+        self._next_field = 0
+        self._condition.notify_all()
+
+    def _close(self) -> None:
+        lease = self._lease
+        try:
+            if lease is not None:
+                lease.close()
+        finally:
+            self._reset()
 
     def read(self, field: str, repository: str) -> object:
-        if self._snapshot is None:
-            self._snapshot = self._capture()
-            self._remaining = 4
-        snapshot = self._snapshot
-        if getattr(snapshot, "subject").repository != repository:
-            _fail(
-                "LIVE_GUARD_READ_UNAVAILABLE",
-                "Guard read repository differs from the live subject",
-            )
-        value = getattr(snapshot, field, None)
-        if value is None:
-            _fail(
-                "LIVE_GUARD_READ_UNAVAILABLE",
-                f"live attestation has no {field} readback",
-            )
-        self._remaining -= 1
-        if self._remaining == 0:
-            self._snapshot = None
-        return value
+        current_thread = get_ident()
+        with self._condition:
+            while self._owner is not None and self._owner != current_thread:
+                self._condition.wait()
+            if self._snapshot is None:
+                snapshot = self._capture()
+                lease = getattr(snapshot, "lease", None)
+                if not callable(getattr(lease, "close", None)):
+                    _fail(
+                        "LIVE_GUARD_READ_UNAVAILABLE",
+                        "live attestation has no closable lease",
+                    )
+                self._owner = current_thread
+                self._remaining = len(self._FIELDS)
+                self._snapshot = snapshot
+                self._lease = lease
+                self._next_field = 0
+            if field != self._FIELDS[self._next_field]:
+                self._close()
+                _fail(
+                    "LIVE_GUARD_READ_UNAVAILABLE",
+                    "Guard reads did not consume one ordered live snapshot",
+                )
+            snapshot = self._snapshot
+            try:
+                if getattr(snapshot, "subject").repository != repository:
+                    _fail(
+                        "LIVE_GUARD_READ_UNAVAILABLE",
+                        "Guard read repository differs from the live subject",
+                    )
+                value = getattr(snapshot, field, None)
+                if value is None:
+                    _fail(
+                        "LIVE_GUARD_READ_UNAVAILABLE",
+                        f"live attestation has no {field} readback",
+                    )
+            except Exception:
+                self._close()
+                raise
+            self._next_field += 1
+            self._remaining -= 1
+            if self._remaining == 0:
+                self._close()
+            return value
 
 
 class _LiveReadPort:
@@ -391,10 +454,9 @@ def _compose_live_read_ports(
         attestor = ProductionBootstrapAttestor(
             control_ownership_attestor=dependencies.control_ownership_attestor,
             legacy_attestor=dependencies.legacy_attestor,
-            subject_factory=lambda _config, _release: subject,
         )
 
-        def capture() -> object:
+        def capture() -> _LiveAttestationSnapshot:
             attempt = AttemptIdentity.create(
                 run_id=run_id,
                 repository=subject.repository,
@@ -411,9 +473,10 @@ def _compose_live_read_ports(
             )
             try:
                 bundle.validate()
-            finally:
+            except Exception:
                 lease.close()
-            return bundle
+                raise
+            return _LiveAttestationSnapshot(bundle, lease)
 
         cycle = _LiveAttestationCycle(capture)
         return (
