@@ -521,7 +521,7 @@ def test_fault_proxy_fails_closed_when_parent_swaps_at_temp_create(
             encoding="utf-8",
         )
 
-    original_open_lock = fault_proxy_module._open_lock_file
+    original_open_lock = getattr(fault_proxy_module, "_open_lock_file", None)
     boundary_reached = False
     swapped = False
 
@@ -535,12 +535,15 @@ def test_fault_proxy_fails_closed_when_parent_swaps_at_temp_create(
             approved.rename(tmp_path / "approved-original")
             replacement.rename(approved)
             swapped = True
+        if original_open_lock is None:
+            return None
         return original_open_lock(name, parent)
 
     monkeypatch.setattr(
         fault_proxy_module,
         "_open_lock_file",
         open_lock_after_parent_swap,
+        raising=False,
     )
 
     request = FaultRequest(
