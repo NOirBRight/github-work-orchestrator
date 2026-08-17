@@ -58,6 +58,47 @@ _STATIC_RECORD_FIELDS = frozenset(
     }
 )
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_LOCAL_VERIFICATION_SCHEMAS = frozenset(
+    {
+        "gwo-local-verification.v1",
+        "gwo-c1-local-verification.v2",
+        "gwo-v8-beta2-local-verification.v1",
+        "gwo-v8-phase4-local-verification.v1",
+        "gwo-v8-c2-local-gate.v2",
+    }
+)
+_LOCAL_VERIFICATION_MODES = frozenset(
+    {"local-only", "Local Verification Only"}
+)
+_LOCAL_HOSTED_FIELDS = frozenset(
+    {
+        "ci",
+        "check_run",
+        "check_runs",
+        "ci_conclusion",
+        "ci_head_sha",
+        "ci_run_id",
+        "ci_url",
+        "conclusion",
+        "head_sha",
+        "hosted_ci",
+        "hosted",
+        "hosted_check",
+        "hosted_conclusion",
+        "hosted_head_sha",
+        "hosted_run_id",
+        "hosted_url",
+        "repository_check",
+        "run_id",
+        "status_check",
+        "status_checks",
+        "url",
+        "workflow_run",
+        "workflow_run_id",
+        "workflow_url",
+    }
+)
 
 
 class ReleaseGateError(RuntimeError):
@@ -131,6 +172,12 @@ def _require_sha(value: object, code: str) -> str:
 
 def _require_text(value: object, code: str) -> str:
     if not isinstance(value, str) or not value.strip():
+        raise ReleaseGateError(code)
+    return value
+
+
+def _require_sha256(value: object, code: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise ReleaseGateError(code)
     return value
 
@@ -389,6 +436,327 @@ def clean_install_and_smoke(source: Path, run_root: Path) -> CleanInstallResult:
     return CleanInstallResult(surfaces, ("advance", "inspect", "start"), False)
 
 
+def _normalized_field_name(value: object) -> str:
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+    return re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+
+
+def _reject_local_hosted_fields(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if _normalized_field_name(key) in _LOCAL_HOSTED_FIELDS:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE")
+            _reject_local_hosted_fields(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _reject_local_hosted_fields(child)
+
+
+def _first_mapping_value(
+    mappings: Sequence[Mapping[str, object]], names: Sequence[str]
+) -> object | None:
+    found: list[object] = []
+    for mapping in mappings:
+        for name in names:
+            if name in mapping:
+                found.append(mapping[name])
+    if found and any(value != found[0] for value in found[1:]):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_SUBJECT_INVALID")
+    return found[0] if found else None
+
+
+def _local_subject(raw: Mapping[str, object]) -> tuple[str, str]:
+    nested = raw.get("subject")
+    mappings: list[Mapping[str, object]] = [raw]
+    if isinstance(nested, Mapping):
+        mappings.append(nested)
+    subject_sha = _first_mapping_value(
+        mappings,
+        ("subject_sha", "merged_main_sha", "main_sha", "source_sha", "sha"),
+    )
+    subject_tree = _first_mapping_value(
+        mappings,
+        (
+            "subject_tree",
+            "subject_tree_sha",
+            "merged_main_git_tree",
+            "main_tree_sha",
+            "source_tree",
+            "tree",
+        ),
+    )
+    if _SHA.fullmatch(subject_sha or "") is None or _SHA.fullmatch(
+        subject_tree or ""
+    ) is None:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_SUBJECT_INVALID")
+    return str(subject_sha), str(subject_tree)
+
+
+def _pytest_summary_count(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    matches = re.findall(r"(\d+) passed", value)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def _read_local_log_count(value: object, expected_digest: object) -> int | None:
+    if not isinstance(value, str) or not value.strip():
+        if expected_digest is not None:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_LOG_INVALID")
+        return None
+    try:
+        raw = Path(value).read_bytes()
+    except (OSError, ValueError):
+        if expected_digest is not None:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_LOG_INVALID")
+        return None
+    if expected_digest is not None:
+        if not isinstance(expected_digest, str) or _SHA256.fullmatch(expected_digest) is None:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_LOG_INVALID")
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_LOG_MISMATCH")
+    return _pytest_summary_count(raw.decode("utf-8", errors="replace"))
+
+
+def _command_text(command: Mapping[str, object]) -> str:
+    values = [
+        command.get("name"),
+        command.get("command"),
+        command.get("arguments"),
+        command.get("argv"),
+    ]
+    parts: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            parts.extend(str(item) for item in value)
+        else:
+            parts.append(str(value))
+    return " ".join(parts)
+
+
+def _command_pytest_count(command: Mapping[str, object]) -> int | None:
+    command_text = _command_text(command)
+    name = str(command.get("name", "")).casefold()
+    is_pytest = name in {"full", "full-suite", "full_pytest", "pytest"} or (
+        "pytest" in command_text.casefold()
+    )
+    if command.get("exit_code") != 0:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    summary_count = _pytest_summary_count(
+        command.get("summary", command.get("output"))
+    )
+    log_value = command.get("log_path", command.get("log"))
+    log_digest = command.get("log_digest", command.get("sha256"))
+    log_count = _read_local_log_count(log_value, log_digest)
+    if not is_pytest:
+        return None
+    if summary_count is not None and log_count is not None and summary_count != log_count:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    return log_count if log_count is not None else summary_count
+
+
+def _local_pytest_count(raw: Mapping[str, object]) -> int:
+    for collection_name in ("focused_suites", "commands"):
+        collection = raw.get(collection_name)
+        if collection is None:
+            continue
+        if not isinstance(collection, (list, tuple)):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        for command in collection:
+            if not isinstance(command, Mapping):
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            _command_pytest_count(command)
+
+    for name in (
+        "pytest_pass_count",
+        "local_pytest_pass_count",
+        "full_pytest_pass_count",
+    ):
+        value = raw.get(name)
+        if type(value) is int and value > 0:
+            return value
+        if value is not None:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_INVALID")
+
+    for name in ("full_pytest_summary", "pytest_summary"):
+        count = _pytest_summary_count(raw.get(name))
+        if count is not None:
+            return count
+
+    full_attempts = raw.get("full_attempts")
+    if isinstance(full_attempts, (list, tuple)) and full_attempts:
+        candidates: list[int] = []
+        for attempt in full_attempts:
+            if not isinstance(attempt, Mapping):
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            if type(attempt.get("exit_code")) is not int:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            count = _pytest_summary_count(
+                attempt.get("summary", attempt.get("output"))
+            )
+            if count is None:
+                count = _read_local_log_count(
+                    attempt.get("log_path", attempt.get("log")),
+                    attempt.get("log_digest", attempt.get("sha256")),
+                )
+            if count is not None:
+                candidates.append(count)
+        if full_attempts[-1].get("exit_code") != 0:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        if candidates:
+            return candidates[-1]
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+
+    chunk_logs = raw.get("chunk_logs")
+    if isinstance(chunk_logs, (list, tuple)) and chunk_logs:
+        if raw.get("status") != "GO" or raw.get("verification") != "chunked_full_pytest":
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        failed_chunks = raw.get("failed_chunks")
+        if not isinstance(failed_chunks, (list, tuple)) or failed_chunks:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        declared_chunks = raw.get("chunks")
+        if type(declared_chunks) is not int or declared_chunks != len(chunk_logs):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        total = 0
+        for chunk in chunk_logs:
+            if not isinstance(chunk, Mapping) or chunk.get("exit_code") != 0:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            count = _read_local_log_count(chunk.get("path"), chunk.get("sha256"))
+            if count is None:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+            total += count
+        if raw.get("passed") != total:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+        return total
+
+    full_suite = raw.get("full_suite")
+    if isinstance(full_suite, Mapping):
+        if full_suite.get("exit_code") != 0:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        count = _pytest_summary_count(full_suite.get("summary"))
+        log_count = _read_local_log_count(
+            full_suite.get("log_path"),
+            full_suite.get("log_digest"),
+        )
+        if count is not None and log_count is not None and count != log_count:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+        if log_count is not None:
+            count = log_count
+        if count is not None:
+            return count
+
+    commands = raw.get("commands")
+    if isinstance(commands, (list, tuple)):
+        candidates: list[int] = []
+        for command in commands:
+            if not isinstance(command, Mapping):
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            if command.get("exit_code") != 0:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            count = _command_pytest_count(command)
+            if count is not None:
+                candidates.append(count)
+        if candidates:
+            return candidates[-1]
+
+    raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalVerificationReadback:
+    schema: str
+    verification_mode: str
+    subject_sha: str
+    subject_tree_sha: str
+    pytest_pass_count: int
+    manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema not in _LOCAL_VERIFICATION_SCHEMAS:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_SCHEMA_INVALID")
+        if self.verification_mode not in _LOCAL_VERIFICATION_MODES:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_MODE_INVALID")
+        _require_sha(self.subject_sha, "GA_LOCAL_VERIFICATION_SUBJECT_INVALID")
+        _require_sha(self.subject_tree_sha, "GA_LOCAL_VERIFICATION_SUBJECT_INVALID")
+        if type(self.pytest_pass_count) is not int or self.pytest_pass_count < 1:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_INVALID")
+        _require_sha256(self.manifest_sha256, "GA_LOCAL_VERIFICATION_DIGEST_INVALID")
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, object], *, manifest_sha256: str
+    ) -> "LocalVerificationReadback":
+        _reject_local_hosted_fields(raw)
+        schema = raw.get("schema", raw.get("schema_version"))
+        if schema not in _LOCAL_VERIFICATION_SCHEMAS:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_SCHEMA_INVALID")
+        mode = raw.get("mode", raw.get("verification_mode"))
+        if mode is None and schema == "gwo-v8-phase4-local-verification.v1":
+            mode = "local-only"
+        if mode not in _LOCAL_VERIFICATION_MODES:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_MODE_INVALID")
+        workflow_count = raw.get("workflow_count")
+        if workflow_count is not None and (
+            type(workflow_count) is not int or workflow_count != 0
+        ):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        workflow_paths = raw.get("workflow_paths")
+        if workflow_paths is not None and (
+            not isinstance(workflow_paths, (list, tuple))
+            or any(path is not None for path in workflow_paths)
+        ):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        actions_policy = raw.get("actions_policy")
+        if isinstance(actions_policy, Mapping) and actions_policy.get("enabled") is not False:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        for name in ("actions_enabled", "github_actions_enabled"):
+            if name in raw and raw[name] is not False:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        schema_text = str(schema)
+        if schema_text == "gwo-v8-phase4-local-verification.v1":
+            if raw.get("workspace") != "clean":
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_OUTCOME_INVALID")
+        elif schema_text in {
+            "gwo-v8-beta2-local-verification.v1",
+            "gwo-v8-c2-local-gate.v2",
+        }:
+            final_outcome = raw.get("final_outcome")
+            if final_outcome is not None and final_outcome not in {"pass", "passed"}:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_OUTCOME_INVALID")
+        elif raw.get("final_outcome") not in {"pass", "passed"}:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_OUTCOME_INVALID")
+        subject_sha, subject_tree_sha = _local_subject(raw)
+        return cls(
+            schema=str(schema),
+            verification_mode=str(mode),
+            subject_sha=subject_sha,
+            subject_tree_sha=subject_tree_sha,
+            pytest_pass_count=_local_pytest_count(raw),
+            manifest_sha256=manifest_sha256,
+        )
+
+
+def load_local_verification(path: Path) -> LocalVerificationReadback:
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as error:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_UNREADABLE") from error
+    try:
+        raw = _strict_json_loads(raw_bytes, require_canonical=False)
+    except (UnicodeError, ReleaseGateError) as error:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_UNREADABLE") from error
+    if not isinstance(raw, Mapping):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_NOT_OBJECT")
+    return LocalVerificationReadback.from_mapping(
+        raw, manifest_sha256=hashlib.sha256(raw_bytes).hexdigest()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CiReadback:
     run_id: int
@@ -405,8 +773,8 @@ class ReleaseGateReceipt:
     canary_target_sha: str
     tag_candidate_sha: str
     tag_candidate_tree_sha: str
-    ci_run_id: int
-    ci_head_sha: str
+    ci_run_id: int | None
+    ci_head_sha: str | None
     pytest_pass_count: int
     canary_receipt_digest: str
     activation_receipt_digest: str
@@ -414,6 +782,8 @@ class ReleaseGateReceipt:
     campaign_key: str
     activation_id: str
     writer_generation: str
+    verification_mode: str = "hosted-ci"
+    local_verification_manifest_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.version != GA_VERSION:
@@ -424,13 +794,28 @@ class ReleaseGateReceipt:
             self.canary_target_sha,
             self.tag_candidate_sha,
             self.tag_candidate_tree_sha,
-            self.ci_head_sha,
         ):
             _require_sha(value, "GA_RELEASE_RECEIPT_SHA_INVALID")
-        if type(self.ci_run_id) is not int or self.ci_run_id < 1:
-            raise ReleaseGateError("GA_RELEASE_RECEIPT_CI_INVALID")
         if type(self.pytest_pass_count) is not int or self.pytest_pass_count < 1:
-            raise ReleaseGateError("GA_RELEASE_RECEIPT_CI_INVALID")
+            raise ReleaseGateError("GA_RELEASE_RECEIPT_VERIFICATION_INVALID")
+        if self.verification_mode not in {"hosted-ci", "local-only"}:
+            raise ReleaseGateError("GA_RELEASE_RECEIPT_VERIFICATION_INVALID")
+        if self.verification_mode == "local-only":
+            if self.ci_run_id is not None or self.ci_head_sha is not None:
+                raise ReleaseGateError("GA_RELEASE_RECEIPT_HOSTED_EVIDENCE")
+            _require_sha256(
+                self.local_verification_manifest_sha256,
+                "GA_RELEASE_RECEIPT_LOCAL_INVALID",
+            )
+        else:
+            if type(self.ci_run_id) is not int or self.ci_run_id < 1:
+                raise ReleaseGateError("GA_RELEASE_RECEIPT_CI_INVALID")
+            _require_sha(
+                self.ci_head_sha,
+                "GA_RELEASE_RECEIPT_CI_INVALID",
+            )
+            if self.local_verification_manifest_sha256 is not None:
+                raise ReleaseGateError("GA_RELEASE_RECEIPT_LOCAL_INVALID")
         for value in (
             self.canary_receipt_digest,
             self.activation_receipt_digest,
@@ -448,7 +833,7 @@ class ReleaseGateReceipt:
         canary: object,
         activation: object,
         admission: object,
-        ci: object,
+        ci: object | None,
         main_sha: str,
         *,
         main_tree_sha: str,
@@ -456,6 +841,7 @@ class ReleaseGateReceipt:
         campaign_key: str | None = None,
         activation_id: str | None = None,
         writer_generation: str | None = None,
+        local_verification: LocalVerificationReadback | None = None,
     ) -> "ReleaseGateReceipt":
         if canary_target_sha is None:
             if isinstance(canary, Mapping):
@@ -463,6 +849,28 @@ class ReleaseGateReceipt:
             else:
                 canary_target_sha = str(getattr(canary, "canary_target_sha"))
         del activation, admission
+        if (ci is None) == (local_verification is None):
+            raise ReleaseGateError("GA_VERIFICATION_MODE_INVALID")
+        if local_verification is not None:
+            return cls(
+                version=record.version,
+                repository=record.repository,
+                evidence_base_sha=record.evidence_base_sha,
+                canary_target_sha=canary_target_sha,
+                tag_candidate_sha=main_sha,
+                tag_candidate_tree_sha=main_tree_sha,
+                ci_run_id=None,
+                ci_head_sha=None,
+                pytest_pass_count=local_verification.pytest_pass_count,
+                canary_receipt_digest=record.canary_receipt_digest,
+                activation_receipt_digest=record.activation_receipt_digest,
+                default_writer_receipt_digest=record.default_writer_receipt_digest,
+                campaign_key=campaign_key or record.campaign_key or "",
+                activation_id=activation_id or record.activation_id or "",
+                writer_generation=writer_generation or record.writer_generation or "",
+                verification_mode="local-only",
+                local_verification_manifest_sha256=local_verification.manifest_sha256,
+            )
         return cls(
             version=record.version,
             repository=record.repository,
@@ -481,13 +889,70 @@ class ReleaseGateReceipt:
             writer_generation=writer_generation or record.writer_generation or "",
         )
 
+    def to_mapping(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "version": self.version,
+            "repository": self.repository,
+            "evidence_base_sha": self.evidence_base_sha,
+            "canary_target_sha": self.canary_target_sha,
+            "tag_candidate_sha": self.tag_candidate_sha,
+            "tag_candidate_tree_sha": self.tag_candidate_tree_sha,
+            "pytest_pass_count": self.pytest_pass_count,
+            "canary_receipt_digest": self.canary_receipt_digest,
+            "activation_receipt_digest": self.activation_receipt_digest,
+            "default_writer_receipt_digest": self.default_writer_receipt_digest,
+            "campaign_key": self.campaign_key,
+            "activation_id": self.activation_id,
+            "writer_generation": self.writer_generation,
+        }
+        if self.verification_mode == "local-only":
+            payload.update(
+                {
+                    "verification_mode": "local-only",
+                    "local_verification_manifest_sha256": self.local_verification_manifest_sha256,
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "ci_run_id": self.ci_run_id,
+                    "ci_head_sha": self.ci_head_sha,
+                }
+            )
+        return payload
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> "ReleaseGateReceipt":
         fields = {field.name for field in dataclasses.fields(cls)}
-        if set(raw) != fields:
+        hosted_fields = fields - {
+            "verification_mode",
+            "local_verification_manifest_sha256",
+        }
+        hosted_fields_with_mode = fields - {"local_verification_manifest_sha256"}
+        local_fields = fields - {"ci_run_id", "ci_head_sha"}
+        mode = raw.get("verification_mode")
+        if set(raw) == hosted_fields:
+            payload = dict(raw)
+            payload.update(
+                verification_mode="hosted-ci",
+                local_verification_manifest_sha256=None,
+            )
+            return cls._from_payload(payload)
+        if set(raw) == hosted_fields_with_mode and mode == "hosted-ci":
+            payload = dict(raw)
+            payload["local_verification_manifest_sha256"] = None
+            return cls._from_payload(payload)
+        if set(raw) != local_fields or mode not in _LOCAL_VERIFICATION_MODES:
             raise ReleaseGateError("GA_PRE_TAG_RECEIPT_FIELDS_INVALID")
+        payload = dict(raw)
+        payload["verification_mode"] = "local-only"
+        payload.update(ci_run_id=None, ci_head_sha=None)
+        return cls._from_payload(payload)
+
+    @classmethod
+    def _from_payload(cls, payload: Mapping[str, object]) -> "ReleaseGateReceipt":
         try:
-            return cls(**raw)  # type: ignore[arg-type]
+            return cls(**payload)  # type: ignore[arg-type]
         except (TypeError, ValueError) as error:
             raise ReleaseGateError("GA_PRE_TAG_RECEIPT_INVALID") from error
 
@@ -607,8 +1072,9 @@ def verify_pre_tag(
     canary: object,
     activation: object,
     admission: object,
-    ci: CiReadback,
     git: GitAncestryReadback,
+    ci: CiReadback | None = None,
+    local_verification: LocalVerificationReadback | None = None,
 ) -> ReleaseGateReceipt:
     if any(
         type(value) is not str or not value.strip()
@@ -627,25 +1093,38 @@ def verify_pre_tag(
         raise ReleaseGateError("GA_MAIN_SHA_READBACK_MISMATCH")
     main_sha = current_main_sha
 
-    try:
-        ci_run_id = _attribute(ci, "run_id", "GA_EXACT_CI_REQUIRED")
-        ci_head_sha = _attribute(ci, "head_sha", "GA_EXACT_CI_REQUIRED")
-        conclusion = _attribute(ci, "conclusion", "GA_EXACT_CI_REQUIRED")
-        pytest_pass_count = _attribute(ci, "pytest_pass_count", "GA_EXACT_CI_REQUIRED")
-    except (TypeError, ValueError) as error:
-        raise ReleaseGateError("GA_EXACT_CI_REQUIRED") from error
-    if (
-        type(ci_run_id) is not int
-        or ci_run_id < 1
-        or type(ci_head_sha) is not str
-        or _SHA.fullmatch(ci_head_sha) is None
-        or type(conclusion) is not str
-        or main_sha != ci_head_sha
-        or conclusion != "success"
-        or type(pytest_pass_count) is not int
-        or pytest_pass_count < 1
-    ):
-        raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
+    if ci is not None and local_verification is not None:
+        raise ReleaseGateError("GA_VERIFICATION_MODE_CONFLICT")
+    if ci is None and local_verification is None:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_REQUIRED")
+    if local_verification is not None:
+        if not isinstance(local_verification, LocalVerificationReadback):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_INVALID")
+        if local_verification.subject_sha != main_sha:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_SUBJECT_MISMATCH")
+        pytest_pass_count = local_verification.pytest_pass_count
+    else:
+        try:
+            ci_run_id = _attribute(ci, "run_id", "GA_EXACT_CI_REQUIRED")
+            ci_head_sha = _attribute(ci, "head_sha", "GA_EXACT_CI_REQUIRED")
+            conclusion = _attribute(ci, "conclusion", "GA_EXACT_CI_REQUIRED")
+            pytest_pass_count = _attribute(
+                ci, "pytest_pass_count", "GA_EXACT_CI_REQUIRED"
+            )
+        except (TypeError, ValueError) as error:
+            raise ReleaseGateError("GA_EXACT_CI_REQUIRED") from error
+        if (
+            type(ci_run_id) is not int
+            or ci_run_id < 1
+            or type(ci_head_sha) is not str
+            or _SHA.fullmatch(ci_head_sha) is None
+            or type(conclusion) is not str
+            or main_sha != ci_head_sha
+            or conclusion != "success"
+            or type(pytest_pass_count) is not int
+            or pytest_pass_count < 1
+        ):
+            raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
 
     canary_payload, canary_receipt_digest = _canonical_readback_payload(
         canary, "GA_CANARY_RECEIPT_INVALID"
@@ -792,6 +1271,11 @@ def verify_pre_tag(
         raise ReleaseGateError("GA_GIT_TREE_READBACK_REQUIRED") from error
     if not isinstance(main_tree_sha, str) or _SHA.fullmatch(main_tree_sha) is None:
         raise ReleaseGateError("GA_GIT_TREE_READBACK_INVALID")
+    if (
+        local_verification is not None
+        and local_verification.subject_tree_sha != main_tree_sha
+    ):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_SUBJECT_MISMATCH")
     if _read_origin_main_sha(git) != main_sha:
         raise ReleaseGateError("GA_MAIN_SHA_READBACK_MISMATCH")
 
@@ -807,6 +1291,7 @@ def verify_pre_tag(
         campaign_key=expected_campaign,
         activation_id=activation_id,
         writer_generation=writer_generation,
+        local_verification=local_verification,
     )
 
 
@@ -827,7 +1312,11 @@ def _verify_post_release_pre_tag_receipt(
         or receipt.campaign_key != record.campaign_key
         or receipt.activation_id != record.activation_id
         or receipt.writer_generation != record.writer_generation
-        or receipt.tag_candidate_sha != receipt.ci_head_sha
+    ):
+        raise ReleaseGateError("GA_PRE_TAG_RECEIPT_RECORD_MISMATCH")
+    if (
+        receipt.verification_mode == "hosted-ci"
+        and receipt.tag_candidate_sha != receipt.ci_head_sha
     ):
         raise ReleaseGateError("GA_PRE_TAG_RECEIPT_RECORD_MISMATCH")
 
@@ -1016,6 +1505,7 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--activation", type=Path)
     parser.add_argument("--default-writer", type=Path)
     parser.add_argument("--ci-run", type=int)
+    parser.add_argument("--local-verification", type=Path)
     parser.add_argument("--repository", default="NOirBRight/github-work-orchestrator")
     parser.add_argument("--checkout", type=Path)
     parser.add_argument("--output", type=Path)
@@ -1028,53 +1518,15 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
             record = load_ga_release_record(
                 _required_path(args.record, "GA_RELEASE_RECORD_REQUIRED")
             )
-            ci_run_id = args.ci_run
-            if ci_run_id is None:
-                raise ReleaseGateError("GA_PRE_TAG_INPUTS_REQUIRED")
+            if args.ci_run is not None:
+                raise ReleaseGateError("GA_GITHUB_CI_DISABLED")
+            local_verification = load_local_verification(
+                _required_path(
+                    args.local_verification,
+                    "GA_LOCAL_VERIFICATION_REQUIRED",
+                )
+            )
             git = GitCliReadback(args.repository, checkout=args.checkout)
-            run_json = _strict_json_loads(
-                subprocess.check_output(
-                    (
-                        "gh",
-                        "run",
-                        "view",
-                        str(ci_run_id),
-                        "--repo",
-                        git.repository,
-                        "--json",
-                        "databaseId,headSha,conclusion",
-                    ),
-                    text=True,
-                ),
-                require_canonical=False,
-            )
-            if not isinstance(run_json, Mapping):
-                raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
-            try:
-                if int(run_json["databaseId"]) != ci_run_id:
-                    raise ReleaseGateError("GA_EXACT_CI_REQUIRED")
-                ci_head_sha = run_json["headSha"]
-                ci_conclusion = run_json["conclusion"]
-            except (KeyError, TypeError, ValueError) as error:
-                raise ReleaseGateError("GA_EXACT_CI_REQUIRED") from error
-            log = subprocess.check_output(
-                (
-                    "gh",
-                    "run",
-                    "view",
-                    str(ci_run_id),
-                    "--repo",
-                    git.repository,
-                    "--log",
-                ),
-                text=True,
-            )
-            ci = CiReadback(
-                run_id=ci_run_id,
-                head_sha=ci_head_sha,
-                conclusion=ci_conclusion,
-                pytest_pass_count=parse_pytest_count(log),
-            )
             receipt = verify_pre_tag(
                 record,
                 main_sha=args.main_sha,
@@ -1090,12 +1542,12 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                         "GA_DEFAULT_WRITER_RECEIPT_REQUIRED",
                     )
                 ),
-                ci=ci,
                 git=git,
+                local_verification=local_verification,
             )
             _write_json(
                 _required_path(args.output, "GA_OUTPUT_REQUIRED"),
-                dataclasses.asdict(receipt),
+                receipt.to_mapping(),
             )
             return 0
 
@@ -1165,9 +1617,11 @@ The committed record freezes `evidence_base_sha`, `canary_target_sha`, the
 repository/campaign/activation/default-writer identity, the
 Canary/Activation/default-writer receipt digests, and the exact metadata path
 allow-list. It deliberately contains no tag-candidate SHA, final metadata commit SHA,
-CI run ID, or pytest count. The pre-tag command obtains those dynamic values
-only from the current `origin/main` and exact CI readback, then writes a
-separate `ReleaseGateReceipt`.
+CI run ID, or pytest count. GitHub Actions acceptance is disabled and repository
+release acceptance is Local Verification Only. The pre-tag command obtains the
+dynamic tag-candidate SHA/tree and pytest count from the current `origin/main`
+and a content-addressed local verification manifest, then writes a separate
+`ReleaseGateReceipt`.
 
 Every pre-tag receipt input is strict canonical JSON: duplicate names,
 non-canonical bytes, and `NaN`/`Infinity` are rejected. Its complete payload
@@ -1176,13 +1630,16 @@ The gate also binds all readbacks to the committed repository, campaign,
 activation, and default-writer identity; the default-v8 readback may carry
 `campaign_key: null` because it is not campaign-scoped. Git readback runs in
 the requested canonical checkout, proves its `origin` remote is the requested
-repository, and rereads `origin/main` before success. The pre-tag receipt
-freezes the candidate commit and tree. The renderer rejects dynamic SHA/CI
-fields at any nesting or alias, cross-binds its input identities, and uses a
-durable staged publication journal with flushed files, atomic replacement,
-directory sync, and exact final readback. The post-release gate requires that
-the supplied pre-tag receipt is bound to the static record and rechecks the
-pre-tag ancestry, metadata-delta, and commit/tree invariants. It rejects a tag
+repository, and rereads `origin/main` before success. The local manifest must
+prove Local Verification Only, zero workflows, a passing full pytest result,
+and the exact candidate commit/tree; hosted CI fields are rejected. The
+pre-tag receipt freezes that candidate commit and tree. The renderer rejects
+dynamic SHA/CI fields at any nesting or alias, cross-binds its input
+identities, and uses a durable staged publication journal with flushed files,
+atomic replacement, directory sync, and exact final readback. The post-release
+gate requires that the supplied pre-tag receipt is bound to the static record
+and rechecks the pre-tag ancestry, metadata-delta, and commit/tree invariants.
+It rejects a tag
 whose peeled commit or tree differs, then archives by the captured immutable
 commit SHA rather than the mutable tag name. Publication rejects symlink and
 reparse output targets before any backup or replacement. It checks existing

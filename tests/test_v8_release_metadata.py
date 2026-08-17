@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import io
 import json
 import math
@@ -489,7 +490,7 @@ def test_pre_tag_rejects_git_readback_for_a_foreign_repository():
 
 
 def test_pre_tag_cli_rejects_ci_run_id_that_does_not_match_exact_readback(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     record, canary, activation, admission, ci, _git = _canonical_pre_tag_case()
     record_path = write_ga_release_record(tmp_path / "record.json", record)
@@ -563,6 +564,205 @@ def test_pre_tag_cli_rejects_ci_run_id_that_does_not_match_exact_readback(
 
     assert result == 2
     assert not (tmp_path / "receipt.json").exists()
+    assert "GA_GITHUB_CI_DISABLED" in capsys.readouterr().err
+
+
+def test_pre_tag_cli_accepts_local_verification_without_github_ci(
+    tmp_path, monkeypatch
+):
+    record, canary, activation, admission, ci, _git = _canonical_pre_tag_case()
+    record_path = write_ga_release_record(tmp_path / "record.json", record)
+    canary_path = tmp_path / "canary.json"
+    activation_path = tmp_path / "activation.json"
+    admission_path = tmp_path / "admission.json"
+    for path, value in (
+        (canary_path, canary),
+        (activation_path, activation),
+        (admission_path, admission),
+    ):
+        path.write_bytes(verifier.canonical_json_bytes(vars(value)))
+
+    local_verification_path = tmp_path / "local-verification.json"
+    local_verification_path.write_text(
+        json.dumps(
+            {
+                "schema": "gwo-c1-local-verification.v2",
+                "mode": "Local Verification Only",
+                "subject_sha": ci.head_sha,
+                "subject_tree": "a" * 40,
+                "workflow_count": 0,
+                "final_outcome": "pass",
+                "commands": [
+                    {
+                        "name": "full",
+                        "arguments": ["-m", "pytest", "-q"],
+                        "exit_code": 0,
+                        "summary": "42 passed in 1.0s",
+                    }
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_check_output(arguments, *, text=True, cwd=None):
+        del text, cwd
+        if arguments == ("git", "remote", "get-url", "origin"):
+            return "https://github.com/NOirBRight/github-work-orchestrator.git\n"
+        raise AssertionError(f"unexpected subprocess in local-only mode: {arguments}")
+
+    monkeypatch.setattr(verifier.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(
+        GitCliReadback,
+        "current_origin_main_sha",
+        lambda self: ci.head_sha,
+        raising=False,
+    )
+    monkeypatch.setattr(GitCliReadback, "is_ancestor", lambda self, a, d: True)
+    monkeypatch.setattr(
+        GitCliReadback,
+        "changed_paths",
+        lambda self, a, d: (
+            "CHANGELOG.md",
+            "docs/e2e/gwo-v8-root-canary.md",
+            "docs/releases/v8.0.0.md",
+        ),
+    )
+    monkeypatch.setattr(GitCliReadback, "tree_sha", lambda self, commit: "a" * 40)
+
+    output = tmp_path / "receipt.json"
+    result = verify_main(
+        [
+            "--pre-tag",
+            "--main-sha",
+            ci.head_sha,
+            "--record",
+            str(record_path),
+            "--canary",
+            str(canary_path),
+            "--activation",
+            str(activation_path),
+            "--default-writer",
+            str(admission_path),
+            "--local-verification",
+            str(local_verification_path),
+            "--repository",
+            record.repository,
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["verification_mode"] == "local-only"
+    assert receipt["tag_candidate_sha"] == ci.head_sha
+    assert receipt["pytest_pass_count"] == 42
+    assert "ci_run_id" not in receipt
+    assert "ci_head_sha" not in receipt
+
+
+def test_local_verification_reads_and_binds_a_digest_checked_pytest_log(tmp_path):
+    log = tmp_path / "pytest.log"
+    log_bytes = b"full: 42 passed in 1.0s\n"
+    log.write_bytes(log_bytes)
+    manifest = {
+        "schema": "gwo-c1-local-verification.v2",
+        "mode": "Local Verification Only",
+        "subject_sha": "3" * 40,
+        "subject_tree": "a" * 40,
+        "workflow_count": 0,
+        "final_outcome": "pass",
+        "commands": [
+            {
+                "command": "py -3.13 -m pytest -q",
+                "exit_code": 0,
+                "log": str(log),
+                "sha256": hashlib.sha256(log_bytes).hexdigest(),
+            }
+        ],
+    }
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    readback = verifier.load_local_verification(path)
+
+    assert readback.verification_mode == "Local Verification Only"
+    assert readback.subject_sha == "3" * 40
+    assert readback.subject_tree_sha == "a" * 40
+    assert readback.pytest_pass_count == 42
+    assert readback.manifest_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    log.write_bytes(b"full: 41 passed in 1.0s\n")
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+    assert error.value.code == "GA_LOCAL_VERIFICATION_LOG_MISMATCH"
+
+
+def test_local_verification_subject_tree_must_match_git_readback(tmp_path):
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(
+        verifier.canonical_json_bytes(
+            {
+                "schema": "gwo-c1-local-verification.v2",
+                "mode": "Local Verification Only",
+                "subject_sha": ci.head_sha,
+                "subject_tree": "b" * 40,
+                "workflow_count": 0,
+                "final_outcome": "pass",
+                "pytest_pass_count": 42,
+            }
+        )
+    )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=ci.head_sha,
+            canary=canary,
+            activation=activation,
+            admission=admission,
+            git=git,
+            local_verification=verifier.load_local_verification(path),
+        )
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_SUBJECT_MISMATCH"
+
+
+def test_local_pre_tag_receipt_round_trips_without_hosted_ci_fields():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    local = verifier.LocalVerificationReadback(
+        schema="gwo-c1-local-verification.v2",
+        verification_mode="local-only",
+        subject_sha=ci.head_sha,
+        subject_tree_sha="a" * 40,
+        pytest_pass_count=42,
+        manifest_sha256="b" * 64,
+    )
+    receipt = verify_pre_tag(
+        record,
+        main_sha=ci.head_sha,
+        canary=canary,
+        activation=activation,
+        admission=admission,
+        git=git,
+        local_verification=local,
+    )
+
+    payload = receipt.to_mapping()
+    reloaded = verifier.ReleaseGateReceipt.from_mapping(payload)
+
+    assert payload["verification_mode"] == "local-only"
+    assert payload["local_verification_manifest_sha256"] == "b" * 64
+    assert "ci_run_id" not in payload
+    assert "ci_head_sha" not in payload
+    assert reloaded.verification_mode == "local-only"
+    assert reloaded.ci_run_id is None
+    assert reloaded.ci_head_sha is None
 
 
 def test_pytest_count_comes_from_the_last_dynamic_ci_summary():
