@@ -34,7 +34,7 @@ def _batch(
         "batch_id": f"batch:{kind}",
         "repository": ROOT_REPOSITORY,
         "campaign_key": "campaign:test-root-canary",
-        "plan_revision_digest": "plan:1",
+        "plan_revision_digest": PLAN_DIGEST,
         "member_ticket_keys": keys,
         "candidate_receipt_digests": candidate_receipt_digests,
         "finding_ledger_digests": finding_ledger_digests,
@@ -65,7 +65,7 @@ def _batch(
         },
         "integrated_target_sha": target,
     }
-    return {**body, "receipt_digest": _independent_digest(body)}
+    return {**body, "receipt_digest": _task_digest(body)}
 
 
 def _independent_digest(value: object) -> str:
@@ -81,22 +81,150 @@ def _independent_digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _task_digest(value: object) -> str:
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha(label: str) -> str:
+    return _task_digest({"fixture": label})
+
+
+def _oid(label: str) -> str:
+    return hashlib.sha1(label.encode("utf-8")).hexdigest()
+
+
+PLAN_DIGEST = _sha("plan")
+POLICY_WITNESS_BODY = {
+    "allowed_capabilities": ["git", "local_check"],
+    "authority_grants": {
+        "campaign": [
+            {
+                "operation_id": "repository.read.v1",
+                "resource_id": "campaign.snapshot.v1",
+            }
+        ],
+        "recovery_worker": [
+            {
+                "operation_id": "workspace.write.v1",
+                "resource_id": "work-run.workspace.v1",
+            }
+        ],
+        "review": [
+            {
+                "operation_id": "repository.read.v1",
+                "resource_id": "review.subject.v1",
+            }
+        ],
+        "worker": [
+            {
+                "operation_id": "workspace.write.v1",
+                "resource_id": "work-run.workspace.v1",
+            }
+        ],
+    },
+    "exclusive_resources": ["repository.target.v1"],
+    "ref": "policy:gwo-v8-root-canary",
+    "schema_version": 1,
+}
+POLICY_DIGEST = _task_digest(POLICY_WITNESS_BODY)
+POLICY_WITNESS = {**POLICY_WITNESS_BODY, "digest": POLICY_DIGEST}
+AUTHORITY_ROOT_BODY = {
+    "policy_witness_digest": POLICY_DIGEST,
+    "grants": [
+        {
+            "operation_id": "repository.read.v1",
+            "resource_id": "campaign.snapshot.v1",
+        },
+        {
+            "operation_id": "workspace.write.v1",
+            "resource_id": "work-run.workspace.v1",
+        },
+    ],
+}
+AUTHORITY_DIGEST = _task_digest(AUTHORITY_ROOT_BODY)
+AUTHORITY_ROOT = {**AUTHORITY_ROOT_BODY, "subtree_digest": AUTHORITY_DIGEST}
+RUNTIME_SELECTOR_BODY = {
+    "kind": "gwo.runtime-selector-readback.v1",
+    "repository": ROOT_REPOSITORY,
+    "campaign_key": "campaign:test-root-canary",
+    "plan_revision_digest": PLAN_DIGEST,
+    "assignments": [],
+}
+RUNTIME_SELECTOR_DIGEST = _task_digest(RUNTIME_SELECTOR_BODY)
+RUNTIME_SELECTOR = {**RUNTIME_SELECTOR_BODY, "digest": RUNTIME_SELECTOR_DIGEST}
+FAULT_JOURNAL_BODY = {
+    "kind": "fault-journal-readback.v1",
+    "repository": ROOT_REPOSITORY,
+    "campaign_key": "campaign:test-root-canary",
+    "plan_revision_digest": PLAN_DIGEST,
+    "effects": {},
+    "consumed_faults": [],
+}
+FAULT_JOURNAL_DIGEST = _task_digest(FAULT_JOURNAL_BODY)
+FAULT_JOURNAL = {**FAULT_JOURNAL_BODY, "digest": FAULT_JOURNAL_DIGEST}
+
+
 def _ticket(key: str, number: int) -> dict[str, object]:
+    repository = {
+        "full_name": ROOT_REPOSITORY,
+        "url": f"https://api.github.com/repos/{ROOT_REPOSITORY}",
+    }
+    label = {
+        "id": 1000 + number,
+        "node_id": f"MDU6TGFiZWw{number}",
+        "url": f"https://api.github.com/repos/{ROOT_REPOSITORY}/labels/ready-for-agent",
+        "name": "ready-for-agent",
+        "color": "0052cc",
+        "default": False,
+        "description": None,
+    }
+    comment = {
+        "id": 2000 + number,
+        "node_id": f"MDEyOklzc3VlQ29tbWVudA{number}",
+        "url": f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/comments/{2000 + number}",
+        "html_url": f"https://github.com/{ROOT_REPOSITORY}/issues/{number}#issuecomment-{2000 + number}",
+        "body": f"authoritative comment {key}",
+        "user": {"login": "root-canary"},
+        "created_at": "2026-08-17T00:00:00Z",
+        "updated_at": "2026-08-17T00:00:00Z",
+        "author_association": "OWNER",
+    }
     contract = {
+        "id": 3000 + number,
+        "node_id": f"MDU6SXNzdWUz{number}",
         "number": number,
-        "state": "OPEN",
-        "labels": ["ready-for-agent"],
+        "title": f"Root Canary Ticket issue:{number}",
         "body": f"root canary contract {key}",
-        "comments": [f"authoritative comment {key}"],
-        "blocked_by": [],
-        "blocker_states": [],
+        "state": "open",
+        "state_reason": None,
+        "type": None,
+        "repository": repository,
+        "labels": [label],
+        "comments": [comment],
+        "updated_at": "2026-08-17T00:00:00Z",
+    }
+    ticket_key = f"issue:{number}"
+    projection = {
+        "number": number,
+        "contract": contract,
+        "labels": ["ready-for-agent"],
+        "source_ref": ticket_key,
+        "native_blockers": [],
     }
     return {
-        "key": key,
-        "ticket_key": f"issue:{number}",
-        **contract,
-        "contract_digest": _independent_digest(contract),
-        "authoritative_id": f"github-node:{number}",
+        "key": ticket_key,
+        "labels": ["ready-for-agent"],
+        "source": {"ref": ticket_key, "digest": _task_digest(projection)},
+        "contract": contract,
+        "native_blockers": [],
     }
 
 
@@ -110,46 +238,63 @@ def _candidate(
     ticket_key = f"issue:{number}"
     candidate_body = {
         "kind": "candidate_receipt.v1",
+        "parent_digest": _sha(f"parent:{key}"),
         "repository": ROOT_REPOSITORY,
         "campaign_key": "campaign:test-root-canary",
-        "plan_revision_digest": "plan:1",
-        "ticket_key": ticket_key,
+        "campaign_handle": "campaign:test-root-canary",
+        "plan_revision_digest": PLAN_DIGEST,
         "work_run_key": f"work-run:{key}",
-        "base_commit_oid": f"base-commit:{key}",
-        "base_tree_oid": f"base-tree:{key}",
-        "candidate_commit_oid": f"candidate-commit:{key}",
-        "candidate_tree_oid": f"candidate-tree:{key}",
+        "ticket_key": ticket_key,
+        "reported_reference": f"refs/heads/gwo-v8-root-canary-{key}",
+        "base_commit_oid": _oid(f"base-commit:{key}"),
+        "base_tree_oid": _oid(f"base-tree:{key}"),
+        "candidate_commit_oid": _oid(f"candidate-commit:{key}"),
+        "candidate_tree_oid": _oid(f"candidate-tree:{key}"),
         "diff_schema_version": "CandidateDiffRecordV1",
-        "diff_record_digest": f"diff:{key}",
-        "authority_subtree_digest": f"authority-subtree:{key}",
-        "policy_witness_digest": "policy:1",
-        "ticket_contract_digest": contract_digest,
-        "assurance": assurance,
-        "assurance_requirement_digest": f"assurance-requirement:{key}",
-        "review_subject_digest": f"review-subject:{key}",
-        "authoritative_note": f"candidate note {key}",
+        "diff_record_digest": _sha(f"diff:{key}"),
+        "authority_subtree_digest": _sha(f"authority-subtree:{key}"),
+        "runtime_subject_digest": _sha(f"runtime-subject:{key}"),
     }
     candidate_receipt = {
         **candidate_body,
-        "receipt_digest": _independent_digest(candidate_body),
+        "receipt_digest": _task_digest(candidate_body),
     }
-    finding_digest = f"finding:{key}"
+    finding_digest = _task_digest(
+        {"kind": "review_finding_ledger.v1", "entries": []}
+    )
     accepted_body = {
         "kind": "accepted_candidate_receipt.v1",
         "repository": ROOT_REPOSITORY,
         "campaign_key": "campaign:test-root-canary",
-        "plan_revision_digest": "plan:1",
+        "plan_revision_digest": PLAN_DIGEST,
+        "target_branch": "main",
         "ticket_key": ticket_key,
+        "work_run_key": candidate_body["work_run_key"],
+        "integration_node_key": f"integration:{key}",
+        "accepted_sequence": number - 9,
+        "base_sha": candidate_body["base_commit_oid"],
+        "base_tree_oid": candidate_body["base_tree_oid"],
+        "candidate_sha": candidate_body["candidate_commit_oid"],
+        "candidate_tree_oid": candidate_body["candidate_tree_oid"],
         "candidate_receipt_digest": candidate_receipt["receipt_digest"],
+        "diff_schema_version": "CandidateDiffRecordV1",
+        "diff_record_digest": candidate_body["diff_record_digest"],
         "authority_subtree_digest": candidate_body["authority_subtree_digest"],
-        "policy_witness_digest": "policy:1",
-        "review_finding_ledger_digest": finding_digest,
+        "policy_witness_digest": POLICY_DIGEST,
+        "review_subject_digest": _sha(f"review-subject:{key}"),
         "assurance": assurance,
-        "authoritative_note": f"accepted note {key}",
+        "assurance_requirement_digest": _sha(f"assurance-requirement:{key}"),
+        "check_environment_digest": _sha(f"check-environment:{key}"),
+        "delivery_identity_digest": _sha(f"delivery-identity:{key}"),
+        "interaction_keys": [],
+        "protected_surfaces": [],
+        "gitlink_change": False,
+        "evidence_digests": [_sha(f"candidate-evidence:{key}")],
+        "review_finding_ledger_digest": finding_digest,
     }
     accepted_receipt = {
         **accepted_body,
-        "receipt_digest": _independent_digest(accepted_body),
+        "receipt_digest": _task_digest(accepted_body),
     }
     return {
         "ticket_key": ticket_key,
@@ -161,89 +306,56 @@ def _candidate(
 
 
 def _review(key: str, number: int, candidate_digest: str) -> dict[str, object]:
-    finding_digest = f"finding:{key}"
-    ledger_body = {
+    finding_digest = _task_digest(
+        {"kind": "review_finding_ledger.v1", "entries": []}
+    )
+    ledger = {
         "kind": "review_finding_ledger.v1",
-        "ticket_key": f"issue:{number}",
-        "candidate_receipt_digest": candidate_digest,
-        "open_finding_ids": [],
         "entries": [],
-        "authoritative_note": f"ledger note {key}",
+        "ledger_digest": finding_digest,
     }
     return {
         "ticket_key": f"issue:{number}",
         "candidate_receipt_digest": candidate_digest,
         "open_finding_ids": [],
         "finding_ledger_digest": finding_digest,
-        "finding_ledger": {
-            **ledger_body,
-            "ledger_digest": finding_digest,
-        },
+        "finding_ledger": ledger,
     }
 
 
-def _recovery_proof() -> dict[str, object]:
+def _recovery_proof(
+    tickets: list[dict[str, object]],
+    candidates: list[dict[str, object]],
+    reviews: list[dict[str, object]],
+    batches: list[dict[str, object]],
+) -> dict[str, object]:
+    ticket_refs = [ticket["key"] for ticket in tickets]
+    binding_ids = [f"binding:{key}" for key in ("alpha", "beta", "delta", "gamma")]
     return {
+        "ticket_keys": ticket_refs,
         "worker_slot_limit": 4,
         "peak_worker_slots": 4,
-        "ticket_keys": ["alpha", "beta", "gamma", "delta"],
-        "refill_ticket_order": ["alpha", "beta", "gamma", "delta"],
-        "permission_binding_pairs": [["binding:beta", "binding:beta"]],
-        "permission_authorization_links": [
-            {
-                "ticket_key": "beta",
-                "request_id": "permission-request:beta",
-                "binding_id": "binding:beta",
-                "before_binding_id": "binding:beta",
-                "after_binding_id": "binding:beta",
-                "request_digest": "permission-request-digest:beta",
-                "authorization_digest": "permission-authorization:beta",
-            }
-        ],
-        "stale_diagnosis_count_by_binding": [
-            [f"binding:{key}", 1] for key in ("alpha", "beta", "gamma", "delta")
-        ],
-        "stale_diagnosed_binding_ids": [
-            f"binding:{key}" for key in ("alpha", "beta", "gamma", "delta")
-        ],
-        "stale_diagnosis_authorization_links": [
-            {
-                "ticket_key": key,
-                "binding_id": f"binding:{key}",
-                "diagnosis_id": f"stale-diagnosis:{key}",
-                "diagnosis_digest": f"stale-diagnosis-digest:{key}",
-                "authorized": True,
-            }
-            for key in ("alpha", "beta", "gamma", "delta")
-        ],
+        "refill_ticket_order": ticket_refs,
+        "runtime_selector_digest": RUNTIME_SELECTOR_DIGEST,
+        "authority_root_digest": AUTHORITY_DIGEST,
+        "candidate_receipt_digests": sorted(
+            candidate["candidate_receipt_digest"] for candidate in candidates
+        ),
+        "candidate_sha_count_by_ticket": [[ref, 1] for ref in ticket_refs],
         "binding_count_by_ticket": [
             [key, 1] for key in ("alpha", "beta", "gamma", "delta")
         ],
-        "binding_ids_by_ticket": [
-            [key, [f"binding:{key}"]]
-            for key in ("alpha", "beta", "gamma", "delta")
-        ],
+        "permission_binding_pairs": [["binding:beta", "binding:beta"]],
+        "review_finding_ledger_digests": sorted(
+            {review["finding_ledger_digest"] for review in reviews}
+        ),
+        "stale_diagnosed_binding_ids": binding_ids,
+        "stale_diagnosis_count_by_binding": [[binding, 1] for binding in binding_ids],
         "terminal_replacement_receipt_digests": [],
-        "terminal_replacement_authorization_links": [],
         "semantic_effect_ids": ["semantic:alpha"],
         "external_effect_ids": ["external:alpha"],
-        "semantic_effect_records": [
-            {
-                "stable_action_id": "semantic:alpha",
-                "effect_digest": "semantic-effect:alpha",
-            }
-        ],
-        "external_effect_records": [
-            {
-                "stable_action_id": "external:alpha",
-                "effect_digest": "external-effect:alpha",
-            }
-        ],
         "duplicate_effect_ids": [],
-        "policy_witness_digest": "policy:1",
-        "authority_root_digest": "authority:1",
-        "runtime_selector_digest": "selector:1",
-        "fault_journal_digest": "fault:1",
+        "batch_receipt_digests": sorted(batch["receipt_digest"] for batch in batches),
     }
 
 
@@ -267,118 +379,76 @@ def valid_bundle() -> AcceptanceFixture:
     ]
     candidates = [
         _candidate(
-            ticket["key"],
-            ticket["number"],
-            ticket["contract_digest"],
-            assurance="strict" if ticket["key"] == "delta" else "standard",
+            key,
+            int(ticket["contract"]["number"]),
+            ticket["source"]["digest"],
+            assurance="strict" if key == "delta" else "standard",
         )
-        for ticket in tickets
+        for key, ticket in zip(
+            ("alpha", "beta", "gamma", "delta"), tickets, strict=True
+        )
     ]
     candidate_digests = [
         candidate["candidate_receipt_digest"] for candidate in candidates
     ]
     reviews = [
-        _review(ticket["key"], ticket["number"], candidate["candidate_receipt_digest"])
-        for ticket, candidate in zip(tickets, candidates, strict=True)
+        _review(
+            key,
+            int(ticket["contract"]["number"]),
+            candidate["candidate_receipt_digest"],
+        )
+        for key, ticket, candidate in zip(
+            ("alpha", "beta", "gamma", "delta"), tickets, candidates, strict=True
+        )
     ]
     finding_digests = [review["finding_ledger_digest"] for review in reviews]
-    proof = _recovery_proof()
-    proof.update(
-        {
-            "campaign_key": "campaign:test-root-canary",
-            "plan_revision_digest": "plan:1",
-            "policy_witness": {
-                "kind": "policy_witness.v1",
-                "digest": "policy:1",
-                "repository": ROOT_REPOSITORY,
-            },
-            "authority_root": {
-                "kind": "authority_root.v1",
-                "digest": "authority:1",
-                "plan_revision_digest": "plan:1",
-            },
-            "runtime_selector": {
-                "kind": "runtime_selector.v1",
-                "digest": "selector:1",
-                "campaign_key": "campaign:test-root-canary",
-            },
-            "fault_journal": {
-                "kind": "fault_journal.v1",
-                "digest": "fault:1",
-                "events": ["worker:candidate_persisted_before_ack"],
-            },
-            "authoritative_note": "complete recovery and effect proof",
-        }
-    )
-    policy_witness = {
-        "kind": "policy_witness.v1",
-        "digest": "policy:1",
-        "repository": ROOT_REPOSITORY,
-        "canonical_policy": {"assurance": "semantic-delta"},
-    }
-    authority_root = {
-        "kind": "authority_root.v1",
-        "digest": "authority:1",
-        "plan_revision_digest": "plan:1",
-        "grants": ["repository.read.v1", "workspace.write.v1"],
-    }
-    runtime_selector = {
-        "kind": "runtime_selector.v1",
-        "digest": "selector:1",
-        "campaign_key": "campaign:test-root-canary",
-        "selectors": ["worker", "recovery_worker", "review"],
-    }
-    fault_journal = {
-        "kind": "fault_journal.v1",
-        "digest": "fault:1",
-        "events": [
-            {"role": "worker", "point": "candidate_persisted_before_ack"}
-        ],
-    }
+    batches = [
+        _batch(
+            "multi",
+            ["issue:10", "issue:11", "issue:12"],
+            _oid("batch:multi"),
+            201,
+            301,
+            _oid("target:multi"),
+            candidate_digests[:3],
+            finding_digests[:3],
+        ),
+        _batch(
+            "singleton",
+            ["issue:13"],
+            _oid("batch:singleton"),
+            202,
+            302,
+            _oid("target:singleton"),
+            candidate_digests[3:],
+            finding_digests[3:],
+        ),
+    ]
+    proof = _recovery_proof(tickets, candidates, reviews, batches)
+    proof["authoritative_note"] = "complete recovery and effect proof"
     return AcceptanceFixture(
         {
             "repository": ROOT_REPOSITORY,
             "campaign_key": "campaign:test-root-canary",
-            "plan_revision_digest": "plan:1",
+            "plan_revision_digest": PLAN_DIGEST,
             "activation_id": "activation:1",
             "writer_generation": "v8",
-            "canary_target_sha": "sha:canary",
-            "policy_witness_digest": "policy:1",
-            "authority_root_digest": "authority:1",
-            "runtime_selector_digest": "selector:1",
-            "fault_journal_digest": "fault:1",
-            "policy_witness": policy_witness,
-            "authority_root": authority_root,
-            "runtime_selector": runtime_selector,
-            "fault_journal": fault_journal,
+            "canary_target_sha": _oid("canary-target"),
+            "policy_witness_digest": POLICY_DIGEST,
+            "authority_root_digest": AUTHORITY_DIGEST,
+            "runtime_selector_digest": RUNTIME_SELECTOR_DIGEST,
+            "fault_journal_digest": FAULT_JOURNAL_DIGEST,
+            "policy_witness": POLICY_WITNESS,
+            "authority_root": AUTHORITY_ROOT,
+            "runtime_selector": RUNTIME_SELECTOR,
+            "fault_journal": FAULT_JOURNAL,
             "tickets": tickets,
             "candidates": candidates,
             "accepted_candidate_receipts": [
                 candidate["accepted_candidate_receipt"] for candidate in candidates
             ],
             "reviews": reviews,
-            "batches": [
-                _batch(
-                    "multi",
-                    ["issue:10", "issue:11", "issue:12"],
-                    "sha:multi",
-                    201,
-                    301,
-                    "target:multi",
-                    candidate_digests[:3],
-                    finding_digests[:3],
-                ),
-                _batch(
-                    "singleton",
-                    ["issue:13"],
-                    "sha:singleton",
-                    202,
-                    302,
-                    "target:singleton",
-                    candidate_digests[3:],
-                    finding_digests[3:],
-                ),
-            ],
+            "batches": batches,
             "diagnostics": {"status": "Complete", "proof": proof},
         }
     )
@@ -424,17 +494,23 @@ def test_acceptance_requires_four_slots_refill_and_all_recovery_proofs(
     assert receipt.terminal_replacement_bounded
     assert receipt.duplicate_effect_ids == ()
     assert receipt.ticket_contract_digests == tuple(
-        (ticket["key"], ticket["contract_digest"])
-        for ticket in valid_bundle.data["tickets"]
-    )
-    assert receipt.candidate_receipt_digests == tuple(
-        (ticket["key"], candidate["candidate_receipt_digest"])
-        for ticket, candidate in zip(
-            valid_bundle.data["tickets"], valid_bundle.data["candidates"], strict=True
+        (key, ticket["source"]["digest"])
+        for key, ticket in zip(
+            ("alpha", "beta", "gamma", "delta"),
+            valid_bundle.data["tickets"],
+            strict=True,
         )
     )
-    assert receipt.policy_witness_digest == "policy:1"
-    assert receipt.fault_journal_digest == "fault:1"
+    assert receipt.candidate_receipt_digests == tuple(
+        (key, candidate["candidate_receipt_digest"])
+        for key, candidate in zip(
+            ("alpha", "beta", "gamma", "delta"),
+            valid_bundle.data["candidates"],
+            strict=True,
+        )
+    )
+    assert receipt.policy_witness_digest == POLICY_DIGEST
+    assert receipt.fault_journal_digest == FAULT_JOURNAL_DIGEST
 
 
 def test_acceptance_digest_is_canonical_and_binds_repository_identity(
@@ -506,29 +582,26 @@ def test_acceptance_digest_is_canonical_and_binds_repository_identity(
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("path", "code"),
     (
-        ("tickets", 0, "authoritative_note"),
-        ("candidates", 0, "candidate_receipt", "authoritative_note"),
-        ("reviews", 0, "finding_ledger", "authoritative_note"),
-        ("batches", 0, "target_readback", "authoritative_note"),
-        ("diagnostics", "proof", "authoritative_note"),
+        (("tickets", 0, "contract", "title"), "TICKET_CONTRACT_DIGEST_MISMATCH"),
+        (("candidates", 0, "candidate_receipt", "reported_reference"), "CANDIDATE_RECEIPT_INCOMPLETE"),
+        (("batches", 0, "target_readback", "target_branch"), "TARGET_SHA_MISMATCH"),
     ),
 )
 def test_acceptance_digest_binds_complete_authoritative_evidence(
     valid_bundle: AcceptanceFixture,
     path: tuple[object, ...],
+    code: str,
 ):
-    original = verify_root_canary(valid_bundle.data)
     data = valid_bundle.copy()
     target: object = data
     for key in path[:-1]:
         target = target[key]  # type: ignore[index]
     target[path[-1]] = "tampered authoritative evidence"  # type: ignore[index]
 
-    changed = verify_root_canary(data)
-
-    assert changed.receipt_digest != original.receipt_digest
+    with pytest.raises(RootCanaryVerificationError, match=code):
+        verify_root_canary(data)
 
 
 def test_diagnostics_status_is_required_and_nested_malformed_data_is_named(
@@ -567,8 +640,9 @@ def test_manifest_merge_verifies_full_ticket_identity_without_overwriting_readba
     tickets_path.write_text(
         json.dumps(
             {
-                "schema": "gwo-v8-root-canary-tickets.v1",
+                "schema": "gwo-v8-root-canary-tickets.v2",
                 "repository": ROOT_REPOSITORY,
+                "ready_refs": [ticket["key"] for ticket in manifest],
                 "tickets": manifest,
             }
         ),
@@ -595,49 +669,14 @@ def test_manifest_merge_verifies_full_ticket_identity_without_overwriting_readba
         )
 
 
-def test_strict_assurance_is_derived_from_the_semantic_delta_key(
+def test_strict_assurance_is_required_on_the_accepted_receipt(
     valid_bundle: AcceptanceFixture,
 ):
     data = valid_bundle.copy()
     for candidate in data["candidates"]:
-        candidate.pop("assurance")
+        candidate["accepted_candidate_receipt"].pop("assurance")
 
-    receipt = verify_root_canary(data)
-
-    assert receipt.strict_ticket_key == "delta"
-
-
-@pytest.mark.parametrize(
-    ("field", "code"),
-    (
-        (
-            "permission_authorization_links",
-            "PERMISSION_AUTHORIZATION_INCOMPLETE",
-        ),
-        (
-            "stale_diagnosis_authorization_links",
-            "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE",
-        ),
-        (
-            "terminal_replacement_authorization_links",
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        ),
-    ),
-)
-def test_recovery_verdicts_require_complete_authorization_links(
-    valid_bundle: AcceptanceFixture,
-    field: str,
-    code: str,
-):
-    data = valid_bundle.copy()
-    if field == "terminal_replacement_authorization_links":
-        data["diagnostics"]["proof"]["terminal_replacement_receipt_digests"] = [
-            "replacement:gamma"
-        ]
-    else:
-        data["diagnostics"]["proof"].pop(field)
-
-    with pytest.raises(RootCanaryVerificationError, match=code):
+    with pytest.raises(RootCanaryVerificationError, match="ASSURANCE_SHAPE_INVALID"):
         verify_root_canary(data)
 
 
@@ -726,7 +765,7 @@ def test_acceptance_requires_exact_ticket_set_and_candidate_review_crosslinks(
     valid_bundle: AcceptanceFixture,
 ):
     data = valid_bundle.copy()
-    data["tickets"][3]["ticket_key"] = "issue:10"
+    data["tickets"][3]["key"] = "issue:10"
     with pytest.raises(RootCanaryVerificationError, match="ROOT_TICKET_READBACK_INVALID"):
         verify_root_canary(data)
 
@@ -803,12 +842,9 @@ def test_read_only_cli_combines_ticket_manifest_and_diagnostics(
     tickets_path.write_text(
         json.dumps(
             {
-                "schema": "gwo-v8-root-canary-tickets.v1",
+                "schema": "gwo-v8-root-canary-tickets.v2",
                 "repository": ROOT_REPOSITORY,
-                "ready_refs": [
-                    f"github://{ROOT_REPOSITORY}/issues/{number}"
-                    for number in (10, 11, 12, 13)
-                ],
+                "ready_refs": [ticket["key"] for ticket in tickets],
                 "tickets": tickets,
             }
         ),
@@ -846,34 +882,14 @@ def test_read_only_cli_accepts_authoritative_ticket_manifest_readbacks(
     tickets_path = tmp_path / "tickets.json"
     diagnostics_path = tmp_path / "diagnostics.json"
     output_path = tmp_path / "receipt.json"
-    rich_tickets = []
-    for ticket in valid_bundle.data["tickets"]:
-        number = ticket["number"]
-        rich_tickets.append(
-            {
-                **ticket,
-                "id": number,
-                "node_id": f"node-{number}",
-                "title": f"Root Canary Ticket {ticket['key']}",
-                "repository": {
-                    "full_name": ROOT_REPOSITORY,
-                    "url": f"https://api.github.com/repos/{ROOT_REPOSITORY}",
-                },
-                "url": f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/{number}",
-                "html_url": f"https://github.com/{ROOT_REPOSITORY}/issues/{number}",
-                "updated_at": "2026-08-17T00:00:00Z",
-            }
-        )
+    rich_tickets = copy.deepcopy(valid_bundle.data["tickets"])
 
     tickets_path.write_text(
         json.dumps(
             {
-                "schema": "gwo-v8-root-canary-tickets.v1",
+                "schema": "gwo-v8-root-canary-tickets.v2",
                 "repository": ROOT_REPOSITORY,
-                "ready_refs": [
-                    f"github://{ROOT_REPOSITORY}/issues/{number}"
-                    for number in (10, 11, 12, 13)
-                ],
+                "ready_refs": [ticket["key"] for ticket in rich_tickets],
                 "tickets": rich_tickets,
             }
         ),
@@ -899,3 +915,180 @@ def test_read_only_cli_accepts_authoritative_ticket_manifest_readbacks(
         )
         == 0
     )
+
+
+def _v2_ticket_manifest_entry(ticket: dict[str, object]) -> dict[str, object]:
+    """Return an independent copy of Task 1's complete v2 entry."""
+
+    value = copy.deepcopy(ticket)
+    contract = value["contract"]
+    projection = {
+        "number": contract["number"],
+        "contract": contract,
+        "labels": value["labels"],
+        "source_ref": value["key"],
+        "native_blockers": value["native_blockers"],
+    }
+    value["source"]["digest"] = _task_digest(projection)
+    return value
+
+
+def test_task1_v2_manifest_is_authoritative_without_flattening_or_overwriting(
+    tmp_path: Path,
+    valid_bundle: AcceptanceFixture,
+):
+    tickets_path = tmp_path / "tickets.json"
+    diagnostics_path = tmp_path / "diagnostics.json"
+    output_path = tmp_path / "receipt.json"
+    manifest_tickets = [
+        _v2_ticket_manifest_entry(ticket)
+        for ticket in valid_bundle.data["tickets"]
+    ]
+    tickets_path.write_text(
+        json.dumps(
+            {
+                "schema": "gwo-v8-root-canary-tickets.v2",
+                "repository": ROOT_REPOSITORY,
+                "ready_refs": [item["key"] for item in manifest_tickets],
+                "tickets": manifest_tickets,
+            }
+        ),
+        encoding="utf-8",
+    )
+    diagnostics = valid_bundle.copy()
+    diagnostics.pop("tickets")
+    diagnostics_path.write_text(
+        json.dumps({"acceptance_bundle": diagnostics}), encoding="utf-8"
+    )
+
+    assert (
+        verify_main(
+            [
+                "--tickets",
+                str(tickets_path),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+
+def test_task1_v2_manifest_binds_full_contract_and_source_digest(
+    tmp_path: Path,
+    valid_bundle: AcceptanceFixture,
+):
+    tickets_path = tmp_path / "tickets.json"
+    diagnostics_path = tmp_path / "diagnostics.json"
+    output_path = tmp_path / "receipt.json"
+    manifest_tickets = [
+        _v2_ticket_manifest_entry(ticket)
+        for ticket in valid_bundle.data["tickets"]
+    ]
+    manifest_tickets[0]["contract"]["title"] = "tampered title"
+    tickets_path.write_text(
+        json.dumps(
+            {
+                "schema": "gwo-v8-root-canary-tickets.v2",
+                "repository": ROOT_REPOSITORY,
+                "ready_refs": [item["key"] for item in manifest_tickets],
+                "tickets": manifest_tickets,
+            }
+        ),
+        encoding="utf-8",
+    )
+    diagnostics = valid_bundle.copy()
+    diagnostics.pop("tickets")
+    diagnostics_path.write_text(
+        json.dumps({"acceptance_bundle": diagnostics}), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="TICKET_CONTRACT_DIGEST_MISMATCH"
+    ):
+        verify_main(
+            [
+                "--tickets",
+                str(tickets_path),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+
+
+def test_actual_campaign_proof_readback_does_not_require_nonexistent_link_records(
+    valid_bundle: AcceptanceFixture,
+):
+    data = valid_bundle.copy()
+    proof = data["diagnostics"]["proof"]
+    for field in (
+        "permission_authorization_links",
+        "stale_diagnosis_authorization_links",
+        "binding_ids_by_ticket",
+        "semantic_effect_records",
+        "external_effect_records",
+        "effect_history",
+    ):
+        proof.pop(field, None)
+    proof.update(
+        {
+            "ticket_keys": ["alpha", "beta", "gamma", "delta"],
+            "candidate_receipt_digests": sorted(
+                candidate["candidate_receipt_digest"]
+                for candidate in data["candidates"]
+            ),
+            "review_finding_ledger_digests": sorted(
+                {review["finding_ledger_digest"] for review in data["reviews"]}
+            ),
+            "batch_receipt_digests": sorted(
+                batch["receipt_digest"] for batch in data["batches"]
+            ),
+            "runtime_selector_digest": data["runtime_selector_digest"],
+            "authority_root_digest": data["authority_root_digest"],
+        }
+    )
+
+    verify_root_canary(data)
+
+
+def test_candidate_receipt_rejects_policy_witness_field_not_in_task3_schema(
+    valid_bundle: AcceptanceFixture,
+):
+    data = valid_bundle.copy()
+    data["candidates"][0]["candidate_receipt"]["policy_witness_digest"] = (
+        data["policy_witness_digest"]
+    )
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="CANDIDATE_RECEIPT_INCOMPLETE"
+    ):
+        verify_root_canary(data)
+
+
+def test_policy_witness_requires_a_canonical_evidence_object(
+    valid_bundle: AcceptanceFixture,
+):
+    data = valid_bundle.copy()
+    data.pop("policy_witness")
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="POLICY_EVIDENCE_INCOMPLETE"
+    ):
+        verify_root_canary(data)
+
+
+def test_assurance_is_not_defaulted_when_candidate_readback_omits_it(
+    valid_bundle: AcceptanceFixture,
+):
+    data = valid_bundle.copy()
+    candidate = data["candidates"][0]
+    candidate.pop("assurance", None)
+    candidate["candidate_receipt"].pop("assurance", None)
+    candidate["accepted_candidate_receipt"].pop("assurance", None)
+
+    with pytest.raises(RootCanaryVerificationError, match="ASSURANCE_SHAPE_INVALID"):
+        verify_root_canary(data)

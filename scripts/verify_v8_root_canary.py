@@ -23,6 +23,9 @@ _TICKET_KEY_PATTERN = re.compile(r"issue:([1-9][0-9]*)\Z")
 _GITHUB_REF_PATTERN = re.compile(
     rf"github://{re.escape(ROOT_REPOSITORY)}/issues/([1-9][0-9]*)\Z"
 )
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_TASK1_TICKET_SCHEMA = "gwo-v8-root-canary-tickets.v2"
 
 
 class RootCanaryVerificationError(RuntimeError):
@@ -72,6 +75,25 @@ def digest_value(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _canonical_digest(value: object) -> str:
+    """Digest the canonical JSON value used by the Task 1/Task 3 contracts.
+
+    The public verifier receipt retains its historical newline-terminated
+    digest contract.  The imported Task 1 and Task 3 artifacts use the shared
+    GWO canonical encoder, which hashes the JSON value without that transport
+    newline.
+    """
+
+    encoded = json.dumps(
+        _json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _mapping(value: object, code: str) -> dict[str, object]:
     if type(value) is not dict:
         _reject(code)
@@ -92,6 +114,18 @@ def _text(value: object, code: str) -> str:
 
 def _positive_int(value: object, code: str) -> int:
     if type(value) is not int or value <= 0:
+        _reject(code)
+    return value
+
+
+def _digest(value: object, code: str) -> str:
+    if type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None:
+        _reject(code)
+    return value
+
+
+def _object_id(value: object, code: str) -> str:
+    if type(value) is not str or _OBJECT_ID_PATTERN.fullmatch(value) is None:
         _reject(code)
     return value
 
@@ -309,6 +343,246 @@ def _ticket_label_names(ticket: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _v2_repository(value: object, code: str) -> dict[str, object]:
+    repository = _mapping(value, code)
+    if set(repository) != {"full_name", "url"}:
+        _reject(code)
+    if repository.get("full_name") != ROOT_REPOSITORY:
+        _reject("ROOT_REPOSITORY_MISMATCH")
+    if repository.get("url") != f"https://api.github.com/repos/{ROOT_REPOSITORY}":
+        _reject(code)
+    return repository
+
+
+def _v2_label(value: object, code: str) -> dict[str, object]:
+    label = _mapping(value, code)
+    if set(label) != {
+        "id",
+        "node_id",
+        "url",
+        "name",
+        "color",
+        "default",
+        "description",
+    }:
+        _reject(code)
+    _positive_int(label.get("id"), code)
+    _text(label.get("node_id"), code)
+    _text(label.get("name"), code)
+    _text(label.get("url"), code)
+    if type(label.get("color")) is not str or type(label.get("default")) is not bool:
+        _reject(code)
+    description = label.get("description")
+    if description is not None and type(description) is not str:
+        _reject(code)
+    expected_url = (
+        f"https://api.github.com/repos/{ROOT_REPOSITORY}/labels/"
+        "ready-for-agent"
+    )
+    if label.get("url") != expected_url:
+        _reject(code)
+    return label
+
+
+def _v2_comment(value: object, number: int, code: str) -> dict[str, object]:
+    comment = _mapping(value, code)
+    if set(comment) != {
+        "id",
+        "node_id",
+        "url",
+        "html_url",
+        "body",
+        "user",
+        "created_at",
+        "updated_at",
+        "author_association",
+    }:
+        _reject(code)
+    comment_id = _positive_int(comment.get("id"), code)
+    _text(comment.get("node_id"), code)
+    _text(comment.get("body"), code)
+    for field in ("created_at", "updated_at", "author_association"):
+        _text(comment.get(field), code)
+    user = _mapping(comment.get("user"), code)
+    if set(user) != {"login"}:
+        _reject(code)
+    _text(user.get("login"), code)
+    expected_url = (
+        f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/comments/{comment_id}"
+    )
+    expected_html_url = (
+        f"https://github.com/{ROOT_REPOSITORY}/issues/{number}"
+        f"#issuecomment-{comment_id}"
+    )
+    if comment.get("url") != expected_url or comment.get("html_url") != expected_html_url:
+        _reject(code)
+    return comment
+
+
+def _v2_blocker(value: object, code: str) -> dict[str, object]:
+    blocker = _mapping(value, code)
+    if set(blocker) != {"key", "state", "repository", "source"}:
+        _reject(code)
+    key = _text(blocker.get("key"), code)
+    if _TICKET_KEY_PATTERN.fullmatch(key) is None:
+        _reject(code)
+    state = _text(blocker.get("state"), code).lower()
+    if state not in {"open", "closed"}:
+        _reject(code)
+    repository = _v2_repository(blocker.get("repository"), code)
+    source = _mapping(blocker.get("source"), code)
+    if set(source) != {"ref", "digest"} or source.get("ref") != key:
+        _reject(code)
+    if _digest(source.get("digest"), code) != _canonical_digest(
+        {"key": key, "state": state, "repository": repository}
+    ):
+        _reject("TICKET_CONTRACT_DIGEST_MISMATCH")
+    return blocker
+
+
+def _validate_v2_ticket(value: object, expected_ref: str, code: str) -> dict[str, object]:
+    ticket = _mapping(value, code)
+    if set(ticket) != {"key", "labels", "source", "contract", "native_blockers"}:
+        _reject(code)
+    if ticket.get("key") != expected_ref:
+        _reject(code)
+    source = _mapping(ticket.get("source"), code)
+    if set(source) != {"ref", "digest"} or source.get("ref") != expected_ref:
+        _reject(code)
+
+    contract = _mapping(ticket.get("contract"), code)
+    if set(contract) != {
+        "id",
+        "node_id",
+        "number",
+        "title",
+        "body",
+        "state",
+        "state_reason",
+        "type",
+        "repository",
+        "labels",
+        "comments",
+        "updated_at",
+    }:
+        _reject(code)
+    number_match = _TICKET_KEY_PATTERN.fullmatch(expected_ref)
+    if number_match is None:
+        _reject(code)
+    number = int(number_match.group(1))
+    if (
+        _positive_int(contract.get("id"), code) <= 0
+        or _text(contract.get("node_id"), code) == ""
+        or contract.get("number") != number
+    ):
+        _reject(code)
+    _text(contract.get("title"), code)
+    if type(contract.get("body")) is not str:
+        _reject(code)
+    state = _text(contract.get("state"), code).lower()
+    if state not in {"open", "closed"}:
+        _reject(code)
+    state_reason = contract.get("state_reason")
+    if state_reason is not None and type(state_reason) is not str:
+        _reject(code)
+    issue_type = contract.get("type")
+    if issue_type is not None:
+        _mapping(issue_type, code)
+    _v2_repository(contract.get("repository"), code)
+    labels = _sequence(contract.get("labels"), code)
+    parsed_labels = [_v2_label(item, code) for item in labels]
+    if len({item["id"] for item in parsed_labels}) != len(parsed_labels):
+        _reject(code)
+    if len({item["name"] for item in parsed_labels}) != len(parsed_labels):
+        _reject(code)
+    comments = _sequence(contract.get("comments"), code)
+    parsed_comments = [_v2_comment(item, number, code) for item in comments]
+    if len({item["id"] for item in parsed_comments}) != len(parsed_comments):
+        _reject(code)
+    _text(contract.get("updated_at"), code)
+
+    entry_labels = _sequence(ticket.get("labels"), code)
+    if any(type(item) is not str or not item for item in entry_labels):
+        _reject(code)
+    if list(entry_labels) != [item["name"] for item in parsed_labels]:
+        _reject("TICKET_READBACK_MISMATCH")
+    if tuple(entry_labels) != ("ready-for-agent",):
+        _reject("ROOT_TICKET_NOT_READY")
+
+    blockers = tuple(
+        _v2_blocker(item, code)
+        for item in _sequence(ticket.get("native_blockers"), code)
+    )
+    if blockers:
+        _reject("ROOT_TICKET_NOT_READY")
+    projection = {
+        "number": number,
+        "contract": contract,
+        "labels": list(entry_labels),
+        "source_ref": expected_ref,
+        "native_blockers": list(blockers),
+    }
+    if _digest(source.get("digest"), code) != _canonical_digest(projection):
+        _reject("TICKET_CONTRACT_DIGEST_MISMATCH")
+    if state != "open":
+        _reject("ROOT_TICKET_NOT_READY")
+    return ticket
+
+
+def _validate_v2_manifest(
+    manifest: Mapping[str, object], code: str = "ROOT_TICKET_MANIFEST_INVALID"
+) -> tuple[dict[str, object], ...]:
+    if set(manifest) != {"schema", "repository", "ready_refs", "tickets"}:
+        _reject(code)
+    if manifest.get("schema") != _TASK1_TICKET_SCHEMA:
+        _reject(code)
+    if manifest.get("repository") != ROOT_REPOSITORY:
+        _reject("ROOT_REPOSITORY_MISMATCH")
+    refs = _sequence(manifest.get("ready_refs"), code)
+    if len(refs) != 4 or any(
+        type(ref) is not str or _TICKET_KEY_PATTERN.fullmatch(ref) is None
+        for ref in refs
+    ):
+        _reject(code)
+    if len(set(refs)) != len(refs):
+        _reject(code)
+    raw_tickets = _sequence(manifest.get("tickets"), code)
+    if len(raw_tickets) != 4:
+        _reject(code)
+    if tuple(refs) != tuple(
+        _mapping(item, code).get("key") for item in raw_tickets
+    ):
+        _reject("TICKET_READBACK_MISMATCH")
+    tickets = tuple(
+        _validate_v2_ticket(item, ref, code)
+        for item, ref in zip(raw_tickets, refs, strict=True)
+    )
+    return tickets
+
+
+def _ticket_reference(ticket: Mapping[str, object]) -> str:
+    if "contract" in ticket:
+        return _text(ticket.get("key"), "ROOT_TICKET_READBACK_INVALID")
+    return _text(ticket.get("ticket_key"), "ROOT_TICKET_READBACK_INVALID")
+
+
+def _ticket_number(ticket: Mapping[str, object]) -> int:
+    if "contract" in ticket:
+        reference = _ticket_reference(ticket)
+        match = _TICKET_KEY_PATTERN.fullmatch(reference)
+        if match is None:
+            _reject("ROOT_TICKET_READBACK_INVALID")
+        return int(match.group(1))
+    return _positive_int(ticket.get("number"), "ROOT_TICKET_READBACK_INVALID")
+
+
+def _ticket_contract_digest(ticket: Mapping[str, object]) -> str:
+    if "contract" in ticket:
+        source = _mapping(ticket.get("source"), "ROOT_TICKET_READBACK_INVALID")
+        return _digest(source.get("digest"), "ROOT_TICKET_READBACK_INVALID")
+    return _text(ticket.get("contract_digest"), "ROOT_TICKET_READBACK_INVALID")
+
+
 def _ticket_contract_payload(
     ticket: Mapping[str, object], code: str = "ROOT_TICKET_READBACK_INVALID"
 ) -> dict[str, object]:
@@ -397,6 +671,35 @@ def _ticket_aliases(bundle: Mapping[str, object]) -> tuple[dict[str, str], tuple
         bundle.get("tickets"), "ROOT_TICKET_READBACK_INVALID"
     )
     if len(raw_tickets) != 4:
+        _reject("ROOT_TICKET_READBACK_INVALID")
+
+    if all(type(raw) is dict and "contract" in raw for raw in raw_tickets):
+        refs = tuple(
+            _text(
+                _mapping(raw, "ROOT_TICKET_READBACK_INVALID").get("key"),
+                "ROOT_TICKET_READBACK_INVALID",
+            )
+            for raw in raw_tickets
+        )
+        if len(set(refs)) != 4:
+            _reject("ROOT_TICKET_READBACK_INVALID")
+        entries = tuple(
+            _validate_v2_ticket(raw, ref, "ROOT_TICKET_READBACK_INVALID")
+            for raw, ref in zip(raw_tickets, refs, strict=True)
+        )
+        ready_refs = bundle.get("ready_refs")
+        if ready_refs is not None:
+            ready_values = _sequence(
+                ready_refs, "ROOT_TICKET_READBACK_INVALID"
+            )
+            if tuple(ready_values) != refs:
+                _reject("ROOT_TICKET_READBACK_INVALID")
+        return (
+            {ref: ROOT_TICKET_KEYS[index] for index, ref in enumerate(refs)},
+            entries,
+        )
+
+    if any(type(raw) is dict and "contract" in raw for raw in raw_tickets):
         _reject("ROOT_TICKET_READBACK_INVALID")
 
     aliases: dict[str, str] = {}
@@ -495,14 +798,29 @@ def _proof_digest_values(
     if value is None:
         return None
     values = _sequence(value, code)
-    result: list[str] = []
-    for item in values:
-        if type(item) is str:
-            result.append(_text(item, code))
-            continue
-        mapping = _mapping(item, code)
-        result.append(_text(_readback_digest(mapping, "digest", "receipt_digest"), code))
-    return tuple(result)
+    result = tuple(_digest(item, code) for item in values)
+    if result != tuple(sorted(set(result))):
+        _reject(code)
+    return result
+
+
+def _canonical_evidence_digest(
+    value: object, code: str
+) -> tuple[dict[str, object], str]:
+    evidence = _mapping(value, code)
+    digest_fields = tuple(
+        field
+        for field in ("digest", "receipt_digest", "subtree_digest")
+        if field in evidence
+    )
+    if len(digest_fields) != 1:
+        _reject(code)
+    digest_field = digest_fields[0]
+    stored = _digest(evidence.get(digest_field), code)
+    body = {key: item for key, item in evidence.items() if key != digest_field}
+    if not body or stored != _canonical_digest(body):
+        _reject(code)
+    return evidence, stored
 
 
 def _evidence_digest(
@@ -512,91 +830,45 @@ def _evidence_digest(
     evidence_name: str,
     code: str,
 ) -> str:
-    value = bundle.get(field)
-    top_digest: str | None = None
-    if value is not None:
-        if type(value) is str:
-            top_digest = _text(value, code)
-        elif type(value) is dict:
-            top_digest = _text(
-                _readback_digest(value, "digest", "receipt_digest"), code
-            )
-        else:
-            _reject(code)
-
-    proof_digest = _proof_digest(proof, field, evidence_name, code=code)
-    if top_digest is not None and proof_digest is not None and top_digest != proof_digest:
+    top_digest = _digest(bundle.get(field), code)
+    evidence, result = _canonical_evidence_digest(bundle.get(evidence_name), code)
+    if result != top_digest:
         _reject(code)
-    value_digest = top_digest or proof_digest
-    evidence = bundle.get(evidence_name)
-    if value_digest is None and evidence is not None:
-        evidence_mapping = _mapping(evidence, code)
-        value_digest = _readback_digest(evidence_mapping, "digest", "receipt_digest")
-    result = _text(value_digest, code)
-    if evidence is not None:
-        evidence_mapping = _mapping(evidence, code)
-        embedded = _readback_digest(evidence_mapping, "digest", "receipt_digest")
-        if embedded is not None and embedded != result:
-            _reject(code)
+
+    proof_digest = proof.get(field)
+    if proof_digest is not None and _digest(proof_digest, code) != result:
+        _reject(code)
     proof_evidence = proof.get(evidence_name)
     if proof_evidence is not None:
-        proof_evidence_mapping = _mapping(proof_evidence, code)
-        embedded = _readback_digest(
-            proof_evidence_mapping, "digest", "receipt_digest"
+        _proof_value, proof_value_digest = _canonical_evidence_digest(
+            proof_evidence, code
         )
-        if embedded is None or embedded != result:
+        if proof_value_digest != result:
             _reject(code)
+
+    # These optional identity fields are part of the evidence when the
+    # producer exposes them.  They are not guessed when the Task 3 source
+    # does not expose them.
+    if evidence.get("repository") is not None and evidence["repository"] != ROOT_REPOSITORY:
+        _reject("ROOT_REPOSITORY_MISMATCH")
     return result
 
 
 def _validate_effects(proof: Mapping[str, object]) -> tuple[str, ...]:
     semantic = _sequence(proof.get("semantic_effect_ids"), "EFFECT_PROOF_INCOMPLETE")
     external = _sequence(proof.get("external_effect_ids"), "EFFECT_PROOF_INCOMPLETE")
-    semantic_ids = tuple(
-        _text(value, "EFFECT_PROOF_INCOMPLETE") for value in semantic
-    )
-    external_ids = tuple(
-        _text(value, "EFFECT_PROOF_INCOMPLETE") for value in external
-    )
+    semantic_ids = tuple(_text(value, "EFFECT_PROOF_INCOMPLETE") for value in semantic)
+    external_ids = tuple(_text(value, "EFFECT_PROOF_INCOMPLETE") for value in external)
     duplicates = _sequence(proof.get("duplicate_effect_ids"), "DUPLICATE_EFFECT")
     duplicate_ids = tuple(_text(value, "DUPLICATE_EFFECT") for value in duplicates)
-    if len(set(semantic_ids)) != len(semantic_ids):
+    if semantic_ids != tuple(sorted(set(semantic_ids))):
         _reject("DUPLICATE_EFFECT")
-    if len(set(external_ids)) != len(external_ids):
+    if external_ids != tuple(sorted(set(external_ids))):
         _reject("DUPLICATE_EFFECT")
-    if duplicate_ids:
+    if set(semantic_ids) & set(external_ids):
         _reject("DUPLICATE_EFFECT")
-    for field, ids in (
-        ("semantic_effect_records", semantic_ids),
-        ("external_effect_records", external_ids),
-    ):
-        records = _sequence(proof.get(field), "EFFECT_PROOF_INCOMPLETE")
-        record_ids: list[str] = []
-        for record in records:
-            mapping = _mapping(record, "EFFECT_PROOF_INCOMPLETE")
-            record_id = _text(
-                mapping.get("stable_action_id"), "EFFECT_PROOF_INCOMPLETE"
-            )
-            _text(
-                mapping.get("effect_digest", mapping.get("digest")),
-                "EFFECT_PROOF_INCOMPLETE",
-            )
-            record_ids.append(record_id)
-        if tuple(record_ids) != ids:
-            _reject("EFFECT_PROOF_INCOMPLETE")
-    history = proof.get("effect_history")
-    if history is not None:
-        history_values = _sequence(history, "DUPLICATE_EFFECT")
-        seen: set[str] = set()
-        for value in history_values:
-            if type(value) is dict:
-                effect_id = value.get("stable_action_id")
-            else:
-                effect_id = value
-            effect_id = _text(effect_id, "DUPLICATE_EFFECT")
-            if effect_id in seen:
-                _reject("DUPLICATE_EFFECT")
-            seen.add(effect_id)
+    if duplicate_ids or duplicate_ids != tuple(sorted(set(duplicate_ids))):
+        _reject("DUPLICATE_EFFECT")
     return tuple(sorted(duplicate_ids))
 
 
@@ -616,14 +888,58 @@ def _normalise_proof_keys(value: object, aliases: Mapping[str, str], code: str) 
     return tuple(result)
 
 
+def _normalise_count_pairs(
+    value: object,
+    aliases: Mapping[str, str],
+    code: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+    expected_keys: set[str] | None = None,
+) -> dict[str, int]:
+    pairs = _sequence(value, code)
+    result: dict[str, int] = {}
+    for raw in pairs:
+        pair = _sequence(raw, code)
+        if len(pair) != 2:
+            _reject(code)
+        reference = _ticket_key_from_ref(pair[0])
+        key = aliases.get(reference, reference)
+        if key is None and type(pair[0]) is str:
+            key = pair[0]
+        if key not in ROOT_TICKET_KEYS and (
+            expected_keys is None or key not in expected_keys
+        ):
+            _reject(code)
+        if key in result or type(pair[1]) is not int or isinstance(pair[1], bool):
+            _reject(code)
+        if pair[1] < minimum or (maximum is not None and pair[1] > maximum):
+            _reject(code)
+        result[key] = pair[1]
+    if expected_keys is None:
+        if set(result) != set(ROOT_TICKET_KEYS):
+            _reject(code)
+    elif set(result) != expected_keys:
+        _reject(code)
+    return result
+
+
 def _validate_recovery_proof(
     proof: Mapping[str, object], aliases: Mapping[str, str]
 ) -> tuple[int, bool, bool, bool, bool, tuple[str, ...], tuple[str, ...]]:
+    """Validate the exact fields exposed by Task 3 CampaignProofReadback."""
+
+    ticket_keys = _normalise_proof_keys(
+        proof.get("ticket_keys"), aliases, "RECOVERY_PROOF_INCOMPLETE"
+    )
+    if ticket_keys != ROOT_TICKET_KEYS:
+        _reject("RECOVERY_PROOF_INCOMPLETE")
+
     limit = proof.get("worker_slot_limit")
-    if limit is not None and (type(limit) is not int or limit != 4):
-        _reject("WORKER_SLOT_PROOF_INVALID")
     peak = proof.get("peak_worker_slots")
-    if type(peak) is not int or peak != 4:
+    if type(limit) is not int or isinstance(limit, bool) or limit != 4:
+        _reject("WORKER_SLOT_PROOF_INVALID")
+    if type(peak) is not int or isinstance(peak, bool) or peak != 4 or peak > limit:
         _reject("WORKER_SLOT_PROOF_INVALID")
 
     refill = _normalise_proof_keys(
@@ -632,267 +948,289 @@ def _validate_recovery_proof(
     if refill != ROOT_TICKET_KEYS:
         _reject("REFILL_PROOF_INVALID")
 
-    pairs = _sequence(
+    raw_pairs = _sequence(
         proof.get("permission_binding_pairs"), "PERMISSION_BINDING_MISMATCH"
     )
-    if not pairs:
+    if not raw_pairs:
         _reject("PERMISSION_BINDING_MISMATCH")
     permission_pairs: list[tuple[str, str]] = []
-    for pair in pairs:
-        values = _sequence(pair, "PERMISSION_BINDING_MISMATCH")
-        if len(values) != 2:
+    for raw in raw_pairs:
+        pair = _sequence(raw, "PERMISSION_BINDING_MISMATCH")
+        if len(pair) != 2:
             _reject("PERMISSION_BINDING_MISMATCH")
-        before = _text(values[0], "PERMISSION_BINDING_MISMATCH")
-        after = _text(values[1], "PERMISSION_BINDING_MISMATCH")
-        if before != after:
+        before = _text(pair[0], "PERMISSION_BINDING_MISMATCH")
+        after = _text(pair[1], "PERMISSION_BINDING_MISMATCH")
+        if before == after:
+            same_binding = True
+        else:
+            before_identity = before.rsplit(":", 1)[-1]
+            after_identity = after.rsplit(":", 1)[-1]
+            same_binding = bool(before_identity) and before_identity == after_identity
+        if not same_binding:
             _reject("PERMISSION_BINDING_MISMATCH")
         permission_pairs.append((before, after))
+    if tuple(permission_pairs) != tuple(sorted(set(permission_pairs))):
+        _reject("PERMISSION_BINDING_MISMATCH")
 
-    permission_links = proof.get("permission_authorization_links")
-    permission_values = _sequence(
-        permission_links, "PERMISSION_AUTHORIZATION_INCOMPLETE"
+    candidate_counts = _normalise_count_pairs(
+        proof.get("candidate_sha_count_by_ticket"),
+        aliases,
+        "RECOVERY_BOUND_INVALID",
+        minimum=1,
     )
-    if not permission_values:
-        _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-    linked_permission_pairs: list[tuple[str, str]] = []
-    permission_link_records: list[tuple[str, str]] = []
-    permission_request_ids: set[str] = set()
-    for raw in permission_values:
-        link = _mapping(raw, "PERMISSION_AUTHORIZATION_INCOMPLETE")
-        ticket_ref = _text(
-            link.get("ticket_key"), "PERMISSION_AUTHORIZATION_INCOMPLETE"
-        )
-        ticket_key = _ticket_key_from_ref(ticket_ref)
-        if ticket_key in aliases:
-            ticket_key = aliases[ticket_key]
-        if ticket_key not in ROOT_TICKET_KEYS:
-            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-        request_id = _text(
-            link.get("request_id", link.get("permission_request_id")),
-            "PERMISSION_AUTHORIZATION_INCOMPLETE",
-        )
-        if request_id in permission_request_ids:
-            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-        permission_request_ids.add(request_id)
-        binding_id = _text(
-            link.get("binding_id"), "PERMISSION_AUTHORIZATION_INCOMPLETE"
-        )
-        before = _text(
-            link.get("before_binding_id", link.get("before")),
-            "PERMISSION_AUTHORIZATION_INCOMPLETE",
-        )
-        after = _text(
-            link.get("after_binding_id", link.get("after")),
-            "PERMISSION_AUTHORIZATION_INCOMPLETE",
-        )
-        _text(link.get("request_digest"), "PERMISSION_AUTHORIZATION_INCOMPLETE")
-        _text(
-            link.get("authorization_digest"),
-            "PERMISSION_AUTHORIZATION_INCOMPLETE",
-        )
-        if "authorized" in link and link["authorized"] is not True:
-            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-        if binding_id != before or before != after:
-            _reject("PERMISSION_BINDING_MISMATCH")
-        linked_permission_pairs.append((before, after))
-        permission_link_records.append((ticket_key, binding_id))
-    if (
-        len(linked_permission_pairs) != len(permission_pairs)
-        or sorted(linked_permission_pairs) != sorted(permission_pairs)
-    ):
-        _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-    permission_same = True
-
-    stale_values = _sequence(
-        proof.get("stale_diagnosis_count_by_binding"), "RECOVERY_BOUND_INVALID"
+    binding_counts = _normalise_count_pairs(
+        proof.get("binding_count_by_ticket"),
+        aliases,
+        "RECOVERY_BOUND_INVALID",
+        minimum=1,
+        maximum=2,
     )
-    if not stale_values:
-        _reject("RECOVERY_BOUND_INVALID")
-    stale_ids: list[str] = []
-    for item in stale_values:
-        pair = _sequence(item, "RECOVERY_BOUND_INVALID")
-        if len(pair) != 2 or type(pair[1]) is not int or pair[1] < 0:
-            _reject("RECOVERY_BOUND_INVALID")
-        binding_id = _text(pair[0], "RECOVERY_BOUND_INVALID")
-        if pair[1] > 1:
-            _reject("RECOVERY_BOUND_INVALID")
-        stale_ids.append(binding_id)
-    if len(set(stale_ids)) != len(stale_ids):
-        _reject("RECOVERY_BOUND_INVALID")
-    diagnosed = proof.get("stale_diagnosed_binding_ids")
-    diagnosed_ids = tuple(
-        _text(value, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-        for value in _sequence(
-            diagnosed, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
-        )
-    )
-    if (
-        len(diagnosed_ids) != len(stale_ids)
-        or len(set(diagnosed_ids)) != len(diagnosed_ids)
-        or set(diagnosed_ids) != set(stale_ids)
-    ):
+    if set(candidate_counts) != set(ROOT_TICKET_KEYS):
         _reject("RECOVERY_BOUND_INVALID")
 
-    stale_links = _sequence(
-        proof.get("stale_diagnosis_authorization_links"),
-        "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE",
+    stale_ids_value = _sequence(
+        proof.get("stale_diagnosed_binding_ids"), "RECOVERY_BOUND_INVALID"
     )
-    linked_stale: set[str] = set()
-    stale_link_records: list[tuple[str, str]] = []
-    for raw in stale_links:
-        link = _mapping(raw, "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-        ticket_ref = _text(
-            link.get("ticket_key"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
-        )
-        ticket_key = _ticket_key_from_ref(ticket_ref)
-        if ticket_key in aliases:
-            ticket_key = aliases[ticket_key]
-        if ticket_key not in ROOT_TICKET_KEYS:
-            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-        binding_id = _text(
-            link.get("binding_id"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE"
-        )
-        _text(link.get("diagnosis_id"), "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-        _text(
-            link.get("diagnosis_digest"),
-            "STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE",
-        )
-        if link.get("authorized") is not True:
-            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-        linked_stale.add(binding_id)
-        stale_link_records.append((ticket_key, binding_id))
-    if (
-        len(stale_link_records) != len(stale_ids)
-        or len(linked_stale) != len(stale_link_records)
-        or linked_stale != set(stale_ids)
-    ):
-        _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-    stale_bounded = True
-
-    binding_values = _sequence(
-        proof.get("binding_count_by_ticket"), "RECOVERY_BOUND_INVALID"
+    stale_ids = tuple(_text(value, "RECOVERY_BOUND_INVALID") for value in stale_ids_value)
+    if stale_ids != tuple(sorted(set(stale_ids))):
+        _reject("RECOVERY_BOUND_INVALID")
+    stale_counts = _normalise_count_pairs(
+        proof.get("stale_diagnosis_count_by_binding"),
+        {},
+        "RECOVERY_BOUND_INVALID",
+        minimum=1,
+        maximum=1,
+        expected_keys=set(stale_ids),
     )
-    counts: dict[str, int] = {}
-    for item in binding_values:
-        pair = _sequence(item, "RECOVERY_BOUND_INVALID")
-        if len(pair) != 2 or type(pair[1]) is not int or pair[1] < 1:
-            _reject("RECOVERY_BOUND_INVALID")
-        key = _ticket_key_from_ref(pair[0])
-        if key in aliases:
-            key = aliases[key]
-        if key not in ROOT_TICKET_KEYS or key in counts:
-            _reject("RECOVERY_BOUND_INVALID")
-        if pair[1] > 2:
-            _reject("RECOVERY_BOUND_INVALID")
-        counts[key] = pair[1]
-    if set(counts) != set(ROOT_TICKET_KEYS):
+    if set(stale_counts) != set(stale_ids):
         _reject("RECOVERY_BOUND_INVALID")
 
-    binding_ids_values = _sequence(
-        proof.get("binding_ids_by_ticket"), "RECOVERY_BOUND_INVALID"
-    )
-    binding_ids_by_ticket: dict[str, tuple[str, ...]] = {}
-    for item in binding_ids_values:
-        pair = _sequence(item, "RECOVERY_BOUND_INVALID")
-        if len(pair) != 2:
-            _reject("RECOVERY_BOUND_INVALID")
-        key = _ticket_key_from_ref(pair[0])
-        if key in aliases:
-            key = aliases[key]
-        if key not in ROOT_TICKET_KEYS or key in binding_ids_by_ticket:
-            _reject("RECOVERY_BOUND_INVALID")
-        binding_ids = tuple(
-            _text(value, "RECOVERY_BOUND_INVALID")
-            for value in _sequence(pair[1], "RECOVERY_BOUND_INVALID")
-        )
-        if len(binding_ids) != counts[key] or len(set(binding_ids)) != len(binding_ids):
-            _reject("RECOVERY_BOUND_INVALID")
-        binding_ids_by_ticket[key] = binding_ids
-    if set(binding_ids_by_ticket) != set(ROOT_TICKET_KEYS):
-        _reject("RECOVERY_BOUND_INVALID")
-    for ticket_key, binding_id in permission_link_records:
-        if binding_id not in binding_ids_by_ticket[ticket_key]:
-            _reject("PERMISSION_AUTHORIZATION_INCOMPLETE")
-    for ticket_key, binding_id in stale_link_records:
-        if binding_id not in binding_ids_by_ticket[ticket_key]:
-            _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-    if not set(stale_ids).issubset(
-        {binding for values in binding_ids_by_ticket.values() for binding in values}
-    ):
-        _reject("STALE_DIAGNOSIS_AUTHORIZATION_INCOMPLETE")
-
-    terminal = proof.get("terminal_replacement_receipt_digests")
-    terminal_digests = tuple(
-        _text(value, "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        for value in _sequence(
-            () if terminal is None else terminal,
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-    )
-    if len(terminal_digests) > 1 or len(set(terminal_digests)) != len(terminal_digests):
-        _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-
-    terminal_links = _sequence(
-        proof.get("terminal_replacement_authorization_links"),
+    terminal_values = _sequence(
+        proof.get("terminal_replacement_receipt_digests"),
         "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
     )
-    linked_terminal: list[str] = []
-    linked_terminal_tickets: set[str] = set()
-    for raw in terminal_links:
-        link = _mapping(raw, "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        ticket_ref = _text(
-            link.get("ticket_key"),
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-        ticket_key = _ticket_key_from_ref(ticket_ref)
-        if ticket_key in aliases:
-            ticket_key = aliases[ticket_key]
-        if ticket_key not in ROOT_TICKET_KEYS:
-            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        old_binding = _text(
-            link.get("old_binding_id"),
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-        new_binding = _text(
-            link.get("new_binding_id"),
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-        _text(
-            link.get("terminal_binding_evidence_digest"),
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-        replacement_digest = _text(
-            link.get("replacement_receipt_digest"),
-            "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE",
-        )
-        if link.get("authorized") is not True or old_binding == new_binding:
-            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        if counts.get(ticket_key) != 2:
-            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        if old_binding not in binding_ids_by_ticket[ticket_key] or new_binding not in binding_ids_by_ticket[ticket_key]:
-            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        if replacement_digest in linked_terminal:
-            _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-        linked_terminal.append(replacement_digest)
-        linked_terminal_tickets.add(ticket_key)
-    expected_terminal_tickets = {
-        key for key, count in counts.items() if count == 2
-    }
-    if (
-        set(linked_terminal) != set(terminal_digests)
-        or linked_terminal_tickets != expected_terminal_tickets
-    ):
+    terminal_digests = tuple(
+        _digest(value, "TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+        for value in terminal_values
+    )
+    if terminal_digests != tuple(sorted(set(terminal_digests))):
         _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
-    terminal_bounded = True
+    replaced = {key for key, count in binding_counts.items() if count == 2}
+    if bool(replaced) != bool(terminal_digests):
+        _reject("TERMINAL_REPLACEMENT_AUTHORIZATION_INCOMPLETE")
+
     return (
         peak,
-        set(refill) == set(ROOT_TICKET_KEYS),
-        permission_same,
-        stale_bounded,
-        terminal_bounded,
+        True,
+        True,
+        True,
+        True,
         terminal_digests,
-        tuple(sorted(counts)),
+        tuple(sorted(binding_counts)),
     )
+
+
+_CANDIDATE_RECEIPT_KEYS = frozenset(
+    {
+        "kind",
+        "parent_digest",
+        "repository",
+        "campaign_key",
+        "campaign_handle",
+        "plan_revision_digest",
+        "work_run_key",
+        "ticket_key",
+        "reported_reference",
+        "base_commit_oid",
+        "base_tree_oid",
+        "candidate_commit_oid",
+        "candidate_tree_oid",
+        "diff_schema_version",
+        "diff_record_digest",
+        "authority_subtree_digest",
+        "runtime_subject_digest",
+        "receipt_digest",
+    }
+)
+_ACCEPTED_CANDIDATE_RECEIPT_KEYS = frozenset(
+    {
+        "kind",
+        "repository",
+        "campaign_key",
+        "plan_revision_digest",
+        "target_branch",
+        "ticket_key",
+        "work_run_key",
+        "integration_node_key",
+        "accepted_sequence",
+        "base_sha",
+        "base_tree_oid",
+        "candidate_sha",
+        "candidate_tree_oid",
+        "candidate_receipt_digest",
+        "diff_schema_version",
+        "diff_record_digest",
+        "authority_subtree_digest",
+        "policy_witness_digest",
+        "review_subject_digest",
+        "assurance",
+        "assurance_requirement_digest",
+        "check_environment_digest",
+        "delivery_identity_digest",
+        "interaction_keys",
+        "protected_surfaces",
+        "gitlink_change",
+        "evidence_digests",
+        "review_finding_ledger_digest",
+        "receipt_digest",
+    }
+)
+
+
+def _validate_candidate_receipt(value: object) -> dict[str, object]:
+    receipt = _mapping(value, "CANDIDATE_RECEIPT_INCOMPLETE")
+    if frozenset(receipt) != _CANDIDATE_RECEIPT_KEYS:
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt.get("kind") != "candidate_receipt.v1":
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in (
+        "parent_digest",
+        "plan_revision_digest",
+        "diff_record_digest",
+        "authority_subtree_digest",
+        "runtime_subject_digest",
+        "receipt_digest",
+    ):
+        _digest(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in (
+        "repository",
+        "campaign_key",
+        "campaign_handle",
+        "work_run_key",
+        "ticket_key",
+        "reported_reference",
+        "diff_schema_version",
+    ):
+        _text(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in (
+        "base_commit_oid",
+        "base_tree_oid",
+        "candidate_commit_oid",
+        "candidate_tree_oid",
+    ):
+        _object_id(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt.get("diff_schema_version") != "CandidateDiffRecordV1":
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    body = {key: item for key, item in receipt.items() if key != "receipt_digest"}
+    if receipt["receipt_digest"] != _canonical_digest(body):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    return receipt
+
+
+def _validate_interaction_keys(value: object) -> list[dict[str, object]]:
+    values = _sequence(value, "CANDIDATE_RECEIPT_INCOMPLETE")
+    result: list[dict[str, object]] = []
+    for raw in values:
+        item = _mapping(raw, "CANDIDATE_RECEIPT_INCOMPLETE")
+        if set(item) != {"namespace", "value", "classification"}:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        namespace = _text(item.get("namespace"), "CANDIDATE_RECEIPT_INCOMPLETE")
+        interaction_value = _text(item.get("value"), "CANDIDATE_RECEIPT_INCOMPLETE")
+        classification = _text(
+            item.get("classification"), "CANDIDATE_RECEIPT_INCOMPLETE"
+        )
+        if classification not in {
+            "ordinary",
+            "protected",
+            "high_coupling",
+            "non_decomposable",
+        }:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        result.append(
+            {
+                "namespace": namespace,
+                "value": interaction_value,
+                "classification": classification,
+            }
+        )
+    keys = tuple(
+        (item["namespace"], item["value"], item["classification"])
+        for item in result
+    )
+    if keys != tuple(sorted(set(keys))):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    return result
+
+
+def _validate_accepted_candidate_receipt(
+    value: object,
+) -> dict[str, object]:
+    receipt = _mapping(value, "CANDIDATE_RECEIPT_INCOMPLETE")
+    if "assurance" not in receipt:
+        _reject("ASSURANCE_SHAPE_INVALID")
+    if frozenset(receipt) != _ACCEPTED_CANDIDATE_RECEIPT_KEYS:
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt.get("kind") != "accepted_candidate_receipt.v1":
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in (
+        "plan_revision_digest",
+        "candidate_receipt_digest",
+        "diff_record_digest",
+        "authority_subtree_digest",
+        "policy_witness_digest",
+        "review_subject_digest",
+        "assurance_requirement_digest",
+        "check_environment_digest",
+        "delivery_identity_digest",
+        "review_finding_ledger_digest",
+        "receipt_digest",
+    ):
+        _digest(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in (
+        "repository",
+        "campaign_key",
+        "target_branch",
+        "ticket_key",
+        "work_run_key",
+        "integration_node_key",
+        "diff_schema_version",
+        "assurance",
+    ):
+        _text(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt["target_branch"] != "main":
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt["diff_schema_version"] != "CandidateDiffRecordV1":
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    if receipt["assurance"] not in {"standard", "strict"}:
+        _reject("ASSURANCE_SHAPE_INVALID")
+    if type(receipt.get("accepted_sequence")) is not int or (
+        isinstance(receipt["accepted_sequence"], bool)
+        or receipt["accepted_sequence"] < 1
+    ):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    for field in ("base_sha", "base_tree_oid", "candidate_sha", "candidate_tree_oid"):
+        _object_id(receipt.get(field), "CANDIDATE_RECEIPT_INCOMPLETE")
+    _validate_interaction_keys(receipt.get("interaction_keys"))
+    protected = _sequence(
+        receipt.get("protected_surfaces"), "CANDIDATE_RECEIPT_INCOMPLETE"
+    )
+    protected_values = tuple(
+        _text(item, "CANDIDATE_RECEIPT_INCOMPLETE") for item in protected
+    )
+    if protected_values != tuple(sorted(set(protected_values))):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    if type(receipt.get("gitlink_change")) is not bool:
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    evidence = _sequence(
+        receipt.get("evidence_digests"), "CANDIDATE_RECEIPT_INCOMPLETE"
+    )
+    evidence_digests = tuple(_digest(item, "CANDIDATE_RECEIPT_INCOMPLETE") for item in evidence)
+    if not evidence_digests or evidence_digests != tuple(sorted(set(evidence_digests))):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    body = {key: item for key, item in receipt.items() if key != "receipt_digest"}
+    if receipt["receipt_digest"] != _canonical_digest(body):
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    return receipt
 
 
 def _candidate_records(
@@ -904,41 +1242,38 @@ def _candidate_records(
     if len(raw_candidates) != 4:
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     by_key: dict[str, dict[str, object]] = {}
+    seen_receipts: set[str] = set()
+    seen_work_runs: set[str] = set()
+    seen_candidate_oids: set[str] = set()
     for raw in raw_candidates:
         candidate = _mapping(raw, "CANDIDATE_RECEIPT_INCOMPLETE")
         ticket_ref = _text(
             candidate.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE"
         )
-        ticket_key = _ticket_key_from_ref(ticket_ref)
-        if ticket_key in aliases:
-            key = aliases[ticket_key]
-        elif ticket_key in ROOT_TICKET_KEYS:
-            key = ticket_key
-        else:
+        reference = _ticket_key_from_ref(ticket_ref)
+        key = aliases.get(reference, reference)
+        if key not in ROOT_TICKET_KEYS or key in by_key:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        if key in by_key:
+        receipt = _validate_candidate_receipt(candidate.get("candidate_receipt"))
+        receipt_key = _ticket_key_from_ref(receipt["ticket_key"])
+        if aliases.get(receipt_key, receipt_key) != key:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        assurance = _candidate_assurance(candidate, key)
-        expected = "strict" if key == STRICT_TICKET_KEY else "standard"
-        if assurance != expected:
-            _reject("ASSURANCE_SHAPE_INVALID")
-        digest = _readback_digest(
-            candidate,
-            "candidate_receipt_digest",
-            "receipt_digest",
+        digest = _digest(
+            candidate.get("candidate_receipt_digest"),
+            "CANDIDATE_RECEIPT_INCOMPLETE",
         )
-        nested = candidate.get("candidate_receipt")
-        nested_mapping = _mapping(nested, "CANDIDATE_RECEIPT_INCOMPLETE")
-        nested_digest = _readback_digest(
-            nested_mapping, "candidate_receipt_digest", "receipt_digest"
-        )
-        if nested_digest is None:
+        if digest != receipt["receipt_digest"]:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        if digest is not None and digest != nested_digest:
+        receipt_digest = receipt["receipt_digest"]
+        work_run_key = receipt["work_run_key"]
+        candidate_oid = receipt["candidate_commit_oid"]
+        if receipt_digest in seen_receipts or work_run_key in seen_work_runs:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        digest = nested_digest
-        if digest is None:
+        if candidate_oid in seen_candidate_oids:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        seen_receipts.add(receipt_digest)
+        seen_work_runs.add(work_run_key)
+        seen_candidate_oids.add(candidate_oid)
         by_key[key] = candidate
     if set(by_key) != set(ROOT_TICKET_KEYS):
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
@@ -946,101 +1281,128 @@ def _candidate_records(
 
 
 def _candidate_assurance(candidate: Mapping[str, object], key: str) -> str:
-    """Read semantic assurance and bind it to the manifest's delta key."""
+    """Read assurance only from the exact CandidateGate acceptance receipt."""
 
+    accepted = _validate_accepted_candidate_receipt(
+        candidate.get("accepted_candidate_receipt")
+    )
     expected = "strict" if key == STRICT_TICKET_KEY else "standard"
-    records: list[Mapping[str, object]] = [candidate]
-    for name in ("candidate_receipt", "accepted_candidate_receipt"):
-        value = candidate.get(name)
-        if value is not None:
-            records.append(_mapping(value, "ASSURANCE_SHAPE_INVALID"))
-    for record in records:
-        value = record.get("assurance")
-        if value is None:
-            requirement = record.get("assurance_requirement")
-            if type(requirement) is dict:
-                value = requirement.get("mode")
-        if value is not None:
-            if _text(value, "ASSURANCE_SHAPE_INVALID").lower() != expected:
-                _reject("ASSURANCE_SHAPE_INVALID")
+    if accepted["assurance"] != expected:
+        _reject("ASSURANCE_SHAPE_INVALID")
+    wrapper_assurance = candidate.get("assurance")
+    if wrapper_assurance is not None and wrapper_assurance != expected:
+        _reject("ASSURANCE_SHAPE_INVALID")
     return expected
 
 
 def _validate_candidate_links(
     candidates: tuple[dict[str, object], ...],
     accepted: Mapping[str, dict[str, object]],
+    aliases: Mapping[str, str],
     repository: str,
     campaign_key: str,
     plan_revision_digest: str,
     policy_witness_digest: str,
 ) -> None:
     for candidate in candidates:
-        receipt = _mapping(
-            candidate.get("candidate_receipt"), "CANDIDATE_RECEIPT_INCOMPLETE"
-        )
+        receipt = _validate_candidate_receipt(candidate.get("candidate_receipt"))
         candidate_ticket = _text(
             candidate.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE"
         )
+        candidate_key = _ticket_key_from_ref(candidate_ticket)
+        if candidate_key is None:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         for field, expected in (
             ("repository", repository),
             ("campaign_key", campaign_key),
+            ("campaign_handle", campaign_key),
             ("plan_revision_digest", plan_revision_digest),
             ("ticket_key", candidate_ticket),
-            ("policy_witness_digest", policy_witness_digest),
         ):
             if receipt.get(field) != expected:
                 _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        candidate_digest = _readback_digest(
-            candidate, "candidate_receipt_digest", "receipt_digest"
+        key = aliases.get(candidate_key, candidate_key)
+        assurance = _candidate_assurance(candidate, key)
+        accepted_receipt = _validate_accepted_candidate_receipt(
+            candidate.get("accepted_candidate_receipt")
         )
-        if _readback_digest(receipt, "receipt_digest") != candidate_digest:
+        if accepted_receipt["assurance"] != assurance:
+            _reject("ASSURANCE_SHAPE_INVALID")
+        key = aliases.get(candidate_key, candidate_key)
+        if accepted.get(key) is not accepted_receipt:
+            # The global collection is independently checked below; this
+            # comparison is intentionally value based for JSON readbacks.
+            if key not in accepted or canonical_json_bytes(accepted[key]) != canonical_json_bytes(accepted_receipt):
+                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if accepted_receipt["policy_witness_digest"] != policy_witness_digest:
+            _reject("POLICY_EVIDENCE_INCOMPLETE")
+        if accepted_receipt["repository"] != repository:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if accepted_receipt["campaign_key"] != campaign_key:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if accepted_receipt["plan_revision_digest"] != plan_revision_digest:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if accepted_receipt["ticket_key"] != candidate_ticket:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        for candidate_field, accepted_field in (
+            ("work_run_key", "work_run_key"),
+            ("base_commit_oid", "base_sha"),
+            ("base_tree_oid", "base_tree_oid"),
+            ("candidate_commit_oid", "candidate_sha"),
+            ("candidate_tree_oid", "candidate_tree_oid"),
+            ("diff_record_digest", "diff_record_digest"),
+            ("authority_subtree_digest", "authority_subtree_digest"),
+        ):
+            if receipt[candidate_field] != accepted_receipt[accepted_field]:
+                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["receipt_digest"] != accepted_receipt["candidate_receipt_digest"]:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["diff_schema_version"] != accepted_receipt["diff_schema_version"]:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
 
     for key, accepted_receipt in accepted.items():
-        for field, expected, code in (
-            ("repository", repository, "CANDIDATE_RECEIPT_INCOMPLETE"),
-            ("campaign_key", campaign_key, "CANDIDATE_RECEIPT_INCOMPLETE"),
-            ("plan_revision_digest", plan_revision_digest, "CANDIDATE_RECEIPT_INCOMPLETE"),
-            ("policy_witness_digest", policy_witness_digest, "POLICY_EVIDENCE_INCOMPLETE"),
-        ):
-            actual = accepted_receipt.get(field)
-            if actual != expected:
-                _reject(code)
-        _text(
-            accepted_receipt.get("authority_subtree_digest"),
-            "AUTHORITY_EVIDENCE_INCOMPLETE",
-        )
+        receipt = _validate_accepted_candidate_receipt(accepted_receipt)
+        if receipt["policy_witness_digest"] != policy_witness_digest:
+            _reject("POLICY_EVIDENCE_INCOMPLETE")
+        if receipt["repository"] != repository or receipt["campaign_key"] != campaign_key:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["plan_revision_digest"] != plan_revision_digest:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         expected_ticket = _text(
             candidates[ROOT_TICKET_KEYS.index(key)].get("ticket_key"),
             "CANDIDATE_RECEIPT_INCOMPLETE",
         )
-        if accepted_receipt.get("ticket_key") != expected_ticket:
+        if receipt["ticket_key"] != expected_ticket:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        candidate_digest = _readback_digest(
-            accepted_receipt,
-            "candidate_receipt_digest",
-        )
-        if candidate_digest is None:
-            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        finding_digest = _readback_digest(
-            accepted_receipt,
-            "review_finding_ledger_digest",
-            "finding_ledger_digest",
-        )
-        if finding_digest is None:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        if key not in ROOT_TICKET_KEYS:
-            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        nested_accepted = candidates[ROOT_TICKET_KEYS.index(key)].get(
-            "accepted_candidate_receipt"
-        )
-        nested_mapping = _mapping(
-            nested_accepted, "CANDIDATE_RECEIPT_INCOMPLETE"
-        )
-        if canonical_json_bytes(nested_mapping) != canonical_json_bytes(
-            accepted_receipt
+        if receipt["candidate_receipt_digest"] != _digest(
+            candidates[ROOT_TICKET_KEYS.index(key)].get("candidate_receipt_digest"),
+            "CANDIDATE_RECEIPT_INCOMPLETE",
         ):
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+
+
+def _validate_finding_ledger(value: object) -> dict[str, object]:
+    ledger = _mapping(value, "FINDING_LEDGER_INCOMPLETE")
+    if set(ledger) != {"kind", "entries", "ledger_digest"}:
+        _reject("FINDING_LEDGER_INCOMPLETE")
+    if ledger.get("kind") != "review_finding_ledger.v1":
+        _reject("FINDING_LEDGER_INCOMPLETE")
+    entries = _sequence(ledger.get("entries"), "FINDING_LEDGER_INCOMPLETE")
+    for raw_entry in entries:
+        entry = _mapping(raw_entry, "FINDING_LEDGER_INCOMPLETE")
+        entry_digest = _digest(
+            entry.get("entry_digest"), "FINDING_LEDGER_INCOMPLETE"
+        )
+        body = {key: item for key, item in entry.items() if key != "entry_digest"}
+        if not body or entry_digest != _canonical_digest(body):
+            _reject("FINDING_LEDGER_INCOMPLETE")
+    ledger_digest = _digest(
+        ledger.get("ledger_digest"), "FINDING_LEDGER_INCOMPLETE"
+    )
+    body = {key: item for key, item in ledger.items() if key != "ledger_digest"}
+    if ledger_digest != _canonical_digest(body):
+        _reject("FINDING_LEDGER_INCOMPLETE")
+    return ledger
 
 
 def _review_records(
@@ -1048,66 +1410,35 @@ def _review_records(
     accepted: Mapping[str, dict[str, object]],
     aliases: Mapping[str, str],
 ) -> tuple[dict[str, object], ...]:
-    raw_reviews = bundle.get("reviews")
-    if raw_reviews is None:
-        _reject("FINDING_LEDGER_INCOMPLETE")
-    values = _sequence(raw_reviews, "FINDING_LEDGER_INCOMPLETE")
+    values = _sequence(bundle.get("reviews"), "FINDING_LEDGER_INCOMPLETE")
     if len(values) != 4:
         _reject("FINDING_LEDGER_INCOMPLETE")
     by_key: dict[str, dict[str, object]] = {}
     for raw in values:
         review = _mapping(raw, "FINDING_LEDGER_INCOMPLETE")
         ticket_ref = _text(review.get("ticket_key"), "FINDING_LEDGER_INCOMPLETE")
-        ticket_key = _ticket_key_from_ref(ticket_ref)
-        if ticket_key in aliases:
-            key = aliases[ticket_key]
-        elif ticket_key in ROOT_TICKET_KEYS:
-            key = ticket_key
-        else:
+        reference = _ticket_key_from_ref(ticket_ref)
+        key = aliases.get(reference, reference)
+        if key not in ROOT_TICKET_KEYS or key in by_key:
             _reject("FINDING_LEDGER_INCOMPLETE")
-        if key in by_key:
+        open_findings = review.get("open_finding_ids", review.get("open_findings", []))
+        if type(open_findings) not in {list, tuple} or open_findings:
             _reject("FINDING_LEDGER_INCOMPLETE")
-        open_findings = review.get("open_finding_ids")
-        if open_findings is None:
-            open_findings = review.get("open_findings", ())
-        if type(open_findings) not in {list, tuple}:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        if open_findings:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        finding_digest = _readback_digest(
-            review,
-            "finding_ledger_digest",
-            "review_finding_ledger_digest",
-            "ledger_digest",
+        finding_digest = _digest(
+            review.get("finding_ledger_digest"), "FINDING_LEDGER_INCOMPLETE"
         )
-        if finding_digest is None:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        expected_finding = _readback_digest(
-            accepted.get(key, {}),
-            "review_finding_ledger_digest",
-            "finding_ledger_digest",
-        )
-        if expected_finding is None or finding_digest != expected_finding:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        candidate_digest = _readback_digest(
-            review, "candidate_receipt_digest", "candidate_digest"
-        )
-        expected = _readback_digest(
-            accepted.get(key, {}), "candidate_receipt_digest", "receipt_digest"
-        )
-        if candidate_digest is None or expected is None or candidate_digest != expected:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        ledger = _mapping(
-            review.get("finding_ledger"), "FINDING_LEDGER_INCOMPLETE"
-        )
-        if (
-            ledger.get("ticket_key") != ticket_ref
-            or ledger.get("candidate_receipt_digest") != candidate_digest
-            or _readback_digest(ledger, "ledger_digest", "digest") != finding_digest
+        accepted_receipt = accepted.get(key)
+        if accepted_receipt is None or finding_digest != accepted_receipt.get(
+            "review_finding_ledger_digest"
         ):
             _reject("FINDING_LEDGER_INCOMPLETE")
-        ledger_open = ledger.get("open_finding_ids", ledger.get("open_findings"))
-        if type(ledger_open) not in {list, tuple} or ledger_open:
+        candidate_digest = _digest(
+            review.get("candidate_receipt_digest"), "FINDING_LEDGER_INCOMPLETE"
+        )
+        if candidate_digest != accepted_receipt.get("candidate_receipt_digest"):
+            _reject("FINDING_LEDGER_INCOMPLETE")
+        ledger = _validate_finding_ledger(review.get("finding_ledger"))
+        if ledger["ledger_digest"] != finding_digest:
             _reject("FINDING_LEDGER_INCOMPLETE")
         by_key[key] = review
     if set(by_key) != set(ROOT_TICKET_KEYS):
@@ -1501,10 +1832,7 @@ def _authoritative_evidence(
             {
                 "semantic_effect_ids": proof.get("semantic_effect_ids"),
                 "external_effect_ids": proof.get("external_effect_ids"),
-                "semantic_effect_records": proof.get("semantic_effect_records"),
-                "external_effect_records": proof.get("external_effect_records"),
                 "duplicate_effect_ids": proof.get("duplicate_effect_ids"),
-                "effect_history": proof.get("effect_history"),
             }
         ),
         "policy_witness": copy.deepcopy(bundle.get("policy_witness")),
@@ -1521,49 +1849,48 @@ def _accepted_candidate_records(
     aliases: Mapping[str, str],
     candidates: tuple[dict[str, object], ...],
 ) -> dict[str, dict[str, object]]:
-    raw_values = bundle.get("accepted_candidate_receipts")
-    if raw_values is None:
-        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-    values = _sequence(raw_values, "CANDIDATE_RECEIPT_INCOMPLETE")
-    if len(values) != 4:
+    raw_values = _sequence(
+        bundle.get("accepted_candidate_receipts"), "CANDIDATE_RECEIPT_INCOMPLETE"
+    )
+    if len(raw_values) != 4:
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     candidate_by_key: dict[str, dict[str, object]] = {}
     for candidate in candidates:
-        ref = _text(candidate.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE")
-        if ref in aliases:
-            key = aliases[ref]
-        elif ref in ROOT_TICKET_KEYS:
-            key = ref
-        else:
+        reference = _ticket_key_from_ref(
+            _text(candidate.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE")
+        )
+        key = aliases.get(reference, reference)
+        if key not in ROOT_TICKET_KEYS or key in candidate_by_key:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         candidate_by_key[key] = candidate
+
     accepted: dict[str, dict[str, object]] = {}
-    for raw in values:
-        item = _mapping(raw, "CANDIDATE_RECEIPT_INCOMPLETE")
-        ref = _text(item.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE")
-        if ref in aliases:
-            key = aliases[ref]
-        elif ref in ROOT_TICKET_KEYS:
-            key = ref
-        else:
+    seen_receipt_digests: set[str] = set()
+    seen_work_runs: set[str] = set()
+    for raw in raw_values:
+        item = _validate_accepted_candidate_receipt(raw)
+        reference = _ticket_key_from_ref(item["ticket_key"])
+        key = aliases.get(reference, reference)
+        if key not in ROOT_TICKET_KEYS or key in accepted:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        if key in accepted:
+        candidate = candidate_by_key.get(key)
+        if candidate is None:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        candidate_digest = _readback_digest(
-            candidate_by_key[key], "candidate_receipt_digest", "receipt_digest"
+        candidate_digest = _digest(
+            candidate.get("candidate_receipt_digest"),
+            "CANDIDATE_RECEIPT_INCOMPLETE",
         )
-        if item.get("candidate_receipt_digest") != candidate_digest:
+        if item["candidate_receipt_digest"] != candidate_digest:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        if _readback_digest(item, "receipt_digest") is None:
+        if item["receipt_digest"] in seen_receipt_digests or item["work_run_key"] in seen_work_runs:
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
-        ledger = _readback_digest(
-            item, "review_finding_ledger_digest", "finding_ledger_digest"
-        )
-        if ledger is None:
-            _reject("FINDING_LEDGER_INCOMPLETE")
-        if item.get("ticket_key") != candidate_by_key[key].get("ticket_key"):
+        nested = candidate.get("accepted_candidate_receipt")
+        nested_mapping = _validate_accepted_candidate_receipt(nested)
+        if canonical_json_bytes(nested_mapping) != canonical_json_bytes(item):
             _reject("CANDIDATE_RECEIPT_INCOMPLETE")
         accepted[key] = item
+        seen_receipt_digests.add(item["receipt_digest"])
+        seen_work_runs.add(item["work_run_key"])
     if set(accepted) != set(ROOT_TICKET_KEYS):
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     return accepted
@@ -1636,47 +1963,53 @@ def _validate_result_integrity(
 def _merge_ticket_manifest(
     bundle: Mapping[str, object], manifest: Mapping[str, object], repository: str
 ) -> dict[str, object]:
-    manifest_repository = manifest.get("repository")
-    if manifest_repository != repository or manifest_repository != ROOT_REPOSITORY:
+    """Merge Task 1's v2 manifest without projecting it into a v1 shape."""
+
+    if manifest.get("repository") != repository or repository != ROOT_REPOSITORY:
         _reject("ROOT_REPOSITORY_MISMATCH")
-    if manifest.get("schema") not in {None, "gwo-v8-root-canary-tickets.v1"}:
+    if manifest.get("schema") != _TASK1_TICKET_SCHEMA:
         _reject("ROOT_TICKET_MANIFEST_INVALID")
-    manifest_tickets = manifest.get("tickets")
-    if manifest_tickets is None:
-        _reject("ROOT_TICKET_MANIFEST_INVALID")
-    manifest_values = _sequence(manifest_tickets, "ROOT_TICKET_MANIFEST_INVALID")
+    manifest_tickets = _validate_v2_manifest(manifest)
+
     merged = dict(bundle)
     existing = bundle.get("tickets")
     if existing is not None:
         existing_values = _sequence(existing, "TICKET_READBACK_MISMATCH")
-        if len(existing_values) != len(manifest_values):
+        if len(existing_values) != len(manifest_tickets):
             _reject("TICKET_READBACK_MISMATCH")
-        for left, right in zip(existing_values, manifest_values, strict=True):
-            left_mapping = _mapping(left, "TICKET_READBACK_MISMATCH")
-            right_mapping = _mapping(right, "TICKET_READBACK_MISMATCH")
-            try:
-                left_digest = digest_value(left_mapping)
-                right_digest = digest_value(right_mapping)
-                _ticket_contract_payload(left_mapping, "TICKET_READBACK_MISMATCH")
-                _ticket_contract_payload(right_mapping, "TICKET_READBACK_MISMATCH")
-            except RootCanaryVerificationError as error:
-                if error.code == "TICKET_READBACK_MISMATCH":
-                    raise
-                _reject("TICKET_READBACK_MISMATCH")
-            if left_digest != right_digest:
-                _reject("TICKET_READBACK_MISMATCH")
+        # An authoritative v2 manifest cannot be compared with, or silently
+        # overwrite, a v1-only diagnostics projection.
+        if any(
+            type(value) is not dict or "contract" not in value
+            for value in existing_values
+        ):
+            _reject("TICKET_READBACK_MISMATCH")
+        existing_tickets = tuple(
+            _validate_v2_ticket(
+                value,
+                _text(
+                    _mapping(value, "TICKET_READBACK_MISMATCH").get("key"),
+                    "TICKET_READBACK_MISMATCH",
+                ),
+                "TICKET_READBACK_MISMATCH",
+            )
+            for value in existing_values
+        )
+        if canonical_json_bytes(existing_tickets) != canonical_json_bytes(
+            manifest_tickets
+        ):
+            _reject("TICKET_READBACK_MISMATCH")
+
     merged["repository"] = repository
-    # Keep the already-read diagnostics projection.  The Task 1 manifest is a
-    # second authoritative readback, not a lossy replacement for it.
-    merged["tickets"] = list(existing_values) if existing is not None else manifest_tickets
+    # Preserve the complete v2 objects.  Never flatten contract fields into a
+    # legacy ticket record or let the diagnostics projection replace them.
+    merged["tickets"] = [copy.deepcopy(value) for value in manifest_tickets]
     ready_refs = manifest.get("ready_refs")
     if ready_refs is not None:
-        if "ready_refs" in bundle:
-            if canonical_json_bytes(bundle["ready_refs"]) != canonical_json_bytes(
-                ready_refs
-            ):
-                _reject("TICKET_READBACK_MISMATCH")
-        merged["ready_refs"] = ready_refs
+        refs = _sequence(ready_refs, "ROOT_TICKET_MANIFEST_INVALID")
+        if "ready_refs" in bundle and canonical_json_bytes(bundle["ready_refs"]) != canonical_json_bytes(refs):
+            _reject("TICKET_READBACK_MISMATCH")
+        merged["ready_refs"] = list(refs)
     return merged
 
 
@@ -1944,6 +2277,7 @@ def _verify_root_canary(
     _validate_candidate_links(
         candidates,
         accepted,
+        aliases,
         repository,
         campaign_key,
         plan_revision_digest,
@@ -1989,16 +2323,18 @@ def _verify_root_canary(
     proof_candidate_digests = _proof_digest_values(
         proof, "candidate_receipt_digests", "CANDIDATE_RECEIPT_INCOMPLETE"
     )
-    if proof_candidate_digests is not None and proof_candidate_digests != tuple(
-        digest for _key, digest in candidate_digests
-    ):
+    expected_candidate_digests = tuple(
+        sorted({digest for _key, digest in candidate_digests})
+    )
+    if proof_candidate_digests is not None and proof_candidate_digests != expected_candidate_digests:
         _reject("CANDIDATE_RECEIPT_INCOMPLETE")
     proof_finding_digests = _proof_digest_values(
         proof, "review_finding_ledger_digests", "FINDING_LEDGER_INCOMPLETE"
     )
-    if proof_finding_digests is not None and proof_finding_digests != tuple(
-        digest for _key, digest in finding_digests
-    ):
+    expected_finding_digests = tuple(
+        sorted({digest for _key, digest in finding_digests})
+    )
+    if proof_finding_digests is not None and proof_finding_digests != expected_finding_digests:
         _reject("FINDING_LEDGER_INCOMPLETE")
     proof_batch_digests = _proof_digest_values(
         proof, "batch_receipt_digests", "BATCH_READBACK_INCOMPLETE"
@@ -2011,10 +2347,15 @@ def _verify_root_canary(
 
     ticket_contract_digests = tuple(
         (
-            ticket["key"],
-            _text(ticket.get("contract_digest"), "ROOT_TICKET_READBACK_INVALID"),
+            aliases.get(_ticket_reference(ticket), _ticket_reference(ticket)),
+            _ticket_contract_digest(ticket),
         )
-        for ticket in sorted(tickets, key=lambda item: ROOT_TICKET_KEYS.index(item["key"]))
+        for ticket in sorted(
+            tickets,
+            key=lambda item: ROOT_TICKET_KEYS.index(
+                aliases.get(_ticket_reference(item), _ticket_reference(item))
+            ),
+        )
     )
     batch_receipt_digests = (
         ("multi", standard_batch.receipt_digest),
