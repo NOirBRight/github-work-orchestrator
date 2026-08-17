@@ -1414,12 +1414,28 @@ _CUTOVER_LINEAGE_TABLES = (
 def _local_store_is_fresh_for_cutover(
     publication: LocalPlanPublication,
     repository: str,
+    *,
+    store_generation: str,
 ) -> bool:
-    """Read the local lineage tables without creating or changing state."""
+    """Read local lineage, allowing only the provisioned Store genesis row."""
     database_uri = f"{publication.store_path.resolve().as_uri()}?mode=ro"
     try:
         with sqlite3.connect(database_uri, uri=True) as connection:
             for table in _CUTOVER_LINEAGE_TABLES:
+                if table == "v8_writer_generations":
+                    rows = connection.execute(
+                        """
+                        SELECT writer_generation
+                        FROM v8_writer_generations
+                        WHERE repository = ?
+                        """,
+                        (repository,),
+                    ).fetchall()
+                    if len(rows) > 1 or any(
+                        row[0] != store_generation for row in rows
+                    ):
+                        return False
+                    continue
                 if connection.execute(
                     f"SELECT 1 FROM {table} WHERE repository = ? LIMIT 1",
                     (repository,),
@@ -1428,6 +1444,54 @@ def _local_store_is_fresh_for_cutover(
     except (OSError, sqlite3.Error):
         return False
     return True
+
+
+def _prepare_fresh_store_reconstruction(
+    connection: sqlite3.Connection,
+    *,
+    repository: str,
+    store_generation: str,
+) -> None:
+    """Atomically replace an optional Store genesis row during reconstruction."""
+    for table in _CUTOVER_LINEAGE_TABLES:
+        if table == "v8_writer_generations":
+            rows = connection.execute(
+                """
+                SELECT writer_generation
+                FROM v8_writer_generations
+                WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchall()
+            if len(rows) > 1 or any(
+                row[0] != store_generation for row in rows
+            ):
+                raise ActivationError(
+                    "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                    "Store genesis identity changed before reconstruction",
+                )
+            if rows:
+                deleted = connection.execute(
+                    """
+                    DELETE FROM v8_writer_generations
+                    WHERE repository = ? AND writer_generation = ?
+                    """,
+                    (repository, store_generation),
+                ).rowcount
+                if deleted != 1:
+                    raise ActivationError(
+                        "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                        "Store genesis identity changed during reconstruction",
+                    )
+            continue
+        if connection.execute(
+            f"SELECT 1 FROM {table} WHERE repository = ? LIMIT 1",
+            (repository,),
+        ).fetchone():
+            raise ActivationError(
+                "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                "Store has unrelated lineage during reconstruction",
+            )
 
 
 class WriterCutoverController:
@@ -1607,6 +1671,14 @@ class WriterCutoverController:
         ):
             expected_active_digest = durable_activation.expected_previous_digest
         reconstruction_authority = None
+
+        def prepare_reconstruction(connection: sqlite3.Connection) -> None:
+            _prepare_fresh_store_reconstruction(
+                connection,
+                repository=repository,
+                store_generation=guard_subject.store_generation,
+            )
+
         if resuming_pending:
             if (
                 durable_activation is not None
@@ -1675,6 +1747,7 @@ class WriterCutoverController:
                             if not _local_store_is_fresh_for_cutover(
                                 self.publication,
                                 repository,
+                                store_generation=guard_subject.store_generation,
                             ):
                                 blockers.add(
                                     "CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH"
@@ -1743,7 +1816,11 @@ class WriterCutoverController:
             self.transitions.publish(pending)
         if reconstruction_authority is not None:
             receipt, record = reconstruction_authority
-            if not _local_store_is_fresh_for_cutover(self.publication, repository):
+            if not _local_store_is_fresh_for_cutover(
+                self.publication,
+                repository,
+                store_generation=guard_subject.store_generation,
+            ):
                 blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
             else:
                 try:
@@ -1753,6 +1830,7 @@ class WriterCutoverController:
                     ).reconstruct_active_from_readback(
                         record,
                         receipt,
+                        populate=prepare_reconstruction,
                     )
                 except (ActivationError, OSError, sqlite3.Error):
                     blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
