@@ -501,3 +501,73 @@ def test_fault_proxy_fails_closed_when_the_approved_root_is_replaced_after_valid
     assert swapped is True
     assert not (approved / "journal.json").exists()
     assert not (tmp_path / "approved-original" / "journal.json").exists()
+
+
+def test_fault_proxy_fails_closed_when_parent_swaps_at_temp_create(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import v8_root_canary_fault_proxy as fault_proxy_module
+
+    approved = tmp_path / "approved"
+    replacement = tmp_path / "replacement"
+    approved.mkdir()
+    replacement.mkdir()
+    for root in (approved, replacement):
+        (root / "plan.json").write_text(
+            json.dumps({"events": []}),
+            encoding="utf-8",
+        )
+
+    original_replace = fault_proxy_module.os.replace
+    boundary_reached = False
+    swapped = False
+
+    def replace_after_parent_swap(source, target, *args, **kwargs):
+        nonlocal boundary_reached, swapped
+        if (
+            not boundary_reached
+            and Path(source).name.startswith(".journal.json.")
+        ):
+            boundary_reached = True
+            # Model the approved parent now resolving to its replacement at
+            # the actual replace boundary, while retaining real filesystem
+            # I/O for the intercepted operation on Windows.
+            replacement_source = replacement / Path(source).name
+            replacement_source.write_bytes(Path(source).read_bytes())
+            swapped = True
+            return original_replace(
+                replacement_source,
+                replacement / Path(target).name,
+                *args,
+                **kwargs,
+            )
+        return original_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        fault_proxy_module.os,
+        "replace",
+        replace_after_parent_swap,
+    )
+
+    request = FaultRequest(
+        "worker",
+        "none",
+        "action:operation-race",
+        "payload:operation-race",
+        ("echo", "ok"),
+        plan_revision_digest="a" * 64,
+    )
+
+    with pytest.raises(ValueError):
+        proxy = FaultProxy.from_files(
+            approved / "plan.json",
+            approved / "journal.json",
+            run_root=approved,
+        )
+        proxy.execute(request, run_command=lambda _command: "response")
+
+    assert boundary_reached is True
+    assert swapped is True
+    assert not (approved / "journal.json").exists()
+    assert not (tmp_path / "approved-original" / "journal.json").exists()

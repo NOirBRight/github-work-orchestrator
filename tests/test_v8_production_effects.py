@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -285,6 +286,77 @@ def test_restart_recovers_a_dispatched_runtime_effect_without_duplicate_provider
 
     with pytest.raises(ProviderAcknowledgementLost):
         first.execute(action)
+
+    restarted_runtime = DurableRuntime()
+    support.runtime_factory.gateway = restarted_runtime
+    restarted = make_production_effects(tmp_path, support)
+
+    observation = restarted.execute(action)
+
+    assert observation.phase == "accepted_awaiting_delivery"
+    assert first_runtime.external_dispatches == 1
+    assert restarted_runtime.external_dispatches == 0
+    assert json.loads(provider_state.read_text(encoding="utf-8"))["external_dispatches"] == 1
+    assert restarted.readback(action) == observation
+
+
+def test_restart_recovers_an_unmarked_runtime_effect_without_duplicate_provider_call(
+    tmp_path,
+    action,
+    support,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "gwo_v8.production_effects._EFFECT_CLAIM_WAIT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "gwo_v8.production_effects._EFFECT_CLAIM_POLL_SECONDS",
+        0.001,
+    )
+    support.candidate.result = support.accepted_candidate_result(action)
+    provider_state = tmp_path / "provider-state.json"
+
+    class ProviderAcknowledgementLost(RuntimeError):
+        pass
+
+    class DurableRuntime:
+        def __init__(self):
+            self.external_dispatches = 0
+
+        def progress(self, subject, *, wake_cursor=None):
+            state = (
+                json.loads(provider_state.read_text(encoding="utf-8"))
+                if provider_state.exists()
+                else {"external_dispatches": 0, "terminal": False}
+            )
+            if state["external_dispatches"] == 0:
+                state["external_dispatches"] = 1
+                state["terminal"] = True
+                provider_state.write_text(
+                    json.dumps(state),
+                    encoding="utf-8",
+                )
+                self.external_dispatches += 1
+                raise ProviderAcknowledgementLost(
+                    "provider completed before the local receipt was durable"
+                )
+            return support.runtime_completed_receipt(action)
+
+    first_runtime = DurableRuntime()
+    support.runtime_factory.gateway = first_runtime
+    first = make_production_effects(tmp_path, support)
+
+    with pytest.raises(ProviderAcknowledgementLost):
+        first.execute(action)
+
+    with sqlite3.connect(tmp_path / "effects.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT provider_dispatched "
+            "FROM v8_production_effect_claims "
+            "WHERE stable_action_id = ?",
+            (action.stable_action_id,),
+        ).fetchone() == (None,)
 
     restarted_runtime = DurableRuntime()
     support.runtime_factory.gateway = restarted_runtime
