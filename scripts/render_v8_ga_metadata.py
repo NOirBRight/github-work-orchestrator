@@ -30,6 +30,9 @@ from scripts.verify_v8_ga_release import (
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _PRODUCTION_WRITER_GENERATION = "v8-generation-1"
+_V6_1_WRITER_GENERATION = "v6.1"
+_LOCAL_ROOT_WRITER_GENERATION = "writer:local"
+_PRODUCTION_CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 _METADATA_BRIDGE_SCHEMA = "gwo-v8-ga-metadata-bridge.v1"
 
 
@@ -292,16 +295,39 @@ def _stable_bridge_identity_digest(evidence_bridge: Mapping[str, object]) -> str
     return digest_value(stable_projection)
 
 
-def _bind_activation_release_subject_to_readback(
-    production_activation_source: str,
-    production_activation_source_sha256: str,
-    activation_release_subject: Mapping[str, object],
-) -> None:
+def _bridge_source_path(
+    section: Mapping[str, object], filename: str, field: str
+) -> tuple[Path, str]:
+    source_file = _bridge_text(section.get("source_file"), field)
+    source_sha256 = _bridge_sha256(
+        section.get("source_file_sha256"), f"{field} digest"
+    )
+    source = Path(source_file)
+    if source.name != filename:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_SOURCE_INVALID")
     try:
-        raw = Path(production_activation_source).read_bytes()
-    except (OSError, ValueError) as error:
-        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
-    if hashlib.sha256(raw).hexdigest() != production_activation_source_sha256:
+        _reject_reparse_path(source)
+        observed = os.lstat(source)
+    except (OSError, ReleaseGateError) as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_SOURCE_INVALID") from error
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or bool(getattr(observed, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE)
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_SOURCE_INVALID")
+    return source, source_sha256
+
+
+def _read_bridge_source(
+    section: Mapping[str, object], filename: str, field: str
+) -> dict[str, object]:
+    source, source_sha256 = _bridge_source_path(section, filename, field)
+    try:
+        raw = source.read_bytes()
+    except OSError as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_SOURCE_INVALID") from error
+    if hashlib.sha256(raw).hexdigest() != source_sha256:
         raise ReleaseGateError("GA_METADATA_BRIDGE_DIGEST_MISMATCH")
     try:
         readback = _strict_canonical_json_loads(raw)
@@ -309,31 +335,60 @@ def _bind_activation_release_subject_to_readback(
         raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
     if not isinstance(readback, Mapping):
         raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
-    authorization = readback.get("authorization")
-    if not isinstance(authorization, Mapping):
+    return dict(readback)
+
+
+def _source_mapping(
+    payload: Mapping[str, object], field: str
+) -> Mapping[str, object]:
+    value = payload.get(field)
+    if not isinstance(value, Mapping):
         raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
-    try:
-        authorized_subject = {
-            "merged_main_sha": authorization["merged_main_sha"],
-            "merged_main_tree": authorization["merged_main_git_tree"],
-            "release_subject_digest": authorization["release_subject_digest"],
-        }
-    except KeyError as error:
-        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
-    if (
-        type(authorized_subject["merged_main_sha"]) is not str
-        or _SHA.fullmatch(authorized_subject["merged_main_sha"]) is None
-        or type(authorized_subject["merged_main_tree"]) is not str
-        or _SHA.fullmatch(authorized_subject["merged_main_tree"]) is None
-        or type(authorized_subject["release_subject_digest"]) is not str
-        or _SHA256.fullmatch(authorized_subject["release_subject_digest"]) is None
-    ):
+    return value
+
+
+def _source_text(payload: Mapping[str, object], field: str) -> str:
+    value = payload.get(field)
+    if type(value) is not str or not value.strip():
         raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
-    if any(
-        activation_release_subject[field] != authorized_subject[field]
-        for field in _EVIDENCE_RELEASE_SUBJECT_FIELDS
-    ):
+    return value
+
+
+def _source_sha(payload: Mapping[str, object], field: str) -> str:
+    value = _source_text(payload, field)
+    if _SHA.fullmatch(value) is None:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    return value
+
+
+def _source_sha256(payload: Mapping[str, object], field: str) -> str:
+    value = _source_text(payload, field)
+    if _SHA256.fullmatch(value) is None:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    return value
+
+
+def _source_control_ref(payload: Mapping[str, object]) -> dict[str, object]:
+    control_ref = _source_mapping(payload, "control_ref")
+    if set(control_ref) != {"branch", "commit_sha", "tree_sha"}:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    if control_ref.get("branch") != "gwo-control":
         raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    _source_sha(control_ref, "commit_sha")
+    _source_sha(control_ref, "tree_sha")
+    return dict(control_ref)
+
+
+def _assert_source_equal(
+    condition: bool, *, writer: bool = False, local: bool = False
+) -> None:
+    if condition:
+        return
+    if writer:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID")
+    if local:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_LOCAL_ROOT_INVALID")
+    raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
 
 
 def _renderer_evidence_bridge_context(
@@ -405,7 +460,7 @@ def _renderer_evidence_bridge_context(
         production_canary.get("package_repository"),
         "GA evidence package repository",
     )
-    if package_repository != "NOirBRight/gwo-v8-canary":
+    if package_repository != _PRODUCTION_CANARY_REPOSITORY:
         raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
     package_digest = _bridge_sha256(
         production_canary.get("package_digest"),
@@ -507,6 +562,57 @@ def _renderer_evidence_bridge_context(
     ):
         raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_COLLISION")
 
+    local_payload = _read_bridge_source(
+        local_root, "root-canary-acceptance.json", "GA evidence local source"
+    )
+    canary_payload = _read_bridge_source(
+        production_canary,
+        "production-canary-readback.json",
+        "GA evidence package source",
+    )
+    activation_payload = _read_bridge_source(
+        production_activation,
+        "production-activation-readback.json",
+        "GA evidence activation source",
+    )
+    default_payload = _read_bridge_source(
+        default_writer, "default-writer-readback.json", "GA evidence default source"
+    )
+
+    _assert_source_equal(
+        local_payload.get("schema") == local_root["schema"]
+        and local_payload.get("acceptance_mode") == local_root["acceptance_mode"]
+        and local_payload.get("repository") == repository
+        and local_payload.get("writer_generation") == _LOCAL_ROOT_WRITER_GENERATION
+        and local_payload.get("campaign_key") == local_campaign
+        and local_payload.get("activation_id") == local_activation_id
+        and local_campaign == local_activation_id
+        and _source_sha(local_payload, "canary_target_sha")
+        == local_target_sha
+        and _source_sha256(local_payload, "receipt_digest") == local_receipt_digest,
+        local=True,
+    )
+
+    _assert_source_equal(
+        canary_payload.get("schema") == "gwo-v8-production-canary-readback.v1"
+        and canary_payload.get("repository") == _PRODUCTION_CANARY_REPOSITORY
+        and canary_payload.get("manifest_repository") == package_repository
+        and canary_payload.get("package_repository") == package_repository
+        and _source_sha256(canary_payload, "package_digest") == package_digest
+        and _source_sha256(canary_payload, "manifest_sha256") == package_digest
+        and canary_payload.get("manifest_ref")
+        == f"github://canary-manifest/{package_digest}"
+        and canary_payload.get("manifest_ref") == production_canary["manifest_ref"]
+        and canary_payload.get("evidence_ref_count") == evidence_ref_count
+        and canary_payload.get("evidence_readback_count") == evidence_ref_count
+        and _source_sha256(canary_payload, "receipt_digest")
+        == production_canary["readback_receipt_digest"]
+        and canary_payload.get("accepted") is True
+        and canary_payload.get("all_evidence_exact") is True
+        and canary_payload.get("blockers") == []
+        and canary_payload.get("manifest_branch") == "gwo-control",
+    )
+
     # The activation readback subject is an independently authorized subject.
     # Validate it separately from the final GA subject: the latter may move as
     # metadata is published, while the former remains bound to cutover.
@@ -517,10 +623,83 @@ def _renderer_evidence_bridge_context(
         activation_release_subject.get("release_subject_digest"),
         "GA evidence activation release subject digest",
     )
-    _bind_activation_release_subject_to_readback(
-        production_activation["source_file"],
-        production_activation["source_file_sha256"],
-        activation_release_subject,
+
+    execute_outcome = _source_mapping(activation_payload, "execute_outcome")
+    transition_record = _source_mapping(activation_payload, "transition_record")
+    active_plan = _source_mapping(activation_payload, "active_plan")
+    transition_current = _source_mapping(activation_payload, "transition_current")
+    authorization = _source_mapping(activation_payload, "authorization")
+    guard_receipt = _source_mapping(activation_payload, "guard_receipt")
+    legacy_writer_fence = _source_mapping(
+        activation_payload, "legacy_writer_fence"
+    )
+    activation_control_ref = _source_control_ref(activation_payload)
+    activation_plan_digest = _source_sha256(transition_record, "plan_digest")
+    authorization_release_subject = {
+        "merged_main_sha": _source_sha(authorization, "merged_main_sha"),
+        "merged_main_tree": _source_sha(
+            authorization, "merged_main_git_tree"
+        ),
+        "release_subject_digest": _source_sha256(
+            authorization, "release_subject_digest"
+        ),
+    }
+    source_activation_release_subject = _source_mapping(
+        activation_payload, "release_subject"
+    )
+    _assert_source_equal(
+        _source_text(activation_payload, "schema")
+        == "gwo-v8-production-activation-readback.v1"
+        and _source_text(activation_payload, "repository") == repository
+        and _source_sha256(activation_payload, "receipt_digest")
+        == production_activation_receipt_digest
+        and _source_text(execute_outcome, "activation_id")
+        == production_activation_id
+        and _source_text(execute_outcome, "record_id") == transition_record_id
+        and execute_outcome.get("repository") == repository
+        and execute_outcome.get("status") == "cut_over"
+        and _source_text(execute_outcome, "writer_generation")
+        == production_writer_generation
+        and _source_text(transition_record, "activation_id")
+        == production_activation_id
+        and _source_text(transition_record, "record_id") == transition_record_id
+        and transition_record.get("repository") == repository
+        and transition_record.get("status") == "cut_over"
+        and _source_text(transition_record, "writer_generation")
+        == production_writer_generation
+        and _source_text(transition_record, "previous_writer_generation")
+        == production_activation["previous_writer_generation"]
+        and _source_text(transition_record, "previous_writer_generation")
+        == _PRODUCTION_WRITER_GENERATION
+        and active_plan.get("latest_activation_id") == production_activation_id
+        and _source_sha256(active_plan, "latest_plan_digest")
+        == activation_plan_digest
+        and _source_sha256(active_plan, "active_plan_digest")
+        == activation_plan_digest
+        and _source_text(transition_current, "record_id")
+        == transition_record_id
+        and transition_current.get("repository") == repository
+        and _source_text(transition_current, "writer_generation")
+        == production_writer_generation
+        and _source_text(authorization, "run_id")
+        == production_activation["run_id"]
+        and _source_text(authorization, "repository") == repository
+        and _source_text(authorization, "target_repository") == repository
+        and _source_text(authorization, "target_writer_generation")
+        == production_writer_generation
+        and _source_text(authorization, "writer_transition") == "v6.1 -> v8"
+        and _source_text(guard_receipt, "source_writer_generation")
+        == _V6_1_WRITER_GENERATION
+        and _source_text(guard_receipt, "target_writer_generation")
+        == production_writer_generation
+        and legacy_writer_fence.get("stopped") is True
+        and authorization_release_subject
+        == {
+            field: activation_release_subject[field]
+            for field in _EVIDENCE_RELEASE_SUBJECT_FIELDS
+        }
+        and dict(source_activation_release_subject)
+        == dict(activation_release_subject),
     )
 
     _bridge_fields(release_subject, _EVIDENCE_RELEASE_SUBJECT_FIELDS)
@@ -529,6 +708,32 @@ def _renderer_evidence_bridge_context(
     _bridge_sha256(
         release_subject.get("release_subject_digest"),
         "GA evidence release subject digest",
+    )
+
+    default_control_ref = _source_control_ref(default_payload)
+    _assert_source_equal(
+        _source_text(default_payload, "schema")
+        == "gwo-v8-default-writer-readback.v1"
+        and _source_text(default_payload, "repository") == repository
+        and default_payload.get("status") == "cut_over"
+        and default_payload.get("mode") == "default_v8"
+        and _source_text(default_payload, "writer_generation")
+        == production_writer_generation
+        and _source_text(default_payload, "previous_writer_generation")
+        == default_writer["previous_writer_generation"]
+        and _source_text(default_payload, "previous_writer_generation")
+        == _PRODUCTION_WRITER_GENERATION
+        and default_payload.get("campaign_key") is None
+        and _source_text(default_payload, "activation_id")
+        == production_activation_id
+        and _source_text(default_payload, "record_id") == transition_record_id
+        and _source_sha256(default_payload, "plan_digest") == activation_plan_digest
+        and _source_sha256(default_payload, "activation_readback_digest")
+        == production_activation_receipt_digest
+        and _source_sha256(default_payload, "receipt_digest")
+        == default_receipt_digest
+        and default_payload.get("legacy_writer_fence_stopped") is True
+        and default_control_ref == activation_control_ref,
     )
 
     links = {
@@ -555,7 +760,7 @@ def _renderer_evidence_bridge_context(
         "activation_id": production_activation_id,
         "campaign_key": None,
         "mode": "default_v8",
-        "previous_writer_generation": _PRODUCTION_WRITER_GENERATION,
+        "previous_writer_generation": default_payload["previous_writer_generation"],
         "receipt_digest": default_receipt_digest,
         "repository": repository,
         "writer_generation": production_writer_generation,
