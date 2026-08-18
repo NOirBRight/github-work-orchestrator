@@ -64,3 +64,17 @@ The exact fallback code/detail match and durable-ref validation remain in the
 factory. Durable manifest/evidence readback remains in
 `ProductionActivationFacade`; no synthetic or network readback was added to
 the factory, and no production mutation was performed.
+
+## Final factory fix commit
+
+The final factory fix commit is
+`ffedfa70ed29d0166d74d11b271eabd9823f7d65`.
+
+Its exact changed files are:
+
+- `tests/test_v8_production_factory.py`
+- `.superpowers/sdd/2026-08-11-gwo-v8-phase1-5-production/task-p1-factory-fix-round1-report.md`
+
+## Unresolved P1
+
+None known.
