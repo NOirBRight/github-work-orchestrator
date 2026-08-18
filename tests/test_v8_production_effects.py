@@ -308,7 +308,7 @@ def test_restart_recovers_an_unmarked_runtime_effect_without_duplicate_provider_
 ):
     monkeypatch.setattr(
         "gwo_v8.production_effects._EFFECT_CLAIM_WAIT_SECONDS",
-        0.01,
+        0.05,
     )
     monkeypatch.setattr(
         "gwo_v8.production_effects._EFFECT_CLAIM_POLL_SECONDS",
