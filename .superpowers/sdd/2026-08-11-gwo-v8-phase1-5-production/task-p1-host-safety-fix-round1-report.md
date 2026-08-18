@@ -1,45 +1,53 @@
-# P1 host safety fix — round 1
+# P1 host safety fix — rounds 1–2
 
 Date: 2026-08-18
-Scope: host safety only. Factory files were not modified and no production
-mutation was performed.
+Scope: host safety only. Factory files were not modified in these rounds and
+no production mutation was performed.
 
-## Findings addressed
+## Round 1 baseline
 
-### I-1 — one-shot legacy read and Guard cycle isolation
+Round 1 implementation commit: `30af6ec70045ab1dadbb15dd3b95264916df15b5`.
+It isolated legacy/Guard cycles per thread, bounded abandoned snapshots, and
+asserted lease stability throughout the four-read snapshot. The round 1 TDD
+record remains below; round 2 adds the cleanup-failure evidence and fix.
 
-`_LegacyExecutionReadback` and the Guard both consume `sources.legacy`. The
-adapter now keeps cycle state per calling thread. A new `legacy` read closes
-that thread's unfinished prior state before capturing a fresh snapshot, so the
-one-shot transition read cannot poison the following Guard evaluation. Other
-threads do not wait for or consume that state. Guard reads remain ordered as
-`legacy`, `durable_state`, `writer_fence`, and `ownership`, all from one fresh
-snapshot.
+## Round 2 review finding and fix
 
-Regressions: `test_live_attestation_cycle_restarts_after_a_one_shot_legacy_read`
-and `test_live_attestation_cycle_holds_each_lease_and_isolates_evaluations`.
+### Lease cleanup failure paths
 
-### I-2 — abandoned owner lifecycle
+The actual production lease is `BootstrapLease`. Its `close()` marks the lease
+closed before attempting every closer, runs all closers, and raises an aggregate
+error if any closer fails. Therefore a close failure is terminal for that lease;
+the host must not retry it as though the lease were reusable.
 
-The old shared owner/condition could retain a lease when its owner thread
-terminated mid-cycle. Each cycle state now has a bounded 30-second daemon
-timer. If a thread abandons its snapshot, the timer removes that state and
-closes its lease; subsequent reads cannot reuse the abandoned snapshot. State
-close is idempotent, so normal completion, read failure, restart, and timeout
-invoke lease close at most once.
+The host now:
 
-Regression: `test_live_attestation_cycle_releases_an_abandoned_thread_snapshot`
-(shortens the bound to 0.05 seconds).
+- closes a closable lease before rejecting a snapshot whose lease lacks
+  `assert_stable()`; a cleanup failure is surfaced as a typed host error;
+- records any state-close failure, including timer cleanup failure, instead of
+  silently discarding it; and
+- fails closed on every later read after a cleanup failure, so it cannot acquire
+  another snapshot while cleanup status is uncertain.
 
-### I-3 — lease stability boundary
+Normal completion, read failure, legacy-cycle restart, timer expiry, and
+concurrent evaluation isolation retain their existing exactly-once behavior.
 
-The cycle requires the lease's `assert_stable()` and `close()` contract. It
-asserts stability after capture and before every read, asserts once more after
-the final field is read, and closes on drift or any read failure. The lease
-therefore remains held through the complete four-read snapshot and closes once
-only after the final stability boundary or a fail-closed error.
+Regression tests:
 
-Regression: `test_live_attestation_cycle_asserts_lease_stability_before_each_read`.
+- `test_live_attestation_cycle_closes_lease_rejected_for_missing_stability_contract`
+  proves a closable lease without `assert_stable()` is closed before the host
+  raises.
+- `test_live_attestation_cycle_fails_closed_after_timer_close_failure` proves a
+  timer close is attempted once, its failure is not silently ignored, and no
+  later snapshot is captured.
+
+### Stability evidence
+
+`test_live_attestation_cycle_asserts_stability_after_a_successful_snapshot`
+now consumes all four ordered fields and verifies five stability assertions:
+one before each field and the final post-read assertion. The existing
+`test_live_attestation_cycle_asserts_lease_stability_before_each_read` remains
+the separate drift regression.
 
 ## Lease lifecycle
 
@@ -51,39 +59,38 @@ Regression: `test_live_attestation_cycle_asserts_lease_stability_before_each_rea
    field, or on ordering, repository, readback, or stability failure.
 4. A later `legacy` read on the same thread closes any unfinished prior state
    and starts a new snapshot. A different thread has an independent state.
-5. A 30-second daemon timer bounds an abandoned state and closes it fail-closed.
+5. A 30-second daemon timer bounds an abandoned state. If its close fails, the
+   state is retired, the failure is recorded, and all later reads fail closed.
+6. A rejected but closable lease is closed before the contract error is raised;
+   a close failure permanently disables that cycle.
 
-## TDD evidence
+## Round 2 TDD evidence
 
-The regression tests were written before the host implementation was changed.
-The following focused command was run against the pre-fix implementation:
+The two cleanup regressions were written before the round 2 implementation.
+RED was run against the current pre-fix host implementation:
 
 ```powershell
-$base = Join-Path $PWD '.pytest-basetemp-p1-round1'; if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }; python -m pytest -vv --basetemp $base tests/test_v8_live_guard_host.py::test_live_attestation_cycle_holds_each_lease_and_isolates_evaluations tests/test_v8_live_guard_host.py::test_live_attestation_cycle_restarts_after_a_one_shot_legacy_read tests/test_v8_live_guard_host.py::test_live_attestation_cycle_releases_an_abandoned_thread_snapshot tests/test_v8_live_guard_host.py::test_live_attestation_cycle_asserts_lease_stability_before_each_read
+$base = Join-Path $PWD '.pytest-basetemp-p1-round2-red'; if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }; python -m pytest -vv --basetemp $base tests/test_v8_live_guard_host.py::test_live_attestation_cycle_holds_each_lease_and_isolates_evaluations tests/test_v8_live_guard_host.py::test_live_attestation_cycle_restarts_after_a_one_shot_legacy_read tests/test_v8_live_guard_host.py::test_live_attestation_cycle_releases_an_abandoned_thread_snapshot tests/test_v8_live_guard_host.py::test_live_attestation_cycle_asserts_lease_stability_before_each_read tests/test_v8_live_guard_host.py::test_live_attestation_cycle_closes_lease_rejected_for_missing_stability_contract tests/test_v8_live_guard_host.py::test_live_attestation_cycle_fails_closed_after_timer_close_failure tests/test_v8_live_guard_host.py::test_live_attestation_cycle_asserts_stability_after_a_successful_snapshot; $exit=$LASTEXITCODE; if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }; exit $exit
 ```
 
-RED result: **4 failed**. The pre-fix shared owner blocked the concurrent
-second evaluation, the one-shot legacy read left the next Guard cycle out of
-order, an abandoned owner blocked the survivor, and lease drift was not
-asserted.
+RED result: **2 failed, 5 passed in 0.34s**. The intended failures were the
+unclosed rejected lease and the timer close failure being ignored.
 
-The same focused command was rerun after the minimal host change:
+GREEN was the same focused test set on the round 2 implementation:
 
-```text
-============================== 4 passed in 0.13s ==============================
+```powershell
+$base = Join-Path $PWD '.pytest-basetemp-p1-round2-green'; if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }; python -m pytest -vv --basetemp $base tests/test_v8_live_guard_host.py::test_live_attestation_cycle_holds_each_lease_and_isolates_evaluations tests/test_v8_live_guard_host.py::test_live_attestation_cycle_restarts_after_a_one_shot_legacy_read tests/test_v8_live_guard_host.py::test_live_attestation_cycle_releases_an_abandoned_thread_snapshot tests/test_v8_live_guard_host.py::test_live_attestation_cycle_asserts_lease_stability_before_each_read tests/test_v8_live_guard_host.py::test_live_attestation_cycle_closes_lease_rejected_for_missing_stability_contract tests/test_v8_live_guard_host.py::test_live_attestation_cycle_fails_closed_after_timer_close_failure tests/test_v8_live_guard_host.py::test_live_attestation_cycle_asserts_stability_after_a_successful_snapshot; $exit=$LASTEXITCODE; if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }; exit $exit
 ```
+
+GREEN result: **7 passed in 0.22s**.
+
+Canonical round 2 implementation commit: **`4b3b4e951dab955e7da7dc8f2e4b85fece921943`**.
 
 ## Final focused verification
 
-Commands were run with explicit workspace `--basetemp` directories so pytest's
-Windows temporary-directory cleanup was not part of the test result.
-
 ```text
-python -m pytest -q --basetemp .pytest-basetemp-p1-final-host tests/test_v8_live_guard_host.py
-10 passed in 0.21s
-
-python -m pytest -q --basetemp .pytest-basetemp-p1-final-factory tests/test_v8_production_factory.py
-24 passed in 0.52s
+python -m pytest -q --basetemp .pytest-basetemp-p1-round2-host tests/test_v8_live_guard_host.py
+13 passed in 0.27s
 
 ruff check --isolated --no-cache scripts/gwo_v8_live_guard_host.py tests/test_v8_live_guard_host.py
 All checks passed!
@@ -95,9 +102,8 @@ git diff --check
 exit 0
 ```
 
-A repository-wide pytest run was intentionally interrupted at the user's
-request before completion; it is not claimed as a passing check. No production
-activation, writer transition, Store mutation, push, or tag was performed.
+No broad or production test was claimed. No production activation, writer
+transition, Store mutation, push, or tag was performed.
 
 ## Changed files
 
@@ -108,4 +114,5 @@ activation, writer transition, Store mutation, push, or tag was performed.
 ## Unresolved P1
 
 None known within the requested host scope. Factory files remain untouched.
-The final commit SHA is returned with the task result.
+The report is finalized in the evidence commit and its SHA is returned with
+the task result.
