@@ -9,15 +9,30 @@ from dataclasses import dataclass
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
 from typing import Mapping, Protocol, Sequence
+
+try:
+    from scripts.verify_v8_root_canary import (
+        RootCanaryAcceptanceReceiptV1,
+        VerifiedBatch,
+        digest_value as _root_digest_value,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from verify_v8_root_canary import (  # type: ignore[no-redef]
+        RootCanaryAcceptanceReceiptV1,
+        VerifiedBatch,
+        digest_value as _root_digest_value,
+    )
 
 
 PYTHON = sys.executable
@@ -30,6 +45,7 @@ V6_1_WRITER_GENERATION = "v6.1"
 LOCAL_ROOT_RECEIPT_SCHEMA = "gwo-v8-root-canary-acceptance.v2"
 LOCAL_ROOT_RECEIPT_MODE = "local-only-v1"
 LOCAL_ROOT_WRITER_GENERATION = "writer:local"
+_LEGACY_V8_WRITER_GENERATIONS = frozenset({V8_WRITER_FAMILY, V8_WRITER_GENERATION})
 PRODUCTION_CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 PRODUCTION_CANARY_EVIDENCE_REF_COUNT = 19
 ALLOWED_METADATA_PATHS = (
@@ -140,6 +156,42 @@ _LOCAL_FORBIDDEN_FIELD_PREFIXES = (
     "target_remote_",
     "workflow_run",
     "workflow_url",
+)
+_LOCAL_ROOT_SOURCE_FIELDS = frozenset(
+    {
+        "acceptance_mode",
+        "activation_id",
+        "authoritative_evidence",
+        "authority_root_digest",
+        "batch_receipt_digests",
+        "campaign_key",
+        "canary_target_sha",
+        "candidate_receipt_digests",
+        "duplicate_effect_ids",
+        "fault_journal_digest",
+        "finding_ledger_digests",
+        "peak_worker_slots",
+        "permission_same_binding",
+        "plan_revision_digest",
+        "policy_witness_digest",
+        "receipt_digest",
+        "refill_proven",
+        "repository",
+        "runtime_selector_digest",
+        "schema",
+        "stale_diagnosis_bounded",
+        "standard_batch",
+        "standard_ticket_keys",
+        "strict_batch",
+        "strict_ticket_key",
+        "terminal_replacement_bounded",
+        "terminal_replacement_receipt_digests",
+        "ticket_contract_digests",
+        "writer_generation",
+    }
+)
+_LOCAL_ROOT_BATCH_FIELDS = frozenset(
+    {"batch_id", "batch_sha", "member_count", "receipt_digest", "target_sha"}
 )
 
 
@@ -1377,7 +1429,7 @@ def load_local_verification(path: Path) -> LocalVerificationReadback:
     except OSError as error:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_UNREADABLE") from error
     try:
-        raw = _strict_json_loads(raw_bytes, require_canonical=False)
+        raw = _strict_json_loads(raw_bytes, require_canonical=True)
     except (UnicodeError, ReleaseGateError) as error:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_UNREADABLE") from error
     if not isinstance(raw, Mapping):
@@ -1749,12 +1801,9 @@ def _bridge_mapping_field(
     return dict(value)
 
 
-def _bridge_source_readback(
-    section: Mapping[str, object], supplied: object
-) -> dict[str, object]:
-    """Bind an in-memory readback to the bridge's canonical source file."""
-
-    supplied_payload = _bridge_mapping(supplied, "GA_EVIDENCE_BRIDGE_MISMATCH")
+def _bridge_source_path(
+    section: Mapping[str, object], filename: str
+) -> tuple[Path, str]:
     source_file = _bridge_text_field(
         section, "source_file", "GA_EVIDENCE_BRIDGE_MISMATCH"
     )
@@ -1762,7 +1811,40 @@ def _bridge_source_readback(
         section, "source_file_sha256", "GA_EVIDENCE_BRIDGE_MISMATCH"
     )
     try:
-        raw = Path(source_file).read_bytes()
+        _require_sha256(source_sha, "GA_EVIDENCE_BRIDGE_MISMATCH")
+        source = Path(source_file)
+        if source.name != filename:
+            raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+        current = Path(os.path.abspath(os.fspath(source)))
+        leaf = current
+        while True:
+            observed = os.lstat(current)
+            if stat.S_ISLNK(observed.st_mode) or bool(
+                getattr(observed, "st_file_attributes", 0) & 0x0400
+            ):
+                raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+            if current == leaf and not stat.S_ISREG(observed.st_mode):
+                raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    except (OSError, ReleaseGateError, TypeError, ValueError) as error:
+        if isinstance(error, ReleaseGateError):
+            raise
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH") from error
+    return source, source_sha
+
+
+def _bridge_source_readback(
+    section: Mapping[str, object], supplied: object, filename: str
+) -> dict[str, object]:
+    """Bind an in-memory readback to the bridge's canonical source file."""
+
+    supplied_payload = _bridge_mapping(supplied, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    try:
+        source, source_sha = _bridge_source_path(section, filename)
+        raw = source.read_bytes()
         source_payload = _strict_canonical_json_loads(raw)
     except (OSError, UnicodeError, ReleaseGateError) as error:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH") from error
@@ -1804,6 +1886,174 @@ def _bridge_control_ref(payload: Mapping[str, object]) -> dict[str, object]:
     return control_ref
 
 
+def _local_root_text(payload: Mapping[str, object], name: str) -> str:
+    value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(value) is not str or not value.strip():
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return value
+
+
+def _local_root_digest(payload: Mapping[str, object], name: str) -> str:
+    value = _local_root_text(payload, name)
+    return _require_sha256(value, "GA_EVIDENCE_BRIDGE_MISMATCH")
+
+
+def _local_root_pairs(payload: Mapping[str, object], name: str) -> tuple[tuple[str, str], ...]:
+    value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(value) is not list:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    pairs: list[tuple[str, str]] = []
+    for item in value:
+        if type(item) is not list or len(item) != 2:
+            raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+        key, digest = item
+        if type(key) is not str or not key.strip():
+            raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+        pairs.append(
+            (key, _require_sha256(digest, "GA_EVIDENCE_BRIDGE_MISMATCH"))
+        )
+    return tuple(pairs)
+
+
+def _local_root_digest_list(
+    payload: Mapping[str, object], name: str
+) -> tuple[str, ...]:
+    value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(value) is not list:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return tuple(
+        _require_sha256(item, "GA_EVIDENCE_BRIDGE_MISMATCH") for item in value
+    )
+
+
+def _local_root_batch(payload: Mapping[str, object], name: str) -> VerifiedBatch:
+    value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(value) is not dict or set(value) != _LOCAL_ROOT_BATCH_FIELDS:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    batch_id = _local_root_digest(value, "batch_id")
+    member_count = _bridge_field(value, "member_count", "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(member_count) is not int or member_count < 1:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    batch_sha = _bridge_field(value, "batch_sha", "GA_EVIDENCE_BRIDGE_MISMATCH")
+    target_sha = _bridge_field(value, "target_sha", "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if (
+        type(batch_sha) is not str
+        or _SHA.fullmatch(batch_sha) is None
+        or type(target_sha) is not str
+        or _SHA.fullmatch(target_sha) is None
+    ):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return VerifiedBatch(
+        batch_id=batch_id,
+        member_count=member_count,
+        pull_request_number=None,
+        hosted_run_id=None,
+        batch_sha=batch_sha,
+        target_sha=target_sha,
+        receipt_digest=_local_root_digest(value, "receipt_digest"),
+    )
+
+
+def _verify_bridge_local_root_receipt(
+    payload: Mapping[str, object],
+) -> RootCanaryAcceptanceReceiptV1:
+    """Rebuild the root receipt so its producer digest cannot be self-asserted."""
+
+    _reject_local_hosted_fields(payload)
+    if type(payload) is not dict or set(payload) != _LOCAL_ROOT_SOURCE_FIELDS:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    if (
+        payload.get("schema") != LOCAL_ROOT_RECEIPT_SCHEMA
+        or payload.get("acceptance_mode") != LOCAL_ROOT_RECEIPT_MODE
+    ):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+
+    standard_ticket_keys = _bridge_field(
+        payload, "standard_ticket_keys", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    if (
+        type(standard_ticket_keys) is not list
+        or len(standard_ticket_keys) != 3
+        or any(type(key) is not str or not key.strip() for key in standard_ticket_keys)
+    ):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    strict_ticket_key = _local_root_text(payload, "strict_ticket_key")
+    authoritative_evidence = _bridge_field(
+        payload, "authoritative_evidence", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    if type(authoritative_evidence) is not dict:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+
+    peak_worker_slots = _bridge_field(
+        payload, "peak_worker_slots", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    if type(peak_worker_slots) is not int or peak_worker_slots < 1:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    boolean_fields = (
+        "refill_proven",
+        "permission_same_binding",
+        "stale_diagnosis_bounded",
+        "terminal_replacement_bounded",
+    )
+    boolean_values: dict[str, bool] = {}
+    for name in boolean_fields:
+        value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+        if type(value) is not bool:
+            raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+        boolean_values[name] = value
+    if boolean_values["refill_proven"] is not True:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+
+    duplicate_effect_ids = _bridge_field(
+        payload, "duplicate_effect_ids", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    if type(duplicate_effect_ids) is not list or any(
+        type(value) is not str or not value.strip() for value in duplicate_effect_ids
+    ):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+
+    receipt = RootCanaryAcceptanceReceiptV1(
+        repository=_local_root_text(payload, "repository"),
+        campaign_key=_local_root_text(payload, "campaign_key"),
+        plan_revision_digest=_local_root_digest(payload, "plan_revision_digest"),
+        activation_id=_local_root_text(payload, "activation_id"),
+        writer_generation=_local_root_text(payload, "writer_generation"),
+        standard_ticket_keys=tuple(standard_ticket_keys),
+        strict_ticket_key=strict_ticket_key,
+        standard_batch=_local_root_batch(payload, "standard_batch"),
+        strict_batch=_local_root_batch(payload, "strict_batch"),
+        peak_worker_slots=peak_worker_slots,
+        refill_proven=boolean_values["refill_proven"],
+        permission_same_binding=boolean_values["permission_same_binding"],
+        stale_diagnosis_bounded=boolean_values["stale_diagnosis_bounded"],
+        terminal_replacement_bounded=boolean_values["terminal_replacement_bounded"],
+        terminal_replacement_receipt_digests=_local_root_digest_list(
+            payload, "terminal_replacement_receipt_digests"
+        ),
+        duplicate_effect_ids=tuple(duplicate_effect_ids),
+        ticket_contract_digests=_local_root_pairs(payload, "ticket_contract_digests"),
+        candidate_receipt_digests=_local_root_pairs(
+            payload, "candidate_receipt_digests"
+        ),
+        policy_witness_digest=_local_root_digest(payload, "policy_witness_digest"),
+        authority_root_digest=_local_root_digest(payload, "authority_root_digest"),
+        runtime_selector_digest=_local_root_digest(payload, "runtime_selector_digest"),
+        finding_ledger_digests=_local_root_pairs(payload, "finding_ledger_digests"),
+        batch_receipt_digests=_local_root_pairs(payload, "batch_receipt_digests"),
+        fault_journal_digest=_local_root_digest(payload, "fault_journal_digest"),
+        canary_target_sha=_require_sha(
+            _bridge_field(payload, "canary_target_sha", "GA_EVIDENCE_BRIDGE_MISMATCH"),
+            "GA_EVIDENCE_BRIDGE_MISMATCH",
+        ),
+        authoritative_evidence=authoritative_evidence,
+        receipt_digest=_local_root_digest(payload, "receipt_digest"),
+        acceptance_mode=LOCAL_ROOT_RECEIPT_MODE,
+    )
+    if _root_digest_value(receipt.canonical_digest_payload()) != receipt.receipt_digest:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return receipt
+
+
 def _verify_bridge_external_canary(
     bridge: GaEvidenceBridge,
     activation_payload: Mapping[str, object],
@@ -1813,13 +2063,16 @@ def _verify_bridge_external_canary(
 
     package = bridge.production_canary
     try:
-        raw = Path(str(package["source_file"])).read_bytes()
+        source, source_sha = _bridge_source_path(
+            package, "production-canary-readback.json"
+        )
+        raw = source.read_bytes()
         payload = _strict_canonical_json_loads(raw)
     except (OSError, UnicodeError, ReleaseGateError) as error:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH") from error
     if not isinstance(payload, Mapping):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
-    if hashlib.sha256(raw).hexdigest() != package["source_file_sha256"]:
+    if hashlib.sha256(raw).hexdigest() != source_sha:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     expected_fields = {
         "accepted",
@@ -1923,9 +2176,16 @@ def _verify_pre_tag_bridge(
     local_section = bridge.local_root_canary
     activation_section = bridge.production_activation
     default_section = bridge.default_writer
-    local_payload = _bridge_source_readback(local_section, canary)
-    activation_payload = _bridge_source_readback(activation_section, activation)
-    admission_payload = _bridge_source_readback(default_section, admission)
+    local_payload = _bridge_source_readback(
+        local_section, canary, "root-canary-acceptance.json"
+    )
+    activation_payload = _bridge_source_readback(
+        activation_section, activation, "production-activation-readback.json"
+    )
+    admission_payload = _bridge_source_readback(
+        default_section, admission, "default-writer-readback.json"
+    )
+    _verify_bridge_local_root_receipt(local_payload)
 
     local_campaign = _bridge_text_field(
         local_payload, "campaign_key", "GA_EVIDENCE_BRIDGE_MISMATCH"
@@ -2274,6 +2534,8 @@ def verify_pre_tag(
     writer_generation = _required_readback_text(
         activation_payload, "writer_generation", "GA_ACTIVATION_READBACK_INVALID"
     )
+    if writer_generation not in _LEGACY_V8_WRITER_GENERATIONS:
+        raise ReleaseGateError("GA_ACTIVATION_READBACK_INVALID")
     if (
         activation_receipt_digest != record.activation_receipt_digest
         or activation_repository != record.repository
