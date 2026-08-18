@@ -51,6 +51,7 @@ def _valid_renderer_bridge_fixture(tmp_path):
     activation_payload = json.loads(
         json.dumps(source_payloads["production_activation"][1])
     )
+    activation_payload["authorization_receipt_digest"] = "6" * 64
     activation_payload["transition_record"]["canary_evidence_refs"] = evidence_refs
     activation_payload = _with_canonical_receipt(activation_payload)
     bridge = _renderer_bridge_with_source_payload(
@@ -63,9 +64,18 @@ def _valid_renderer_bridge_fixture(tmp_path):
     default_payload = json.loads(
         (tmp_path / "default-writer-readback.json").read_text(encoding="utf-8")
     )
-    default_payload["activation_readback_digest"] = activation_payload[
-        "receipt_digest"
-    ]
+    default_payload.update(
+        {
+            "activation_readback_digest": activation_payload["receipt_digest"],
+            "authorization_receipt_digest": activation_payload[
+                "authorization_receipt_digest"
+            ],
+            "canary_evidence_digest": canary_payload["package_digest"],
+            "canary_manifest_ref": canary_payload["manifest_ref"],
+            "canary_repository": canary_payload["package_repository"],
+            "kind": "default-writer-readback.v1",
+        }
+    )
     default_payload = _with_canonical_receipt(default_payload)
     bridge = _renderer_bridge_with_source_payload(
         tmp_path, bridge, "default_writer", default_payload
@@ -388,6 +398,45 @@ def test_renderer_recomputes_complete_producer_receipt_digest(
     else:
         payload["integrity_mutation"] = {"changed": True}
     bridge = _renderer_bridge_with_source_payload(tmp_path, bridge, section, payload)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path / "tampered", bridge)
+
+
+@pytest.mark.parametrize(
+    "section",
+    ("production_activation", "default_writer", "production_canary"),
+)
+def test_renderer_rejects_recomputed_digest_with_an_unbound_producer_field(
+    tmp_path, section
+):
+    bridge, _complete_refs = _valid_renderer_bridge_fixture(tmp_path)
+    _render_with_bridge(tmp_path / "baseline", bridge)
+
+    payload_path = {
+        "production_activation": tmp_path / "production-activation-readback.json",
+        "default_writer": tmp_path / "default-writer-readback.json",
+        "production_canary": tmp_path / "production-canary-readback.json",
+    }[section]
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["unbound_renderer_field"] = {"producer": section}
+    payload = _with_canonical_receipt(payload)
+    bridge = _renderer_bridge_with_source_payload(tmp_path, bridge, section, payload)
+    bridge[section]["readback_receipt_digest"] = payload["receipt_digest"]
+
+    if section == "production_activation":
+        default_payload = json.loads(
+            (tmp_path / "default-writer-readback.json").read_text(encoding="utf-8")
+        )
+        default_payload["activation_readback_digest"] = payload["receipt_digest"]
+        default_payload = _with_canonical_receipt(default_payload)
+        bridge = _renderer_bridge_with_source_payload(
+            tmp_path, bridge, "default_writer", default_payload
+        )
+        bridge["default_writer"]["readback_receipt_digest"] = default_payload[
+            "receipt_digest"
+        ]
+    bridge = _rehash_bridge(bridge)
 
     with pytest.raises(ReleaseGateError):
         _render_with_bridge(tmp_path / "tampered", bridge)

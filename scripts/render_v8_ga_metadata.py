@@ -23,6 +23,9 @@ if __package__ in {None, ""}:
 
 
 from scripts.verify_v8_ga_release import (
+    _DEFAULT_WRITER_RECEIPT_FIELDS,
+    _PRODUCTION_ACTIVATION_RECEIPT_FIELDS,
+    _PRODUCTION_CANARY_RECEIPT_FIELDS,
     DYNAMIC_METADATA_FIELDS,
     PRODUCTION_CANARY_EVIDENCE_REF_COUNT,
     ReleaseGateError,
@@ -346,6 +349,16 @@ def _read_bridge_source(
     return dict(readback)
 
 
+def _canonical_producer_readback_payload(
+    value: Mapping[str, object], fields: frozenset[str]
+) -> tuple[dict[str, object], str]:
+    if type(value) is not dict or set(value) != fields:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID")
+    return _canonical_readback_payload(
+        value, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    )
+
+
 def _source_mapping(
     payload: Mapping[str, object], field: str
 ) -> Mapping[str, object]:
@@ -596,14 +609,14 @@ def _renderer_evidence_bridge_context(
     default_source_payload = _read_bridge_source(
         default_writer, "default-writer-readback.json", "GA evidence default source"
     )
-    canary_payload, canary_receipt_digest = _canonical_readback_payload(
-        canary_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    canary_payload, canary_receipt_digest = _canonical_producer_readback_payload(
+        canary_source_payload, _PRODUCTION_CANARY_RECEIPT_FIELDS
     )
-    activation_payload, activation_receipt_digest = _canonical_readback_payload(
-        activation_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    activation_payload, activation_receipt_digest = _canonical_producer_readback_payload(
+        activation_source_payload, _PRODUCTION_ACTIVATION_RECEIPT_FIELDS
     )
-    default_payload, default_receipt_digest = _canonical_readback_payload(
-        default_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    default_payload, default_receipt_digest = _canonical_producer_readback_payload(
+        default_source_payload, _DEFAULT_WRITER_RECEIPT_FIELDS
     )
 
     _assert_source_equal(
