@@ -18,6 +18,7 @@ from typing import Sequence
 from scripts.verify_v8_ga_release import (
     DYNAMIC_METADATA_FIELDS,
     ReleaseGateError,
+    _reject_local_hosted_fields,
     _strict_canonical_json_loads,
     canonical_json_bytes,
     write_ga_release_record,
@@ -448,6 +449,8 @@ def render_ga_documents(
                 "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
             )
         _reject_dynamic_metadata(value, name)
+        if name != "tickets":
+            _reject_local_hosted_fields(value)
         _validate_metadata_json(value, name)
     static_tickets = tickets
     static_acceptance = acceptance
@@ -576,6 +579,7 @@ def write_live_release_record(
         if not isinstance(value, Mapping):
             raise ReleaseGateError("GA_METADATA_INPUT_INVALID", f"{name} is not an object")
         _reject_dynamic_metadata(value, name)
+        _reject_local_hosted_fields(value)
         _validate_metadata_json(value, name)
     _renderer_identity_context(acceptance, named_admission, default_writer)
     fixture = SimpleNamespace(

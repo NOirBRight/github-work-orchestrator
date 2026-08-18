@@ -107,6 +107,9 @@ _LOCAL_HOSTED_FIELDS = frozenset(
         "workflow_run",
         "workflow_run_id",
         "workflow_url",
+        "release_url",
+        "release_receipt",
+        "release_receipt_digest",
     }
 )
 _CANONICAL_FULL_COMMAND_NAMES = frozenset({"full", "full-suite", "full_pytest"})
@@ -117,6 +120,7 @@ _LOCAL_FORBIDDEN_FIELD_PREFIXES = (
     "check_",
     "ci_",
     "github_",
+    "git_hub_",
     "hosted_",
     "pr_",
     "publication_",
@@ -473,11 +477,58 @@ def _normalized_field_name(value: object) -> str:
 
 def _is_local_hosted_field(value: object) -> bool:
     normalized = _normalized_field_name(value)
+    compact = normalized.replace("_", "")
     return normalized in _LOCAL_HOSTED_FIELDS or normalized in {
         "publication",
         "remote",
         "remote_target",
         "target_remote",
+    } or compact in {
+        "ci",
+        "checkrun",
+        "checkruns",
+        "cirun",
+        "cirunid",
+        "githubactions",
+        "githubworkflow",
+        "githubworkflows",
+        "hosted",
+        "hostedci",
+        "hostedcheck",
+        "hostedconclusion",
+        "hostedheadsha",
+        "hostedrun",
+        "hostedrunid",
+        "hostedurl",
+        "pr",
+        "prheadsha",
+        "prnumber",
+        "pullrequest",
+        "publication",
+        "publicationreceipt",
+        "remotetarget",
+        "releaseurl",
+        "releasereceipt",
+        "releasereceiptdigest",
+        "run",
+        "runid",
+        "statuscheck",
+        "statuschecks",
+        "workflow",
+        "workflowrun",
+        "workflowrunid",
+        "workflowurl",
+        "githubactionsenabled",
+        "githubworkflowrun",
+        "githubworkflowurl",
+        "hostedcisuite",
+        "pullrequestheadsha",
+        "pullrequestmergemapping",
+        "pullrequestnumber",
+        "publicationreceiptdigest",
+        "remotetargetsha",
+        "checkrunid",
+        "statuscheckid",
     } or normalized.startswith(_LOCAL_FORBIDDEN_FIELD_PREFIXES)
 
 
@@ -603,16 +654,22 @@ def _command_pytest_count(command: Mapping[str, object]) -> int | None:
 def _canonical_command_tokens(command: Mapping[str, object]) -> list[str]:
     arguments = command.get("arguments", command.get("argv"))
     if isinstance(arguments, (list, tuple)):
-        return [str(value).strip('"\'').casefold() for value in arguments]
+        return [str(value).strip('"\'') for value in arguments]
     command_text = command.get("command")
     if isinstance(command_text, str):
-        return [value.strip('"\'').casefold() for value in command_text.split()]
+        return [value.strip('"\'') for value in command_text.split()]
     return []
 
 
 def _require_canonical_full_command(
     command: Mapping[str, object], *, require_name: bool
 ) -> None:
+    representations = [
+        name for name in ("command", "arguments", "argv") if name in command
+    ]
+    if len(representations) > 1:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
     command_name = str(command.get("name", "")).casefold()
     if require_name and command_name not in _CANONICAL_FULL_COMMAND_NAMES:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
@@ -624,14 +681,84 @@ def _require_canonical_full_command(
         (
             index
             for index, token in enumerate(tokens)
-            if token in {"pytest", "py.test", "pytest.exe", "py.test.exe"}
+            if token.casefold() in {"pytest", "py.test", "pytest.exe", "py.test.exe"}
         ),
         None,
     )
     if pytest_index is None:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
 
-    selected_flags = ("-k", "--keyword", "--deselect", "--ignore", "--pyargs")
+    selected_flags = (
+        "-k",
+        "--keyword",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--pyargs",
+        "--lf",
+        "--last-failed",
+        "--ff",
+        "--failed-first",
+        "--nf",
+        "--new-first",
+        "--sw",
+        "--stepwise",
+        "--stepwise-skip",
+        "--sw-skip",
+        "--stepwise-reset",
+        "--sw-reset",
+        "--last-failed-no-failures",
+        "--lfnf",
+        "-x",
+        "--exitfirst",
+        "--maxfail",
+        "--continue-on-collection-errors",
+        "--collect-only",
+        "--co",
+        "--setup-only",
+        "--setup-plan",
+        "--doctest-only",
+        "--fixtures",
+        "--funcargs",
+        "--fixtures-per-test",
+        "--markers",
+        "--keep-duplicates",
+        "--collect-in-virtualenv",
+        "--noconftest",
+        "--doctest-modules",
+        "--doctest-glob",
+        "--doctest-ignore-import-errors",
+        "--doctest-continue-on-failure",
+        "--doctest-report",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+        "-c",
+        "--config-file",
+        "--override-ini",
+        "-o",
+        "--confcutdir",
+        "--rootdir",
+        "--basetemp",
+        "--import-mode",
+        "--strict-config",
+        "--strict-markers",
+        "--strict",
+        "--assert",
+        "--setup-show",
+        "--testpaths",
+        "--trace-config",
+        "--disable-plugin-autoload",
+        "-p",
+        "--pdb",
+        "--pdbcls",
+        "--trace",
+        "--runxfail",
+        "--cache-show",
+        "--cache-clear",
+        "--debug",
+    )
     for token in tokens[pytest_index + 1 :]:
         if token == "-m" or token.startswith("-m="):
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
@@ -1333,6 +1460,10 @@ def verify_pre_tag(
     admission_payload, default_writer_receipt_digest = _canonical_readback_payload(
         admission, "GA_DEFAULT_WRITER_READBACK_INVALID"
     )
+    if local_verification is not None:
+        if canary_payload.get("acceptance_mode") != _CANONICAL_LOCAL_VERIFICATION_MODE:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_CANARY_MODE_INVALID")
+        _reject_local_hosted_fields(canary_payload)
 
     canary_repository = _required_readback_text(
         canary_payload, "repository", "GA_CANARY_RECEIPT_MISMATCH"

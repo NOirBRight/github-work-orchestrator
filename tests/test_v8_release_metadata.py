@@ -82,6 +82,7 @@ def _canonical_pre_tag_case(
     activation_campaign: str = "campaign:root",
     admission_campaign: str = "campaign:root",
     main_sha: str = "3" * 40,
+    canary_acceptance_mode: str | None = None,
 ):
     repository = "NOirBRight/github-work-orchestrator"
     campaign = "campaign:root"
@@ -94,6 +95,8 @@ def _canonical_pre_tag_case(
         "activation_id": activation_id,
         "subject": {"repository": canary_repository, "campaign_key": campaign},
     }
+    if canary_acceptance_mode is not None:
+        canary_body["acceptance_mode"] = canary_acceptance_mode
     activation_body = {
         "repository": repository,
         "campaign_key": activation_campaign,
@@ -571,7 +574,9 @@ def test_pre_tag_cli_rejects_ci_run_id_that_does_not_match_exact_readback(
 def test_pre_tag_cli_accepts_local_verification_without_github_ci(
     tmp_path, monkeypatch
 ):
-    record, canary, activation, admission, ci, _git = _canonical_pre_tag_case()
+    record, canary, activation, admission, ci, _git = _canonical_pre_tag_case(
+        canary_acceptance_mode="local-only-v1"
+    )
     record_path = write_ga_release_record(tmp_path / "record.json", record)
     canary_path = tmp_path / "canary.json"
     activation_path = tmp_path / "activation.json"
@@ -664,6 +669,63 @@ def test_pre_tag_cli_accepts_local_verification_without_github_ci(
     assert receipt["pytest_pass_count"] == 42
     assert "ci_run_id" not in receipt
     assert "ci_head_sha" not in receipt
+
+
+def test_local_pre_tag_requires_a_local_only_canary_payload():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    local = verifier.LocalVerificationReadback(
+        schema="gwo-c1-local-verification.v2",
+        verification_mode="local-only-v1",
+        subject_sha=ci.head_sha,
+        subject_tree_sha="a" * 40,
+        pytest_pass_count=42,
+        manifest_sha256="b" * 64,
+    )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=ci.head_sha,
+            canary=canary,
+            activation=activation,
+            admission=admission,
+            git=git,
+            local_verification=local,
+        )
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_CANARY_MODE_INVALID"
+
+
+def test_local_pre_tag_rejects_hosted_fields_nested_in_a_local_canary():
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    canary_payload = vars(canary).copy()
+    canary_payload["acceptance_mode"] = "local-only-v1"
+    canary_payload["local_evidence"] = {"pull_request": {"number": 119}}
+    canary_payload.pop("receipt_digest")
+    canary_payload["receipt_digest"] = verifier.digest_value(canary_payload)
+    canary = SimpleNamespace(**canary_payload)
+    record = replace(record, canary_receipt_digest=canary.receipt_digest)
+    local = verifier.LocalVerificationReadback(
+        schema="gwo-c1-local-verification.v2",
+        verification_mode="local-only-v1",
+        subject_sha=ci.head_sha,
+        subject_tree_sha="a" * 40,
+        pytest_pass_count=42,
+        manifest_sha256="b" * 64,
+    )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=ci.head_sha,
+            canary=canary,
+            activation=activation,
+            admission=admission,
+            git=git,
+            local_verification=local,
+        )
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE"
 
 
 def test_local_verification_reads_and_binds_a_digest_checked_pytest_log(tmp_path):
@@ -826,11 +888,54 @@ def test_canonical_local_verification_rejects_commandless_full_pytest_evidence(
             "arguments": ["-m", "pytest", "-k", "one", "-q"],
         },
         {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--lf", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--ignore-glob=tests/slow/*", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--maxfail=1", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--collect-only", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--stepwise-skip", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--strict-markers", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--basetemp=tmp", "-q"],
+        },
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "--fixtures", "-q"],
+        },
+        {
             "name": "package",
             "arguments": ["-m", "pytest", "-q", "tests/test_v8_release_metadata.py"],
         },
     ],
-    ids=["pytest-selector", "package-only"],
+    ids=[
+        "pytest-selector",
+        "last-failed-selector",
+        "ignore-glob-selector",
+        "maxfail-selector",
+        "collect-only",
+        "stepwise-skip",
+        "strict-markers",
+        "basetemp",
+        "fixtures",
+        "package-only",
+    ],
 )
 def test_canonical_local_verification_rejects_non_full_pytest_commands(
     tmp_path, command
@@ -855,6 +960,128 @@ def test_canonical_local_verification_rejects_non_full_pytest_commands(
         else "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING"
     )
     assert error.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "-k=one",
+        "--keyword=one",
+        "-m=one",
+        "--deselect=node",
+        "--ignore=tests/slow",
+        "--ignore-glob=tests/slow/*",
+        "--pyargs",
+        "--lf",
+        "--last-failed",
+        "--lfnf=none",
+        "--last-failed-no-failures=none",
+        "--ff",
+        "--failed-first",
+        "--nf",
+        "--new-first",
+        "--sw",
+        "--stepwise",
+        "--sw-skip",
+        "--stepwise-skip",
+        "--sw-reset",
+        "--stepwise-reset",
+        "-x",
+        "--exitfirst",
+        "--maxfail=1",
+        "--continue-on-collection-errors",
+        "--collect-only",
+        "--co",
+        "--fixtures",
+        "--funcargs",
+        "--fixtures-per-test",
+        "--markers",
+        "--keep-duplicates",
+        "--collect-in-virtualenv",
+        "--noconftest",
+        "--doctest-modules",
+        "--doctest-glob=*.txt",
+        "--doctest-report=only_first_failure",
+        "--doctest-ignore-import-errors",
+        "--doctest-continue-on-failure",
+        "--doctest-only",
+        "-c=pytest.ini",
+        "--config-file=pytest.ini",
+        "--confcutdir=.",
+        "--rootdir=.",
+        "--basetemp=tmp",
+        "--import-mode=importlib",
+        "--strict-config",
+        "--strict-markers",
+        "--strict",
+        "--override-ini=addopts=-q",
+        "-o=addopts=-q",
+        "--assert=plain",
+        "--setup-show",
+        "--testpaths=tests",
+        "--trace-config",
+        "--disable-plugin-autoload",
+        "-p=no:plugin",
+        "--pdb",
+        "--pdbcls=module:Class",
+        "--trace",
+        "--runxfail",
+        "--cache-show=*",
+        "--cache-clear",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+        "--debug=pytest.log",
+    ],
+)
+def test_canonical_local_verification_rejects_remaining_pytest_gate_options(
+    tmp_path, option
+):
+    manifest = _canonical_local_verification_manifest(
+        commands=[
+            {
+                "name": "full",
+                "arguments": ["-m", "pytest", option, "-q"],
+                "exit_code": 0,
+                "status": "passed",
+                "passed": 42,
+                "summary": "42 passed in 1.0s",
+            }
+        ]
+    )
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_FAILED"
+
+
+def test_canonical_local_verification_rejects_conflicting_command_representations(
+    tmp_path,
+):
+    manifest = _canonical_local_verification_manifest(
+        commands=[
+            {
+                "name": "full",
+                "command": "py -3.13 -m pytest --lf -q",
+                "arguments": ["-m", "pytest", "-q"],
+                "exit_code": 0,
+                "status": "passed",
+                "passed": 42,
+                "summary": "42 passed in 1.0s",
+            }
+        ]
+    )
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_FAILED"
 
 
 @pytest.mark.parametrize("missing", ["status", "passed"])
@@ -898,6 +1125,27 @@ def test_canonical_local_verification_requires_full_pytest_result_fields(
         "PullRequestMergeMapping",
         "PublicationReceiptDigest",
         "RemoteTargetSha",
+        "GitHubActionsEnabled",
+        "releaseURL",
+        "pullrequest",
+        "workflow",
+        "hostedci",
+        "publicationreceipt",
+        "remotetarget",
+        "githubactionsenabled",
+        "checkrun",
+        "pullrequestmergemapping",
+        "releaseReceiptdigest",
+        "workflowRun",
+        "hostedcisuite",
+        "publicationreceiptdigest",
+        "remotetargetsha",
+        "pullrequestheadsha",
+        "pullrequestnumber",
+        "checkrunid",
+        "statuscheckid",
+        "githubworkflowrun",
+        "githubworkflowurl",
     ],
 )
 def test_canonical_local_verification_rejects_extended_forbidden_field_aliases(
@@ -929,7 +1177,9 @@ def test_canonical_local_verification_rejects_nested_pull_request_evidence(tmp_p
 
 
 def test_local_verification_subject_tree_must_match_git_readback(tmp_path):
-    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case(
+        canary_acceptance_mode="local-only-v1"
+    )
     path = tmp_path / "local-verification.json"
     path.write_bytes(
         verifier.canonical_json_bytes(
@@ -960,7 +1210,9 @@ def test_local_verification_subject_tree_must_match_git_readback(tmp_path):
 
 
 def test_local_pre_tag_receipt_round_trips_without_hosted_ci_fields():
-    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case(
+        canary_acceptance_mode="local-only-v1"
+    )
     local = verifier.LocalVerificationReadback(
         schema="gwo-c1-local-verification.v2",
         verification_mode="local-only",
@@ -992,7 +1244,9 @@ def test_local_pre_tag_receipt_round_trips_without_hosted_ci_fields():
 
 
 def test_canonical_local_pre_tag_receipt_preserves_v1_mode():
-    record, canary, activation, admission, ci, git = _canonical_pre_tag_case()
+    record, canary, activation, admission, ci, git = _canonical_pre_tag_case(
+        canary_acceptance_mode="local-only-v1"
+    )
     local = verifier.LocalVerificationReadback(
         schema="gwo-c1-local-verification.v2",
         verification_mode="local-only-v1",
@@ -1082,6 +1336,59 @@ def test_renderer_labels_repository_verification_local_only(tmp_path):
     assert "local-only-v1" in combined
     assert "exact CI" not in combined
     assert "Product Hosted-CI" in combined
+
+
+@pytest.mark.parametrize("forbidden", ["hosted_ci", "pull_request"])
+def test_renderer_rejects_hosted_or_pr_acceptance_evidence(tmp_path, forbidden):
+    acceptance = {
+        "repository": "NOirBRight/github-work-orchestrator",
+        "campaign_key": "campaign:root",
+        "canary_target_sha": "5" * 40,
+        "receipt_digest": "canary:1",
+        forbidden: {"status": "success"},
+    }
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            acceptance=acceptance,
+            named_admission={"receipt_digest": "named:1"},
+            default_writer={
+                "receipt_digest": "default:1",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            },
+        )
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE"
+
+
+@pytest.mark.parametrize("forbidden", ["hostedci", "pullrequest"])
+def test_live_release_record_rejects_hosted_or_pr_acceptance_evidence(
+    tmp_path, forbidden
+):
+    with pytest.raises(ReleaseGateError) as error:
+        renderer.write_live_release_record(
+            tmp_path / "release-record.json",
+            evidence_base_sha="4" * 40,
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:root",
+                "canary_target_sha": "5" * 40,
+                "receipt_digest": "canary:1",
+                forbidden: {"status": "success"},
+            },
+            named_admission={"receipt_digest": "named:1"},
+            default_writer={
+                "receipt_digest": "default:1",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            },
+        )
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE"
 
 
 @pytest.mark.parametrize(
