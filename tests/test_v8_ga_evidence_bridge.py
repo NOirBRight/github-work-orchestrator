@@ -24,6 +24,9 @@ REPOSITORY = "NOirBRight/github-work-orchestrator"
 CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 MAIN_SHA = "f81994db1bee226cd6ca429e79c9b1cdf6d02897"
 MAIN_TREE_SHA = "5c97df0ecd0a267f69e80de92d4325f3a6f86743"
+FINAL_MAIN_SHA = "a" * 40
+FINAL_MAIN_TREE_SHA = "b" * 40
+FINAL_RELEASE_SUBJECT_DIGEST = "d" * 64
 EVIDENCE_BASE_SHA = "1" * 40
 LOCAL_TARGET_SHA = "d31d5787df8ff53f081ed45df42389ef2e505ffb"
 LOCAL_RECEIPT_DIGEST = (
@@ -72,16 +75,24 @@ def _case(tmp_path: Path):
     assert activation["control_ref"]["commit_sha"] == CONTROL_REF_SHA
     assert activation["active_plan"]["active_plan_digest"] == PLAN_DIGEST
     assert admission["receipt_digest"] == DEFAULT_WRITER_RECEIPT_DIGEST
-    admission["previous_writer_generation"] = PREVIOUS_WRITER_GENERATION
     assert (
         bridge_payload["bridge_digest"]
         == "97c173547a4bfd1444503cfb3ed76cc0ea03e1eba2d800a4d8fa2d854fb70ea4"
     )
-    # The activation bundle's previous writer is V6.1; keep the test contract
-    # explicit even if an older derived bridge file still carries V8 here.
+    # The activation readback is immutable production evidence.  Its transition
+    # record carries the cutover record's own V8 lineage field; the source
+    # writer is proven by the Guard/authorization readbacks instead.
     bridge_payload["production_activation"] = {
         **bridge_payload["production_activation"],
         "previous_writer_generation": PREVIOUS_WRITER_GENERATION,
+    }
+    bridge_payload["activation_release_subject"] = bridge_payload.pop("release_subject")
+    bridge_payload["release_subject"] = {
+        "merged_main_sha": MAIN_SHA,
+        "merged_main_tree": MAIN_TREE_SHA,
+        "release_subject_digest": bridge_payload["activation_release_subject"][
+            "release_subject_digest"
+        ],
     }
     default_writer_raw = canonical_json_bytes(admission)
     bridge_payload["default_writer"] = {
@@ -102,6 +113,7 @@ def _case(tmp_path: Path):
         bridge.production_activation["previous_writer_generation"]
         == PREVIOUS_WRITER_GENERATION
     )
+    assert bridge.activation_release_subject["merged_main_sha"] == MAIN_SHA
     record = GaReleaseRecord(
         version="8.0.0",
         repository=REPOSITORY,
@@ -225,6 +237,81 @@ def test_bridge_rejects_a_v8_previous_writer_generation(tmp_path):
         GaEvidenceBridge.from_mapping(wrong_payload)
 
     assert error.value.code == "GA_EVIDENCE_BRIDGE_WRITER_INVALID"
+
+
+def test_bridge_keeps_activation_subject_when_final_ga_subject_moves(tmp_path):
+    record, canary, activation, admission, bridge, local_verification, git = _case(
+        tmp_path
+    )
+    moved_payload = bridge.to_mapping()
+    moved_payload["release_subject"] = {
+        "merged_main_sha": FINAL_MAIN_SHA,
+        "merged_main_tree": FINAL_MAIN_TREE_SHA,
+        "release_subject_digest": FINAL_RELEASE_SUBJECT_DIGEST,
+    }
+    moved_payload = _rehash_bridge(moved_payload)
+    moved_bridge = GaEvidenceBridge.from_mapping(moved_payload)
+    moved_local = LocalVerificationReadback(
+        schema=local_verification.schema,
+        verification_mode=local_verification.verification_mode,
+        subject_sha=FINAL_MAIN_SHA,
+        subject_tree_sha=FINAL_MAIN_TREE_SHA,
+        pytest_pass_count=local_verification.pytest_pass_count,
+        manifest_sha256=local_verification.manifest_sha256,
+    )
+    moved_git = SimpleNamespace(
+        repository=REPOSITORY,
+        current_origin_main_sha=lambda: FINAL_MAIN_SHA,
+        tree_sha=lambda commit: FINAL_MAIN_TREE_SHA,
+        is_ancestor=lambda ancestor, descendant: ancestor == EVIDENCE_BASE_SHA,
+        changed_paths=lambda base, descendant: (
+            "CHANGELOG.md",
+            "docs/e2e/gwo-v8-root-canary.md",
+            "docs/releases/v8.0.0.md",
+        ),
+    )
+
+    receipt = verify_pre_tag(
+        record,
+        main_sha=FINAL_MAIN_SHA,
+        canary=canary,
+        activation=activation,
+        admission=admission,
+        git=moved_git,
+        local_verification=moved_local,
+        evidence_bridge=moved_bridge,
+    )
+
+    assert receipt.tag_candidate_sha == FINAL_MAIN_SHA
+    assert moved_bridge.activation_release_subject["merged_main_sha"] == MAIN_SHA
+
+
+def test_bridge_rejects_an_activation_subject_mismatch(tmp_path):
+    record, canary, activation, admission, bridge, local_verification, git = _case(
+        tmp_path
+    )
+    wrong_payload = bridge.to_mapping()
+    wrong_payload["activation_release_subject"] = {
+        "merged_main_sha": FINAL_MAIN_SHA,
+        "merged_main_tree": FINAL_MAIN_TREE_SHA,
+        "release_subject_digest": FINAL_RELEASE_SUBJECT_DIGEST,
+    }
+    wrong_payload = _rehash_bridge(wrong_payload)
+    mismatched = GaEvidenceBridge.from_mapping(wrong_payload)
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=MAIN_SHA,
+            canary=canary,
+            activation=activation,
+            admission=admission,
+            git=git,
+            local_verification=local_verification,
+            evidence_bridge=mismatched,
+        )
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
 
 
 def test_bridge_rejects_a_local_root_receipt_identity_mismatch(tmp_path):

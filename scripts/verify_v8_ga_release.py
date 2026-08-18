@@ -250,6 +250,7 @@ class GaEvidenceBridge:
     local_root_canary: Mapping[str, object]
     production_canary: Mapping[str, object]
     production_activation: Mapping[str, object]
+    activation_release_subject: Mapping[str, object]
     default_writer: Mapping[str, object]
     release_subject: Mapping[str, object]
     bridge_digest: str
@@ -258,6 +259,7 @@ class GaEvidenceBridge:
         {
             "bridge_digest",
             "default_writer",
+            "activation_release_subject",
             "local_root_canary",
             "production_activation",
             "production_canary",
@@ -363,6 +365,9 @@ class GaEvidenceBridge:
         local = cls._section(raw, "local_root_canary", cls._LOCAL_FIELDS)
         canary = cls._section(raw, "production_canary", cls._CANARY_FIELDS)
         activation = cls._section(raw, "production_activation", cls._ACTIVATION_FIELDS)
+        activation_release_subject = cls._section(
+            raw, "activation_release_subject", cls._RELEASE_SUBJECT_FIELDS
+        )
         default_writer = cls._section(raw, "default_writer", cls._DEFAULT_WRITER_FIELDS)
         release_subject = cls._section(
             raw, "release_subject", cls._RELEASE_SUBJECT_FIELDS
@@ -458,13 +463,15 @@ class GaEvidenceBridge:
             "GA_EVIDENCE_BRIDGE_DEFAULT_WRITER_INVALID",
         )
 
-        for field in ("merged_main_sha", "merged_main_tree"):
-            _require_sha(release_subject[field], "GA_EVIDENCE_BRIDGE_SUBJECT_INVALID")
-        _require_sha256(
-            release_subject["release_subject_digest"],
-            "GA_EVIDENCE_BRIDGE_SUBJECT_INVALID",
-        )
+        for subject in (activation_release_subject, release_subject):
+            for field in ("merged_main_sha", "merged_main_tree"):
+                _require_sha(subject[field], "GA_EVIDENCE_BRIDGE_SUBJECT_INVALID")
+            _require_sha256(
+                subject["release_subject_digest"],
+                "GA_EVIDENCE_BRIDGE_SUBJECT_INVALID",
+            )
         return {
+            "activation_release_subject": activation_release_subject,
             "bridge_digest": bridge_digest,
             "default_writer": default_writer,
             "local_root_canary": local,
@@ -488,6 +495,7 @@ class GaEvidenceBridge:
         return {
             "bridge_digest": self.bridge_digest,
             "default_writer": dict(self.default_writer),
+            "activation_release_subject": dict(self.activation_release_subject),
             "local_root_canary": dict(self.local_root_canary),
             "production_activation": dict(self.production_activation),
             "production_canary": dict(self.production_canary),
@@ -505,6 +513,7 @@ class GaEvidenceBridge:
             local_root_canary=normalized["local_root_canary"],  # type: ignore[arg-type]
             production_canary=normalized["production_canary"],  # type: ignore[arg-type]
             production_activation=normalized["production_activation"],  # type: ignore[arg-type]
+            activation_release_subject=normalized["activation_release_subject"],  # type: ignore[arg-type]
             default_writer=normalized["default_writer"],  # type: ignore[arg-type]
             release_subject=normalized["release_subject"],  # type: ignore[arg-type]
             bridge_digest=normalized["bridge_digest"],  # type: ignore[arg-type]
@@ -2018,10 +2027,9 @@ def _verify_pre_tag_bridge(
         or legacy_writer_fence.get("stopped") is not True
         or transition.get("status") != "cut_over"
         or transition.get("repository") != record.repository
-        or guard_receipt.get("source_writer_generation") != V6_1_WRITER_GENERATION
-        or activation_release_subject != bridge.release_subject
-        or activation_release_subject.get("release_subject_digest")
-        != bridge.release_subject["release_subject_digest"]
+        or guard_receipt.get("source_writer_generation")
+        != activation_section["previous_writer_generation"]
+        or activation_release_subject != bridge.activation_release_subject
     ):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     admission_activation_id = _bridge_text_field(
@@ -2049,7 +2057,6 @@ def _verify_pre_tag_bridge(
         or admission_record_id != default_section["record_id"]
         or admission_payload.get("legacy_writer_fence_stopped") is not True
         or admission_payload.get("plan_digest") != plan_digest
-        or admission_payload.get("previous_writer_generation") != V6_1_WRITER_GENERATION
     ):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     admission_control_ref = _bridge_control_ref(admission_payload)
