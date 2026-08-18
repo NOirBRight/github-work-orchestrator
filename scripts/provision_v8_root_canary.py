@@ -1180,10 +1180,11 @@ def _validate_manifest_ticket(
     if number_match is None:
         raise RootCanaryProvisionError(code)
     number = int(number_match.group(1))
+    contract_number = _manifest_positive_int(contract.get("number"), code)
     if (
         _manifest_positive_int(contract.get("id"), code) <= 0
         or not _valid_text(contract.get("node_id"))
-        or contract.get("number") != number
+        or contract_number != number
     ):
         raise RootCanaryProvisionError(code)
     _manifest_text(contract.get("title"), code)
@@ -1210,7 +1211,11 @@ def _validate_manifest_ticket(
     parsed_comments = [
         _validate_manifest_comment(item, number, code) for item in comments
     ]
-    if len({item["id"] for item in parsed_comments}) != len(parsed_comments):
+    comment_ids = [item["id"] for item in parsed_comments]
+    if (
+        len(set(comment_ids)) != len(comment_ids)
+        or comment_ids != sorted(comment_ids)
+    ):
         raise RootCanaryProvisionError(code)
     _manifest_text(contract.get("updated_at"), code)
 

@@ -673,6 +673,70 @@ def test_manifest_loader_rejects_uppercase_open_state_when_source_digest_matches
         load_ticket_manifest(path, require_real_root_numbers=True)
 
 
+def test_manifest_loader_rejects_float_contract_number_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["number"] = 195.0
+    item = payload["tickets"][0]
+    item["source"]["digest"] = digest_value(
+        {
+            "number": 195,
+            "contract": item["contract"],
+            "labels": item["labels"],
+            "source_ref": item["key"],
+            "native_blockers": item["native_blockers"],
+        }
+    )
+    path = tmp_path / "float-number.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_reordered_comment_ids_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+
+    def comment(comment_id, body):
+        return {
+            "id": comment_id,
+            "node_id": f"comment-node-{comment_id}",
+            "url": (
+                f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/comments/"
+                f"{comment_id}"
+            ),
+            "html_url": (
+                f"https://github.com/{ROOT_REPOSITORY}/issues/195"
+                f"#issuecomment-{comment_id}"
+            ),
+            "body": body,
+            "user": {"login": "reviewer"},
+            "created_at": "2026-08-18T00:00:00Z",
+            "updated_at": "2026-08-18T00:00:00Z",
+            "author_association": "MEMBER",
+        }
+
+    payload["tickets"][0]["contract"]["comments"] = [
+        comment(2, "second"),
+        comment(1, "first"),
+    ]
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "reordered-comments.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
 def test_github_port_rejects_duplicate_exact_titles():
     port = GhIssuePort(
         run_gh_json=lambda _command: [
