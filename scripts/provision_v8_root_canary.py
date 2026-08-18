@@ -18,6 +18,9 @@ APPROVAL = "CREATE-GWO-V8-GA-ROOT-CANARY-TICKETS"
 POLICY_WITNESS_PATH = ".gwo-v8/policy-witness.json"
 DEFAULT_LOCK_PATH = Path(".gwo-v8-root-canary-tickets.lock")
 _CREATE_OUTPUT_RE = re.compile(r"^[1-9][0-9]*$")
+_MANIFEST_TICKET_KEY_RE = re.compile(r"^issue:([1-9][0-9]*)$")
+_MANIFEST_SCHEMA = "gwo-v8-root-canary-tickets.v2"
+_REAL_ROOT_REFS = ["issue:195", "issue:196", "issue:197", "issue:198"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1013,6 +1016,287 @@ def write_ticket_manifest(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(payload))
+
+
+def _manifest_mapping(value: object, code: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise RootCanaryProvisionError(code)
+    return value
+
+
+def _manifest_sequence(value: object, code: str) -> list[object]:
+    if type(value) is not list:
+        raise RootCanaryProvisionError(code)
+    return value
+
+
+def _manifest_text(value: object, code: str) -> str:
+    if not _valid_text(value):
+        raise RootCanaryProvisionError(code)
+    return value
+
+
+def _manifest_positive_int(value: object, code: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise RootCanaryProvisionError(code)
+    return value
+
+
+def _manifest_digest(value: object, code: str) -> str:
+    if not _valid_digest(value):
+        raise RootCanaryProvisionError(code)
+    return value
+
+
+def _validate_manifest_repository(value: object, code: str) -> dict[str, object]:
+    repository = _manifest_mapping(value, code)
+    if set(repository) != {"full_name", "url"}:
+        raise RootCanaryProvisionError(code)
+    if repository.get("full_name") != ROOT_REPOSITORY:
+        raise RootCanaryProvisionError("ROOT_REPOSITORY_MISMATCH")
+    if repository.get("url") != f"https://api.github.com/repos/{ROOT_REPOSITORY}":
+        raise RootCanaryProvisionError(code)
+    return repository
+
+
+def _validate_manifest_label(value: object, code: str) -> dict[str, object]:
+    label = _manifest_mapping(value, code)
+    if set(label) != {
+        "id",
+        "node_id",
+        "url",
+        "name",
+        "color",
+        "default",
+        "description",
+    }:
+        raise RootCanaryProvisionError(code)
+    _manifest_positive_int(label.get("id"), code)
+    _manifest_text(label.get("node_id"), code)
+    _manifest_text(label.get("name"), code)
+    _manifest_text(label.get("url"), code)
+    if type(label.get("color")) is not str or type(label.get("default")) is not bool:
+        raise RootCanaryProvisionError(code)
+    description = label.get("description")
+    if description is not None and type(description) is not str:
+        raise RootCanaryProvisionError(code)
+    expected_url = (
+        f"https://api.github.com/repos/{ROOT_REPOSITORY}/labels/ready-for-agent"
+    )
+    if label.get("url") != expected_url:
+        raise RootCanaryProvisionError(code)
+    return label
+
+
+def _validate_manifest_comment(
+    value: object, number: int, code: str
+) -> dict[str, object]:
+    comment = _manifest_mapping(value, code)
+    if set(comment) != {
+        "id",
+        "node_id",
+        "url",
+        "html_url",
+        "body",
+        "user",
+        "created_at",
+        "updated_at",
+        "author_association",
+    }:
+        raise RootCanaryProvisionError(code)
+    comment_id = _manifest_positive_int(comment.get("id"), code)
+    _manifest_text(comment.get("node_id"), code)
+    _manifest_text(comment.get("body"), code)
+    for field_name in ("created_at", "updated_at", "author_association"):
+        _manifest_text(comment.get(field_name), code)
+    user = _manifest_mapping(comment.get("user"), code)
+    if set(user) != {"login"}:
+        raise RootCanaryProvisionError(code)
+    _manifest_text(user.get("login"), code)
+    expected_url = (
+        f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/comments/{comment_id}"
+    )
+    expected_html_url = (
+        f"https://github.com/{ROOT_REPOSITORY}/issues/{number}"
+        f"#issuecomment-{comment_id}"
+    )
+    if comment.get("url") != expected_url or comment.get("html_url") != expected_html_url:
+        raise RootCanaryProvisionError(code)
+    return comment
+
+
+def _validate_manifest_blocker(
+    value: object, code: str
+) -> dict[str, object]:
+    blocker = _manifest_mapping(value, code)
+    if set(blocker) != {"key", "state", "repository", "source"}:
+        raise RootCanaryProvisionError(code)
+    key = _manifest_text(blocker.get("key"), code)
+    if _MANIFEST_TICKET_KEY_RE.fullmatch(key) is None:
+        raise RootCanaryProvisionError(code)
+    state = _manifest_text(blocker.get("state"), code).lower()
+    if state not in {"open", "closed"}:
+        raise RootCanaryProvisionError(code)
+    repository = _validate_manifest_repository(blocker.get("repository"), code)
+    source = _manifest_mapping(blocker.get("source"), code)
+    if set(source) != {"ref", "digest"} or source.get("ref") != key:
+        raise RootCanaryProvisionError(code)
+    if _manifest_digest(source.get("digest"), code) != digest_value(
+        {"key": key, "state": state, "repository": repository}
+    ):
+        raise RootCanaryProvisionError("TICKET_CONTRACT_DIGEST_MISMATCH")
+    return blocker
+
+
+def _validate_manifest_ticket(
+    value: object, expected_ref: str, code: str
+) -> dict[str, object]:
+    ticket = _manifest_mapping(value, code)
+    if set(ticket) != {"key", "labels", "source", "contract", "native_blockers"}:
+        raise RootCanaryProvisionError(code)
+    if ticket.get("key") != expected_ref:
+        raise RootCanaryProvisionError(code)
+    source = _manifest_mapping(ticket.get("source"), code)
+    if set(source) != {"ref", "digest"} or source.get("ref") != expected_ref:
+        raise RootCanaryProvisionError(code)
+
+    contract = _manifest_mapping(ticket.get("contract"), code)
+    if set(contract) != {
+        "id",
+        "node_id",
+        "number",
+        "title",
+        "body",
+        "state",
+        "state_reason",
+        "type",
+        "repository",
+        "labels",
+        "comments",
+        "updated_at",
+    }:
+        raise RootCanaryProvisionError(code)
+    number_match = _MANIFEST_TICKET_KEY_RE.fullmatch(expected_ref)
+    if number_match is None:
+        raise RootCanaryProvisionError(code)
+    number = int(number_match.group(1))
+    if (
+        _manifest_positive_int(contract.get("id"), code) <= 0
+        or not _valid_text(contract.get("node_id"))
+        or contract.get("number") != number
+    ):
+        raise RootCanaryProvisionError(code)
+    _manifest_text(contract.get("title"), code)
+    if type(contract.get("body")) is not str:
+        raise RootCanaryProvisionError(code)
+    state = _manifest_text(contract.get("state"), code).lower()
+    if state not in {"open", "closed"}:
+        raise RootCanaryProvisionError(code)
+    state_reason = contract.get("state_reason")
+    if state_reason is not None and type(state_reason) is not str:
+        raise RootCanaryProvisionError(code)
+    issue_type = contract.get("type")
+    if issue_type is not None:
+        _manifest_mapping(issue_type, code)
+    _validate_manifest_repository(contract.get("repository"), code)
+
+    labels = _manifest_sequence(contract.get("labels"), code)
+    parsed_labels = [_validate_manifest_label(item, code) for item in labels]
+    if len({item["id"] for item in parsed_labels}) != len(parsed_labels):
+        raise RootCanaryProvisionError(code)
+    if len({item["name"] for item in parsed_labels}) != len(parsed_labels):
+        raise RootCanaryProvisionError(code)
+
+    comments = _manifest_sequence(contract.get("comments"), code)
+    parsed_comments = [
+        _validate_manifest_comment(item, number, code) for item in comments
+    ]
+    if len({item["id"] for item in parsed_comments}) != len(parsed_comments):
+        raise RootCanaryProvisionError(code)
+    _manifest_text(contract.get("updated_at"), code)
+
+    entry_labels = _manifest_sequence(ticket.get("labels"), code)
+    if any(type(item) is not str or not item for item in entry_labels):
+        raise RootCanaryProvisionError(code)
+    if list(entry_labels) != [item["name"] for item in parsed_labels]:
+        raise RootCanaryProvisionError("TICKET_READBACK_MISMATCH")
+    if entry_labels != ["ready-for-agent"]:
+        raise RootCanaryProvisionError("ROOT_TICKET_NOT_READY")
+
+    blockers = [
+        _validate_manifest_blocker(item, code)
+        for item in _manifest_sequence(ticket.get("native_blockers"), code)
+    ]
+    if blockers:
+        raise RootCanaryProvisionError("ROOT_TICKET_NOT_READY")
+    projection = {
+        "number": number,
+        "contract": contract,
+        "labels": list(entry_labels),
+        "source_ref": expected_ref,
+        "native_blockers": blockers,
+    }
+    if _manifest_digest(source.get("digest"), code) != digest_value(projection):
+        raise RootCanaryProvisionError("TICKET_CONTRACT_DIGEST_MISMATCH")
+    if state != "open":
+        raise RootCanaryProvisionError("ROOT_TICKET_NOT_READY")
+    return ticket
+
+
+def _validate_manifest_v2(manifest: dict[str, object]) -> None:
+    if set(manifest) != {"schema", "repository", "ready_refs", "tickets"}:
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    if manifest.get("schema") != _MANIFEST_SCHEMA:
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    if manifest.get("repository") != ROOT_REPOSITORY:
+        raise RootCanaryProvisionError("ROOT_REPOSITORY_MISMATCH")
+    refs = _manifest_sequence(
+        manifest.get("ready_refs"), "ROOT_TICKET_MANIFEST_INVALID"
+    )
+    if len(refs) != 4 or any(
+        type(ref) is not str or _MANIFEST_TICKET_KEY_RE.fullmatch(ref) is None
+        for ref in refs
+    ):
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    if len(set(refs)) != len(refs):
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    raw_tickets = _manifest_sequence(
+        manifest.get("tickets"), "ROOT_TICKET_MANIFEST_INVALID"
+    )
+    if len(raw_tickets) != 4:
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    if tuple(refs) != tuple(
+        _manifest_mapping(item, "ROOT_TICKET_MANIFEST_INVALID").get("key")
+        for item in raw_tickets
+    ):
+        raise RootCanaryProvisionError("TICKET_READBACK_MISMATCH")
+    for item, ref in zip(raw_tickets, refs, strict=True):
+        _validate_manifest_ticket(item, ref, "ROOT_TICKET_MANIFEST_INVALID")
+
+
+def load_ticket_manifest(
+    path: Path, *, require_real_root_numbers: bool = False
+) -> dict[str, object]:
+    """Load and validate one canonical, read-only V8 root Ticket manifest."""
+
+    try:
+        raw = Path(path).read_bytes()
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID") from None
+    if type(manifest) is not dict:
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+    try:
+        canonical = canonical_json_bytes(manifest)
+    except (TypeError, ValueError, UnicodeError):
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID") from None
+    if raw != canonical:
+        raise RootCanaryProvisionError("ROOT_TICKET_MANIFEST_INVALID")
+
+    if require_real_root_numbers and manifest.get("ready_refs") != _REAL_ROOT_REFS:
+        raise RootCanaryProvisionError("ROOT_TICKET_REAL_ISSUES_REQUIRED")
+    _validate_manifest_v2(manifest)
+    return json.loads(canonical.decode("utf-8"))
 
 
 def write_ticket_runbook(path: Path) -> None:
