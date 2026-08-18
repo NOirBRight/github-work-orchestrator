@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import gc
@@ -26,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+PROVISION_SCRIPTS = ROOT / "scripts"
+if str(PROVISION_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(PROVISION_SCRIPTS))
 
 import gwo_v8  # noqa: E402
 from gwo_v8._canonical import (  # noqa: E402
@@ -102,6 +106,11 @@ from gwo_v8.runtime_gateway import (  # noqa: E402
     WorkRunPurpose,
     WorkRunSubject,
 )
+from provision_v8_root_canary import (  # noqa: E402
+    RootCanaryProvisionError,
+    canonical_json_bytes as manifest_json_bytes,
+    load_ticket_manifest,
+)
 
 
 PUBLIC_API_SINGLE_NODE_GO = "PUBLIC_API_SINGLE_NODE_GO"
@@ -109,9 +118,65 @@ LOCAL_ROOT_CANARY_GO = "LOCAL_ROOT_CANARY_GO"
 _REPOSITORY = "local/v8-acceptance"
 _TICKET_KEY = "issue:1"
 _TARGET_BRANCH = "main"
-_ROOT_STANDARD_TICKETS = ("issue:101", "issue:102", "issue:103")
-_ROOT_STRICT_TICKET = "issue:104"
-_ROOT_TICKET_KEYS = (*_ROOT_STANDARD_TICKETS, _ROOT_STRICT_TICKET)
+_LOCAL_ROOT_SCHEMA = "gwo.v8.local-root-acceptance.v1"
+_LOCAL_ROOT_MODE = "local-only-v1"
+
+
+@dataclass(frozen=True)
+class _RootLayout:
+    manifest: dict[str, object]
+    repository: str
+    ticket_keys: tuple[str, ...]
+    standard_ticket_keys: tuple[str, ...]
+    strict_ticket_key: str
+    ticket_source_digests: dict[str, str]
+
+    @classmethod
+    def from_manifest(cls, manifest: dict[str, object]) -> "_RootLayout":
+        refs = tuple(manifest["ready_refs"])
+        tickets = tuple(manifest["tickets"])
+        source_digests = {
+            ticket["key"]: ticket["source"]["digest"]
+            for ticket in tickets
+        }
+        return cls(
+            manifest=manifest,
+            repository=manifest["repository"],
+            ticket_keys=refs,
+            standard_ticket_keys=refs[:3],
+            strict_ticket_key=refs[3],
+            ticket_source_digests=source_digests,
+        )
+
+
+def _root_layout(
+    tickets: Path | Mapping[str, object] | None,
+) -> _RootLayout:
+    if tickets is None:
+        raise LocalAcceptanceFailure("ROOT_TICKET_MANIFEST_REQUIRED")
+    try:
+        if isinstance(tickets, (str, bytes)):
+            raise TypeError
+        if isinstance(tickets, Path):
+            manifest = load_ticket_manifest(
+                tickets,
+                require_real_root_numbers=True,
+            )
+        elif isinstance(tickets, Mapping):
+            with tempfile.TemporaryDirectory(prefix="gwo-v8-ticket-manifest-") as directory:
+                manifest_path = Path(directory) / "manifest.json"
+                manifest_path.write_bytes(manifest_json_bytes(dict(tickets)))
+                manifest = load_ticket_manifest(
+                    manifest_path,
+                    require_real_root_numbers=True,
+                )
+        else:
+            raise TypeError
+    except RootCanaryProvisionError as error:
+        raise LocalAcceptanceFailure(error.code) from error
+    except (OSError, TypeError, ValueError, KeyError):
+        raise LocalAcceptanceFailure("ROOT_TICKET_MANIFEST_INVALID") from None
+    return _RootLayout.from_manifest(manifest)
 
 
 def _campaign_key(run_id: str, scenario: str) -> str:
@@ -186,9 +251,10 @@ def _policy() -> dict[str, Any]:
 
 def _campaign_source(
     root_repository: "_RootGitRepository | None" = None,
+    repository: str = _REPOSITORY,
 ) -> dict[str, str]:
     core = {
-        "repository": _REPOSITORY,
+        "repository": repository,
         "input_ref": "refs/heads/main",
         "resolved_commit_oid": (
             "a" * 40 if root_repository is None else root_repository.base_commit
@@ -285,16 +351,16 @@ def _snapshot() -> dict[str, Any]:
 
 def _root_snapshot(
     root_repository: "_RootGitRepository | None" = None,
+    layout: _RootLayout | None = None,
 ) -> dict[str, Any]:
+    if layout is None:
+        raise LocalAcceptanceFailure("ROOT_TICKET_MANIFEST_REQUIRED")
     return {
-        "repository": _REPOSITORY,
+        "repository": layout.repository,
         "target_branch": _TARGET_BRANCH,
-        "campaign_source": _campaign_source(root_repository),
+        "campaign_source": _campaign_source(root_repository, layout.repository),
         "policy": _policy(),
-        "tickets": [
-            _root_ticket(ticket_key, 100 + ordinal)
-            for ordinal, ticket_key in enumerate(_ROOT_TICKET_KEYS, start=1)
-        ],
+        "tickets": layout.manifest["tickets"],
     }
 
 
@@ -303,17 +369,24 @@ class _LocalSnapshotSource:
         self,
         ticket_keys: tuple[str, ...] = (_TICKET_KEY,),
         root_repository: "_RootGitRepository | None" = None,
+        root_layout: _RootLayout | None = None,
     ) -> None:
         self.ticket_keys = tuple(ticket_keys)
         self.root_repository = root_repository
+        self.root_layout = root_layout
 
     def snapshot(self, repository: str, ready_refs: tuple[str, ...]) -> dict[str, Any]:
-        if repository != _REPOSITORY or ready_refs != self.ticket_keys:
+        expected_repository = (
+            self.root_layout.repository
+            if self.root_layout is not None
+            else _REPOSITORY
+        )
+        if repository != expected_repository or ready_refs != self.ticket_keys:
             raise AssertionError("local acceptance source identity changed")
         return (
             _snapshot()
             if self.ticket_keys == (_TICKET_KEY,)
-            else _root_snapshot(self.root_repository)
+            else _root_snapshot(self.root_repository, self.root_layout)
         )
 
 
@@ -476,8 +549,8 @@ def _accepted_for(
     )
 
 
-def _root_assurance(ticket_key: str) -> str:
-    return "strict" if ticket_key == _ROOT_STRICT_TICKET else "standard"
+def _root_assurance(ticket_key: str, layout: _RootLayout) -> str:
+    return "strict" if ticket_key == layout.strict_ticket_key else "standard"
 
 
 def _root_path_token(path: str) -> str:
@@ -521,7 +594,10 @@ class _RootGitRepository:
     candidate_refs: dict[tuple[str, str], str]
 
 
-def _initialize_root_git_repository(root: Path) -> _RootGitRepository:
+def _initialize_root_git_repository(
+    root: Path,
+    layout: _RootLayout,
+) -> _RootGitRepository:
     repository = root / "repository"
     repository.mkdir(parents=True, exist_ok=True)
     _git(repository, "init", "--quiet", "--initial-branch=main")
@@ -545,36 +621,37 @@ def _initialize_root_git_repository(root: Path) -> _RootGitRepository:
     _git(repository, "commit", "--quiet", "-m", "root canary base", env=commit_env)
     base_commit = _git(repository, "rev-parse", "refs/heads/main^{commit}")
     base_tree = _git(repository, "rev-parse", "refs/heads/main^{tree}")
+    first, repair, rejected, strict = layout.ticket_keys
     definitions = {
-        ("issue:101", "accepted"): (
-            "src/root/issue-101.py",
-            "STANDARD_101 = True\n",
-            "issue 101 candidate",
+        (first, "accepted"): (
+            f"src/root/{first.replace(':', '-')}.py",
+            "STANDARD_ROOT = True\n",
+            f"{first} candidate",
         ),
-        ("issue:102", "initial"): (
-            "src/root/issue-102.py",
+        (repair, "initial"): (
+            f"src/root/{repair.replace(':', '-')}.py",
             "REPAIR_REQUIRED = True\n",
-            "issue 102 initial candidate",
+            f"{repair} initial candidate",
         ),
-        ("issue:102", "repaired"): (
-            "src/root/issue-102.py",
+        (repair, "repaired"): (
+            f"src/root/{repair.replace(':', '-')}.py",
             "REPAIR_REQUIRED = False\n",
-            "issue 102 repaired candidate",
+            f"{repair} repaired candidate",
         ),
-        ("issue:103", "rejected"): (
-            "src/root/issue-103.py",
+        (rejected, "rejected"): (
+            f"src/root/{rejected.replace(':', '-')}.py",
             "REJECTED = True\n",
-            "issue 103 rejected candidate",
+            f"{rejected} rejected candidate",
         ),
-        ("issue:103", "replacement"): (
-            "src/root/issue-103.py",
+        (rejected, "replacement"): (
+            f"src/root/{rejected.replace(':', '-')}.py",
             "REJECTED = False\n",
-            "issue 103 replacement candidate",
+            f"{rejected} replacement candidate",
         ),
-        ("issue:104", "accepted"): (
+        (strict, "accepted"): (
             "src/root/strict-surface.py",
-            "STRICT_104 = True\n",
-            "issue 104 strict candidate",
+            "STRICT_ROOT = True\n",
+            f"{strict} strict candidate",
         ),
     }
     candidate_refs: dict[tuple[str, str], str] = {}
@@ -730,12 +807,15 @@ class _RootCandidateStore:
 
 
 class _RootCandidateChecks:
-    def __init__(self):
+    def __init__(self, layout: _RootLayout):
+        self.layout = layout
         self.calls: list[str] = []
 
     def run(self, _parent: CandidateGateParent, readback):
         self.calls.append(readback.candidate.reported_reference)
-        failed = readback.candidate.reported_reference.endswith("issue-103-rejected")
+        failed = readback.candidate.reported_reference.endswith(
+            f"{self.layout.ticket_keys[2].replace(':', '-')}-rejected"
+        )
         failure = (
             DeterministicAuditFailure(
                 kind=AuditFailureKind.AFFECTED_CHECK,
@@ -772,8 +852,11 @@ class _RootCandidateChecks:
 
 
 class _RootAssurancePolicy:
+    def __init__(self, layout: _RootLayout):
+        self.layout = layout
+
     def derive(self, parent, _readback, _checks) -> AssuranceRequirement:
-        strict = parent.runtime_subject.ticket_key == _ROOT_STRICT_TICKET
+        strict = parent.runtime_subject.ticket_key == self.layout.strict_ticket_key
         return AssuranceRequirement(
             policy_id="policy:local-root-candidate",
             policy_version="1",
@@ -790,8 +873,9 @@ class _RootFormalReviewer:
         authority_record_digest="9" * 64,
     )
 
-    def __init__(self, repository: _RootGitRepository):
+    def __init__(self, repository: _RootGitRepository, layout: _RootLayout):
         self.repository = repository
+        self.layout = layout
         self.calls: list[dict[str, str | None]] = []
 
     def review(self, action):
@@ -805,7 +889,7 @@ class _RootFormalReviewer:
         initial = _git(
             self.repository.path,
             "rev-parse",
-            f"{self.repository.candidate_refs[('issue:102', 'initial')]}^{{commit}}",
+            f"{self.repository.candidate_refs[(self.layout.ticket_keys[1], 'initial')]}^{{commit}}",
         )
         if action.subject.candidate_commit_oid == initial:
             finding = FormalReviewFinding(
@@ -848,21 +932,27 @@ class _RootNoopInvalidationReporter:
 
 
 class _RootCandidateGateRunner:
-    def __init__(self, repository: _RootGitRepository, store: _RootCandidateStore):
+    def __init__(
+        self,
+        repository: _RootGitRepository,
+        store: _RootCandidateStore,
+        layout: _RootLayout,
+    ):
         self.repository = repository
         self.store = store
+        self.layout = layout
         self.reader = GitCandidateReader(
             repository_path=repository.path,
             base_reader=_RootBaseReader(repository),
         )
-        self.checks = _RootCandidateChecks()
-        self.policy = _RootAssurancePolicy()
-        self.reviewer = _RootFormalReviewer(repository)
+        self.checks = _RootCandidateChecks(layout)
+        self.policy = _RootAssurancePolicy(layout)
+        self.reviewer = _RootFormalReviewer(repository, layout)
         self.verifier = _RootRepairVerifier()
         self.results: dict[str, object] = {}
 
     def _parent(self, action: WorkRunAction) -> CandidateGateParent:
-        standard = action.ticket_key in _ROOT_STANDARD_TICKETS
+        standard = action.ticket_key in self.layout.standard_ticket_keys
         authority = digest_value(
             {
                 "kind": "root-worker-authority.v1",
@@ -884,20 +974,18 @@ class _RootCandidateGateRunner:
             stable_action_id=action.runtime_binding_id
             or f"binding:root:{action.ticket_key}",
         )
-        number = int(action.ticket_key.split(":", 1)[1])
         return CandidateGateParent(
             runtime_subject=subject,
-            ticket_contract_digest=_root_ticket(action.ticket_key, number)["source"][
-                "digest"
-            ],
+            ticket_contract_digest=self.layout.ticket_source_digests[action.ticket_key],
             policy_witness_digest=_policy()["digest"],
             workspace_identity=f"workspace:root:{action.ticket_key}",
         )
 
     def _gate(self, action: WorkRunAction) -> CandidateGate:
-        strict = action.ticket_key == _ROOT_STRICT_TICKET
+        strict = action.ticket_key == self.layout.strict_ticket_key
         protected = (_root_path_token("src/root/strict-surface.py"),) if strict else ()
         mode = "strict" if strict else "standard"
+        ordinal = self.layout.ticket_keys.index(action.ticket_key) + 1
         return CandidateGate(
             invalidation_reporter=_RootNoopInvalidationReporter(),
             candidate_reader=self.reader,
@@ -908,7 +996,7 @@ class _RootCandidateGateRunner:
             acceptance_facts=CandidateAcceptanceFacts(
                 target_branch=_TARGET_BRANCH,
                 integration_node_key=f"integration:{action.ticket_key}",
-                accepted_sequence=100 + int(action.ticket_key.split(":", 1)[1]),
+                accepted_sequence=100 + ordinal,
                 check_environment_digest=digest_value(
                     {"kind": "root-check-environment.v1", "mode": mode}
                 ),
@@ -955,7 +1043,7 @@ class _RootCandidateGateRunner:
         parent = self._parent(action)
         gate = self._gate(action)
         ticket_key = action.ticket_key
-        if ticket_key == "issue:102":
+        if ticket_key == self.layout.ticket_keys[1]:
             initial_ref = self.repository.candidate_refs[(ticket_key, "initial")]
             reviewed = gate.gate_candidate(parent, initial_ref)
             self._persist(action, "initial", reviewed)
@@ -970,12 +1058,12 @@ class _RootCandidateGateRunner:
             )
             packet = reviewed.repair_packet.with_ledger(ledger.entries)
             repaired_ref = self.repository.candidate_refs[(ticket_key, "repaired")]
-            repaired = self.reader.read_candidate(_REPOSITORY, repaired_ref)
+            repaired = self.reader.read_candidate(self.layout.repository, repaired_ref)
             result = gate.verify_repair(parent, packet, repaired.candidate)
             result = self._bind_result_to_action(action, result)
             self._persist(action, "repair", result)
             return result
-        if ticket_key == "issue:103":
+        if ticket_key == self.layout.ticket_keys[2]:
             rejected_ref = self.repository.candidate_refs[(ticket_key, "rejected")]
             rejected = gate.gate_candidate(parent, rejected_ref)
             self._persist(action, "initial", rejected)
@@ -1347,9 +1435,15 @@ class _RootHostedDriver:
 
 
 class _RootBatchDelivery:
-    def __init__(self, store_path: Path, repository: _RootGitRepository):
+    def __init__(
+        self,
+        store_path: Path,
+        repository: _RootGitRepository,
+        layout: _RootLayout,
+    ):
         self.store_path = Path(store_path)
         self.repository = repository
+        self.layout = layout
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         self.journal = SqliteBatchDeliveryJournal(self.store_path)
         self.boundaries: list[str] = []
@@ -1366,7 +1460,7 @@ class _RootBatchDelivery:
             hosted=self.hosted,
             configuration=BatchIntegratorConfiguration(
                 host_member_limit=4,
-                repository_member_limits={_REPOSITORY: 4},
+                repository_member_limits={layout.repository: 4},
             ),
         )
         self.requests: dict[str, BatchDeliveryRequest] = {}
@@ -1400,21 +1494,24 @@ class _RootBatchDelivery:
         assert row is not None
         return int(row[0])
 
-    @staticmethod
-    def _group_for(ticket_key: str) -> str:
-        return "standard" if ticket_key in _ROOT_STANDARD_TICKETS else "strict"
+    def _group_for(self, ticket_key: str) -> str:
+        return (
+            "standard"
+            if ticket_key in self.layout.standard_ticket_keys
+            else "strict"
+        )
 
     def _target(self) -> BatchTarget:
         head = _git(self.repository.path, "rev-parse", "refs/heads/main^{commit}")
         tree = _git(self.repository.path, "rev-parse", f"{head}^{{tree}}")
         facts = {
-            "repository": _REPOSITORY,
+            "repository": self.layout.repository,
             "target_branch": _TARGET_BRANCH,
             "target_head_sha": head,
             "target_tree_oid": tree,
         }
         return BatchTarget(
-            repository=_REPOSITORY,
+            repository=self.layout.repository,
             target_branch=_TARGET_BRANCH,
             target_head_sha=head,
             target_tree_oid=tree,
@@ -1436,7 +1533,9 @@ class _RootBatchDelivery:
                 )
             return prior.request_digest
         member_keys = (
-            _ROOT_STANDARD_TICKETS if group == "standard" else (_ROOT_STRICT_TICKET,)
+            self.layout.standard_ticket_keys
+            if group == "standard"
+            else (self.layout.strict_ticket_key,)
         )
         if any(ticket_key not in accepted for ticket_key in member_keys):
             raise LocalAcceptanceFailure(
@@ -1673,20 +1772,23 @@ class _LocalEffects:
         delivery: object,
         scenario: str,
         root_repository: _RootGitRepository | None = None,
+        root_layout: _RootLayout | None = None,
     ):
         self.store_path = Path(store_path)
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         self.delivery = delivery
         self.scenario = scenario
         self.root_repository = root_repository
+        self.root_layout = root_layout
         self.root_store = (
             _RootCandidateStore(self.store_path) if scenario == "root" else None
         )
         self.root_gate = (
-            _RootCandidateGateRunner(root_repository, self.root_store)
+            _RootCandidateGateRunner(root_repository, self.root_store, root_layout)
             if scenario == "root"
             and root_repository is not None
             and self.root_store is not None
+            and root_layout is not None
             else None
         )
         self.gate_events: list[dict[str, Any]] = []
@@ -1850,9 +1952,9 @@ class _LocalEffects:
             "candidate_receipt_digest": candidate.digest,
             "accepted_candidate_receipt_digest": accepted.digest,
         }
-        if action.ticket_key == "issue:102":
+        if self.root_layout is not None and action.ticket_key == self.root_layout.ticket_keys[1]:
             event["repair"] = "repair_verify"
-        elif action.ticket_key == "issue:103":
+        elif self.root_layout is not None and action.ticket_key == self.root_layout.ticket_keys[2]:
             if rejected_transition is None:
                 raise LocalAcceptanceFailure(
                     "replacement Candidate was accepted without a persisted rejection"
@@ -1861,7 +1963,7 @@ class _LocalEffects:
                 "candidate_receipt"
             ]["receipt_digest"]
             event["repair"] = "replacement_candidate"
-        elif action.ticket_key == _ROOT_STRICT_TICKET:
+        elif self.root_layout is not None and action.ticket_key == self.root_layout.strict_ticket_key:
             event["specialist_review"] = "accepted"
         self.gate_events.append(event)
         observation = WorkRunObservation(
@@ -1960,6 +2062,7 @@ class _Harness:
     run_id: str
     handle: CampaignHandle
     root_repository: _RootGitRepository | None
+    root_layout: _RootLayout | None
     effects: _LocalEffects
     delivery: object
     control: PlanControl
@@ -2134,6 +2237,9 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
         raise LocalAcceptanceFailure("root readback requires the real root repository")
     if not isinstance(effects.delivery, _RootBatchDelivery):
         raise LocalAcceptanceFailure("root readback requires BatchIntegrator delivery")
+    if effects.root_layout is None:
+        raise LocalAcceptanceFailure("root readback requires a Ticket manifest")
+    layout = effects.root_layout
 
     observations = effects.canonical_readbacks()
     semantic_observations = [
@@ -2150,7 +2256,7 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
     transitions = effects.root_store.transitions()
     accepted_by_ticket: dict[str, dict[str, Any]] = {}
     diff_by_digest: dict[str, dict[str, Any]] = {}
-    for ticket_key in _ROOT_TICKET_KEYS:
+    for ticket_key in layout.ticket_keys:
         ticket_transitions = [
             item for item in transitions if item["ticket_key"] == ticket_key
         ]
@@ -2199,7 +2305,7 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
             observation.result_integrity.accepted_candidate_receipt_digest
         ),
     )
-    if len(result_observations) != len(_ROOT_TICKET_KEYS):
+    if len(result_observations) != len(layout.ticket_keys):
         raise LocalAcceptanceFailure("root delivery readback omitted a Work Run")
     proofs = [
         _delivery_from_result_proof(observation.result_integrity)
@@ -2213,8 +2319,8 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
     group_records = effects.delivery.group_facts()
     ordered_batches: list[dict[str, Any]] = []
     for group, expected_members in (
-        ("standard", _ROOT_STANDARD_TICKETS),
-        ("strict", (_ROOT_STRICT_TICKET,)),
+        ("standard", layout.standard_ticket_keys),
+        ("strict", (layout.strict_ticket_key,)),
     ):
         member_proofs = [proof_by_ticket[ticket_key] for ticket_key in expected_members]
         identities = {
@@ -2322,12 +2428,12 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
     )
     candidate_objects = []
     final_variants = {
-        "issue:101": "accepted",
-        "issue:102": "repaired",
-        "issue:103": "replacement",
-        "issue:104": "accepted",
+        layout.ticket_keys[0]: "accepted",
+        layout.ticket_keys[1]: "repaired",
+        layout.ticket_keys[2]: "replacement",
+        layout.ticket_keys[3]: "accepted",
     }
-    for ticket_key in _ROOT_TICKET_KEYS:
+    for ticket_key in layout.ticket_keys:
         reference = effects.root_repository.candidate_refs[
             (ticket_key, final_variants[ticket_key])
         ]
@@ -2363,14 +2469,14 @@ def _canonical_root_readback(effects: _LocalEffects) -> dict[str, Any]:
         "observations": observations,
         "candidate_receipts": [
             candidates_by_ticket[ticket_key].canonical()
-            for ticket_key in _ROOT_TICKET_KEYS
+            for ticket_key in layout.ticket_keys
         ],
         "candidate_diffs": [
             diff_by_digest[candidates_by_ticket[ticket_key].diff_record_digest]
-            for ticket_key in _ROOT_TICKET_KEYS
+            for ticket_key in layout.ticket_keys
         ],
         "accepted_candidate_receipts": [
-            accepted_by_ticket[ticket_key] for ticket_key in _ROOT_TICKET_KEYS
+            accepted_by_ticket[ticket_key] for ticket_key in layout.ticket_keys
         ],
         "delivery_proofs": [proof.canonical() for proof in proofs],
         "result_integrities": [
@@ -2435,12 +2541,17 @@ def _diagnostics_record(
 
 
 def _install_harness(
-    root: Path, run_id: str, scenario: str
+    root: Path,
+    run_id: str,
+    scenario: str,
+    root_layout: _RootLayout | None = None,
 ) -> tuple[_Harness, CampaignHandle]:
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     root_repository = (
-        _initialize_root_git_repository(root) if scenario == "root" else None
+        _initialize_root_git_repository(root, root_layout)
+        if scenario == "root" and root_layout is not None
+        else None
     )
     if root_repository is None:
         repository_root = root / "repository"
@@ -2451,28 +2562,34 @@ def _install_harness(
     sqlite_root = root / "sqlite"
     sqlite_root.mkdir(parents=True, exist_ok=True)
     artifacts = ArtifactStore(root / "artifacts")
-    ticket_keys = _ROOT_TICKET_KEYS if scenario == "root" else (_TICKET_KEY,)
+    ticket_keys = (
+        root_layout.ticket_keys
+        if scenario == "root" and root_layout is not None
+        else (_TICKET_KEY,)
+    )
     planning_gateway = _LocalPlanningGateway(
         artifacts,
         [],
         ticket_keys=ticket_keys,
         exclusive_resources=(
-            {ticket_key: () for ticket_key in _ROOT_STANDARD_TICKETS}
-            | {_ROOT_STRICT_TICKET: ("repository.target.v1",)}
-            if scenario == "root"
+            {
+                ticket_key: () for ticket_key in root_layout.standard_ticket_keys
+            }
+            | {root_layout.strict_ticket_key: ("repository.target.v1",)}
+            if scenario == "root" and root_layout is not None
             else None
         ),
     )
     control = PlanControl(
-        source=_LocalSnapshotSource(ticket_keys, root_repository),
+        source=_LocalSnapshotSource(ticket_keys, root_repository, root_layout),
         artifacts=artifacts,
         gateway=planning_gateway,
         repository=InMemoryPlanRepository(writer_generation="writer:local"),
     )
     _install_start_host(_LocalStartHost(control, _campaign_key(run_id, scenario)))
     delivery = (
-        _RootBatchDelivery(sqlite_root / "delivery.sqlite3", root_repository)
-        if scenario == "root" and root_repository is not None
+        _RootBatchDelivery(sqlite_root / "delivery.sqlite3", root_repository, root_layout)
+        if scenario == "root" and root_repository is not None and root_layout is not None
         else _LocalDeliveryStub(sqlite_root / "delivery.sqlite3", scenario)
     )
     effects = _LocalEffects(
@@ -2480,12 +2597,18 @@ def _install_harness(
         delivery,
         scenario,
         root_repository,
+        root_layout,
     )
     configuration = ExecutionKernelConfiguration(
         host_worker_slots=4 if scenario == "root" else 1,
-        repository_worker_slots={_REPOSITORY: 4 if scenario == "root" else 1},
+        repository_worker_slots={
+            root_layout.repository if scenario == "root" and root_layout is not None else _REPOSITORY:
+            4 if scenario == "root" else 1
+        },
         host_stale_after_seconds=1800,
-        repository_stale_after_seconds={_REPOSITORY: 1800},
+        repository_stale_after_seconds={
+            root_layout.repository if scenario == "root" and root_layout is not None else _REPOSITORY: 1800
+        },
     )
     kernel = install_execution_kernel(
         store_path=sqlite_root / "execution.sqlite3",
@@ -2493,7 +2616,10 @@ def _install_harness(
         effects=effects,
         configuration=configuration,
     )
-    handle = gwo_v8.start(_REPOSITORY, ticket_keys)
+    handle = gwo_v8.start(
+        root_layout.repository if scenario == "root" and root_layout is not None else _REPOSITORY,
+        ticket_keys,
+    )
     return (
         _Harness(
             root=root,
@@ -2501,6 +2627,7 @@ def _install_harness(
             run_id=run_id,
             handle=handle,
             root_repository=root_repository,
+            root_layout=root_layout,
             effects=effects,
             delivery=delivery,
             control=control,
@@ -2516,6 +2643,7 @@ def _install_restart(harness: _Harness) -> None:
         _RootBatchDelivery(
             harness.root / "sqlite" / "delivery.sqlite3",
             harness.root_repository,
+            harness.root_layout,
         )
         if harness.scenario == "root" and harness.root_repository is not None
         else _LocalDeliveryStub(
@@ -2527,6 +2655,7 @@ def _install_restart(harness: _Harness) -> None:
         delivery,
         harness.scenario,
         harness.root_repository,
+        harness.root_layout,
     )
     harness.effects = effects
     harness.delivery = effects.delivery
@@ -2552,6 +2681,7 @@ def _record_digest(record: dict[str, Any]) -> dict[str, Any]:
 def _root_batch_facts(
     readback: dict[str, Any],
     work_runs: list[dict[str, Any]],
+    layout: _RootLayout,
 ) -> list[dict[str, Any]]:
     proof_by_ticket = {
         run["ticket_key"]: next(
@@ -2567,8 +2697,8 @@ def _root_batch_facts(
     }
     batches: list[dict[str, Any]] = []
     for group, member_ticket_keys, singleton in (
-        ("standard", _ROOT_STANDARD_TICKETS, False),
-        ("strict", (_ROOT_STRICT_TICKET,), True),
+        ("standard", layout.standard_ticket_keys, False),
+        ("strict", (layout.strict_ticket_key,), True),
     ):
         member_proofs = [
             proof_by_ticket[ticket_key] for ticket_key in member_ticket_keys
@@ -2637,12 +2767,187 @@ def _root_batch_facts(
     return batches
 
 
+def _root_delivery_state(
+    delivery: _RootBatchDelivery,
+    stable_action_id: str,
+) -> dict[str, Any]:
+    with _connection(delivery.store_path) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM v8_batch_delivery_actions "
+            "WHERE stable_action_id = ?",
+            (stable_action_id,),
+        ).fetchone()
+    if row is None:
+        raise LocalAcceptanceFailure(
+            "local Batch journal omitted its terminal readback"
+        )
+    state = load_canonical_json(row[0])
+    if type(state) is not dict:
+        raise LocalAcceptanceFailure("local Batch journal state is malformed")
+    return state
+
+
+def _local_batch_evidence(
+    *,
+    readback: dict[str, Any],
+    work_runs: list[dict[str, Any]],
+    harness: _Harness,
+    layout: _RootLayout,
+    campaign_key: str,
+    plan_revision_digest: str,
+) -> dict[str, Any]:
+    if not isinstance(harness.delivery, _RootBatchDelivery):
+        raise LocalAcceptanceFailure("local Batch evidence requires local delivery")
+
+    candidates = {
+        item["ticket_key"]: item for item in readback["candidate_receipts"]
+    }
+    accepted = {
+        item["ticket_key"]: item
+        for item in readback["accepted_candidate_receipts"]
+    }
+    batch_facts = {
+        item["group"]: item for item in readback["git_readback"]["batches"]
+    }
+    target_ref = f"refs/heads/{_TARGET_BRANCH}"
+    proofs: list[dict[str, Any]] = []
+    for group, member_ticket_keys in (
+        ("standard", layout.standard_ticket_keys),
+        ("strict", (layout.strict_ticket_key,)),
+    ):
+        batch = batch_facts[group]
+        member_candidates = [candidates[key] for key in member_ticket_keys]
+        member_accepted = [accepted[key] for key in member_ticket_keys]
+        action_id = batch["integration_action_id"]
+        state = _root_delivery_state(harness.delivery, action_id)
+        request = harness.delivery.group_facts()[group]["request"]
+        local_receipt = state.get("local_receipt")
+        lease = state.get("integration_lease")
+        target = state.get("target_readback")
+        if (
+            type(local_receipt) is not dict
+            or local_receipt.get("outcome") != "passed"
+            or type(lease) is not dict
+            or type(target) is not dict
+        ):
+            raise LocalAcceptanceFailure("local Batch evidence is incomplete")
+
+        batch_tree_oid = _git(
+            harness.root_repository.path,
+            "rev-parse",
+            f"{batch['batch_sha']}^{{tree}}",
+        )
+        target_before = {
+            "commit_sha": request["target"]["target_head_sha"],
+            "tree_sha": request["target"]["target_tree_oid"],
+        }
+        target_after = {
+            "commit_sha": target["target_head_sha"],
+            "tree_sha": _git(
+                harness.root_repository.path,
+                "rev-parse",
+                f"{target['target_head_sha']}^{{tree}}",
+            ),
+        }
+        target_ref_sha = target_after["commit_sha"]
+        ancestry_body = {
+            "ancestor_sha": batch["batch_sha"],
+            "descendant_sha": target_after["commit_sha"],
+            "is_ancestor": bool(batch["target_contains_batch_sha"]),
+        }
+        ancestry = {
+            **ancestry_body,
+            "readback_digest": digest_value(
+                {"kind": "local-target-ancestry.v1", **ancestry_body}
+            ),
+        }
+        target_body = {
+            "repository": layout.repository,
+            "target_branch": _TARGET_BRANCH,
+            "target_before": target_before,
+            "target_after": target_after,
+            "batch_sha": batch["batch_sha"],
+            "batch_ref_sha": batch["batch_ref_sha"],
+            "target_ref_sha": target_ref_sha,
+            "cas": {
+                "ref": target_ref,
+                "expected_sha": target_before["commit_sha"],
+                "updated_sha": target_after["commit_sha"],
+                "readback_sha": target_ref_sha,
+                "updated": target_ref_sha == target_after["commit_sha"],
+            },
+            "ancestry": ancestry,
+        }
+        target_readback = {
+            **target_body,
+            "digest": digest_value(
+                {"kind": "local-target-readback.v1", **target_body}
+            ),
+        }
+        lease_body = {
+            "serialized": dict(lease),
+            "stable_action_id": action_id,
+            "writer": request["writer_generation"],
+            "activation": request["activation_id"],
+            "digest": lease["lease_digest"],
+        }
+        local_suite = {
+            "suite_id": local_receipt["suite_id"],
+            "batch_sha": local_receipt["batch_sha"],
+            "status": local_receipt["outcome"],
+            "receipt_digest": local_receipt["receipt_digest"],
+        }
+        proof_body = {
+            "schema_version": "local_batch_proof.v1",
+            "repository": layout.repository,
+            "campaign_key": campaign_key,
+            "plan_revision_digest": plan_revision_digest,
+            "batch_id": batch["batch_id"],
+            "batch_sha": batch["batch_sha"],
+            "batch_tree_oid": batch_tree_oid,
+            "batch_ref": {
+                "ref": batch["batch_ref"],
+                "sha": batch["batch_ref_sha"],
+            },
+            "member_ticket_keys": list(member_ticket_keys),
+            "candidate_receipt_digests": [
+                item["receipt_digest"] for item in member_candidates
+            ],
+            "accepted_candidate_receipt_digests": [
+                item["receipt_digest"] for item in member_accepted
+            ],
+            "candidate_diff_record_digests": [
+                item["diff_record_digest"] for item in member_candidates
+            ],
+            "finding_ledger_digests": [
+                item["review_finding_ledger_digest"] for item in member_accepted
+            ],
+            "local_suite": local_suite,
+            "integration_lease": lease_body,
+            "target_readback": target_readback,
+        }
+        proofs.append(
+            {
+                **proof_body,
+                "receipt_digest": digest_value(
+                    {"kind": "local_batch_proof.v1", **proof_body}
+                ),
+            }
+        )
+    return {
+        "schema_version": "gwo.v8.local-evidence.v1",
+        "acceptance_mode": _LOCAL_ROOT_MODE,
+        "batches": proofs,
+    }
+
+
 def _run_root_acceptance_in_root(
     *,
     root: Path,
     run_id: str,
+    layout: _RootLayout,
 ) -> dict[str, Any]:
-    harness, handle = _install_harness(Path(root), run_id, "root")
+    harness, handle = _install_harness(Path(root), run_id, "root", layout)
     initial = gwo_v8.inspect(handle)
     transcript: list[dict[str, Any]] = [
         {"operation": "start", "campaign_key": handle.campaign_key},
@@ -2811,9 +3116,9 @@ def _run_root_acceptance_in_root(
         "tickets": [
             {
                 "ticket_key": ticket_key,
-                "assurance": _root_assurance(ticket_key),
+                "assurance": _root_assurance(ticket_key, layout),
             }
-            for ticket_key in _ROOT_TICKET_KEYS
+            for ticket_key in layout.ticket_keys
         ],
         "campaign": {"campaign_key": handle.campaign_key},
         "plan_revision": {"digest": final.plan_revision_digest},
@@ -2833,7 +3138,7 @@ def _run_root_acceptance_in_root(
         },
         "work_runs": work_runs,
         "candidate_gate": {
-            "reviewed": list(_ROOT_TICKET_KEYS),
+            "reviewed": list(layout.ticket_keys),
             "repair_required": [
                 event["ticket_key"]
                 for event in gate_events
@@ -2849,17 +3154,26 @@ def _run_root_acceptance_in_root(
                 for event in gate_events
                 if event.get("specialist_review") == "accepted"
             ],
-            "accepted": list(_ROOT_TICKET_KEYS),
+            "accepted": list(layout.ticket_keys),
             "events": gate_events,
             "transitions": candidate_transitions,
             "formal_reviewer_calls": formal_reviewer_calls,
         },
-        "batches": _root_batch_facts(readback, work_runs),
+        "batches": _root_batch_facts(readback, work_runs, layout),
         "git_readback": readback["git_readback"],
         "readback": readback,
     }
+    local_evidence = _local_batch_evidence(
+        readback=readback,
+        work_runs=work_runs,
+        harness=harness,
+        layout=layout,
+        campaign_key=handle.campaign_key,
+        plan_revision_digest=final.plan_revision_digest,
+    )
     record = {
-        "schema_version": "gwo.v8.local-root-canary.v1",
+        "schema_version": _LOCAL_ROOT_SCHEMA,
+        "acceptance_mode": _LOCAL_ROOT_MODE,
         "gate": LOCAL_ROOT_CANARY_GO,
         "scenario": "root",
         "run_id": run_id,
@@ -2872,6 +3186,7 @@ def _run_root_acceptance_in_root(
             "campaign_key": handle.campaign_key,
         },
         "facts": facts,
+        "local_evidence": local_evidence,
         "transcript": transcript,
         "replay": replay,
         "failure": None,
@@ -2884,13 +3199,18 @@ def _run_local_acceptance_in_root(
     root: Path,
     run_id: str = "phase1-single",
     scenario: str = "single",
+    root_layout: _RootLayout | None = None,
 ) -> dict[str, Any]:
     """Run one local acceptance scenario and return its JSON record."""
 
     if type(run_id) is not str or not run_id:
         raise ValueError("run_id must be non-empty text")
     if scenario == "root":
-        return _run_root_acceptance_in_root(root=Path(root), run_id=run_id)
+        if root_layout is None:
+            raise LocalAcceptanceFailure("ROOT_TICKET_MANIFEST_REQUIRED")
+        return _run_root_acceptance_in_root(
+            root=Path(root), run_id=run_id, layout=root_layout
+        )
     if scenario not in {"single", "wait", "blocked", "failure"}:
         raise ValueError("scenario must be single, wait, blocked, or failure")
 
@@ -3057,9 +3377,11 @@ def run_local_acceptance(
     root: Path,
     run_id: str = "phase1-single",
     scenario: str = "single",
+    tickets: Path | Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Run one isolated local acceptance scenario and return its JSON record."""
 
+    root_layout = _root_layout(tickets) if scenario == "root" else None
     caller_root = Path(root).resolve()
     caller_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -3071,6 +3393,7 @@ def run_local_acceptance(
                 root=Path(isolated_root),
                 run_id=run_id,
                 scenario=scenario,
+                root_layout=root_layout,
             )
         finally:
             gc.collect()
@@ -3091,6 +3414,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("single", "wait", "blocked", "failure", "root"),
         default="single",
     )
+    parser.add_argument(
+        "--tickets",
+        type=Path,
+        help="validated real root Ticket manifest (required for root)",
+    )
     args = parser.parse_args(argv)
     if args.root is None:
         import tempfile
@@ -3100,6 +3428,7 @@ def main(argv: list[str] | None = None) -> int:
                 root=Path(temporary),
                 run_id=args.run_id,
                 scenario=args.scenario,
+                tickets=args.tickets,
             )
             gc.collect()
     else:
@@ -3107,6 +3436,7 @@ def main(argv: list[str] | None = None) -> int:
             root=args.root,
             run_id=args.run_id,
             scenario=args.scenario,
+            tickets=args.tickets,
         )
     sys.stdout.write(canonical_json(record) + "\n")
     return 0

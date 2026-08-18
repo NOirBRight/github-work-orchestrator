@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -15,6 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_v8_local_acceptance.py"
+ROOT_TICKETS = ROOT / "tests" / "fixtures" / "gwo-v8-root-canary-tickets-195-198.json"
 
 
 def _load_runner():
@@ -49,6 +51,43 @@ def _patch_runner_root_lifecycle(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(runner.tempfile, "TemporaryDirectory", temporary_directory)
+
+
+def _run_root(runner, root: Path, run_id: str):
+    return runner.run_local_acceptance(
+        root=root,
+        run_id=run_id,
+        scenario="root",
+        tickets=ROOT_TICKETS,
+    )
+
+
+def _assert_local_evidence_has_no_hosted_or_remote_keys(value: object) -> None:
+    forbidden = {
+        "pr",
+        "pullrequest",
+        "hosted",
+        "hostedci",
+        "ci",
+        "workflow",
+        "workflowrun",
+        "workflowurl",
+        "publication",
+        "publicationreceipt",
+        "remotetarget",
+        "runid",
+        "cirunid",
+        "check",
+        "checkid",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            assert normalized not in forbidden, key
+            _assert_local_evidence_has_no_hosted_or_remote_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_local_evidence_has_no_hosted_or_remote_keys(item)
 
 
 def test_single_acceptance_uses_public_api_and_reaches_complete(tmp_path: Path):
@@ -394,14 +433,15 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
         root=tmp_path,
         run_id="root-run",
         scenario="root",
+        tickets=ROOT_TICKETS,
     )
 
     assert record["gate"] == "LOCAL_ROOT_CANARY_GO"
     assert record["status"] == "Complete"
     assert record["public_status"] == "Complete"
 
-    standard = ("issue:101", "issue:102", "issue:103")
-    strict = "issue:104"
+    standard = ("issue:195", "issue:196", "issue:197")
+    strict = "issue:198"
     facts = record["facts"]
     assert [item["ticket_key"] for item in facts["work_runs"]] == [
         *standard,
@@ -415,24 +455,24 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
         "work_run_count": 4,
     }
     assert facts["exclusive_resources"] == {
-        "issue:101": [],
-        "issue:102": [],
-        "issue:103": [],
-        "issue:104": ["repository.target.v1"],
+        "issue:195": [],
+        "issue:196": [],
+        "issue:197": [],
+        "issue:198": ["repository.target.v1"],
     }
 
     gate = facts["candidate_gate"]
     assert gate["reviewed"] == [*standard, strict]
-    assert gate["repair_required"] == ["issue:102"]
-    assert gate["rejected"] == ["issue:103"]
+    assert gate["repair_required"] == ["issue:196"]
+    assert gate["rejected"] == ["issue:197"]
     assert gate["strict_specialist_review"] == [strict]
     assert gate["accepted"] == [*standard, strict]
     gate_events = {item["ticket_key"]: item for item in gate["events"]}
-    assert gate_events["issue:102"]["repair"] == "repair_verify"
-    assert gate_events["issue:103"]["repair"] == "replacement_candidate"
+    assert gate_events["issue:196"]["repair"] == "repair_verify"
+    assert gate_events["issue:197"]["repair"] == "replacement_candidate"
     assert (
-        gate_events["issue:103"]["rejected_candidate_receipt_digest"]
-        != gate_events["issue:103"]["candidate_receipt_digest"]
+        gate_events["issue:197"]["rejected_candidate_receipt_digest"]
+        != gate_events["issue:197"]["candidate_receipt_digest"]
     )
     assert gate_events[strict]["specialist_review"] == "accepted"
 
@@ -524,6 +564,7 @@ def test_root_canary_persists_authoritative_candidate_gate_transitions(
         root=tmp_path,
         run_id="root-candidate-transitions",
         scenario="root",
+        tickets=ROOT_TICKETS,
     )
 
     transitions = record["facts"]["candidate_gate"]["transitions"]
@@ -531,19 +572,19 @@ def test_root_canary_persists_authoritative_candidate_gate_transitions(
     for transition in transitions:
         by_ticket.setdefault(transition["ticket_key"], []).append(transition)
 
-    assert [item["status"] for item in by_ticket["issue:101"]] == ["review_accepted"]
-    assert [item["status"] for item in by_ticket["issue:102"]] == [
+    assert [item["status"] for item in by_ticket["issue:195"]] == ["review_accepted"]
+    assert [item["status"] for item in by_ticket["issue:196"]] == [
         "repair_required",
         "repair_accepted",
     ]
-    assert [item["status"] for item in by_ticket["issue:103"]] == [
+    assert [item["status"] for item in by_ticket["issue:197"]] == [
         "ordinary_rejected",
         "review_accepted",
     ]
-    assert [item["status"] for item in by_ticket["issue:104"]] == ["review_accepted"]
+    assert [item["status"] for item in by_ticket["issue:198"]] == ["review_accepted"]
     assert (
-        by_ticket["issue:103"][0]["candidate_receipt"]["candidate_commit_oid"]
-        != (by_ticket["issue:103"][1]["candidate_receipt"]["candidate_commit_oid"])
+        by_ticket["issue:197"][0]["candidate_receipt"]["candidate_commit_oid"]
+        != (by_ticket["issue:197"][1]["candidate_receipt"]["candidate_commit_oid"])
     )
     assert all(transition["persisted"] is True for transition in transitions)
 
@@ -567,6 +608,7 @@ def test_root_canary_uses_public_advance_for_watchdog_lost_wake_duplicate_and_re
         root=tmp_path,
         run_id="root-replay",
         scenario="root",
+        tickets=ROOT_TICKETS,
     )
 
     replay = record["replay"]
@@ -602,6 +644,8 @@ def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
         "root-cli-run",
         "--scenario",
         "root",
+        "--tickets",
+        str(ROOT_TICKETS),
     ]
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -643,7 +687,7 @@ def test_root_candidate_readback_uses_real_git_commit_tree_and_diff(
 ):
     runner = _load_runner()
     _patch_runner_root_lifecycle(runner, tmp_path, monkeypatch)
-    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-git-readback", scenario="root")
+    record = _run_root(runner, tmp_path, "task2-git-readback")
     repository = tmp_path / "repository"
     candidates = record["facts"]["git_readback"]["candidate_objects"]
     assert len(candidates) == 4
@@ -673,12 +717,12 @@ def test_root_batch_delivery_uses_real_batch_integrator_and_git_readback(
 ):
     runner = _load_runner()
     _patch_runner_root_lifecycle(runner, tmp_path, monkeypatch)
-    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-batch-readback", scenario="root")
+    record = _run_root(runner, tmp_path, "task2-batch-readback")
     repository = tmp_path / "repository"
     batches = record["facts"]["git_readback"]["batches"]
     assert [batch["member_ticket_keys"] for batch in batches] == [
-        ["issue:101", "issue:102", "issue:103"],
-        ["issue:104"],
+        ["issue:195", "issue:196", "issue:197"],
+        ["issue:198"],
     ]
     assert all(batch["batch_ref_sha"] == batch["batch_sha"] for batch in batches)
     assert all(batch["target_contains_batch_sha"] for batch in batches)
@@ -703,7 +747,7 @@ def test_root_watchdog_callback_lost_wake_duplicate_and_restart_are_public_advan
         return original(handle, wake_ref, **kwargs)
 
     monkeypatch.setattr(runner.gwo_v8, "advance", traced)
-    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-watchdog", scenario="root")
+    record = _run_root(runner, tmp_path, "task2-watchdog")
     replay = record["replay"]
     assert replay["watchdog_progressed"] is True
     assert replay["lost_wake"]["status"] == "Complete"
@@ -718,7 +762,10 @@ def test_root_watchdog_first_callback_routed_through_public_advancer_before_dupl
 ):
     runner = _load_runner()
     record = runner.run_local_acceptance(
-        root=tmp_path, run_id="task2-public-advancer", scenario="root"
+        root=tmp_path,
+        run_id="task2-public-advancer",
+        scenario="root",
+        tickets=ROOT_TICKETS,
     )
     replay = record["replay"]
     callback_ref = replay["callback_emitted"]
@@ -729,27 +776,138 @@ def test_root_watchdog_first_callback_routed_through_public_advancer_before_dupl
 
 def test_root_worker_slots_release_and_strict_resource_is_exclusive(tmp_path: Path):
     runner = _load_runner()
-    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-resources", scenario="root")
+    record = _run_root(runner, tmp_path, "task2-resources")
     concurrency = record["facts"]["concurrency"]
     resources = record["facts"]["exclusive_resources"]
     assert concurrency["worker_slot_limit"] == 4
     assert concurrency["max_held"] == 4
     assert concurrency["final_held"] == 0
     assert concurrency["final_available"] == 4
-    assert resources["issue:101"] == []
-    assert resources["issue:102"] == []
-    assert resources["issue:103"] == []
-    assert resources["issue:104"] == ["repository.target.v1"]
+    assert resources["issue:195"] == []
+    assert resources["issue:196"] == []
+    assert resources["issue:197"] == []
+    assert resources["issue:198"] == ["repository.target.v1"]
 
 
 def test_root_acceptance_is_canonical_across_independent_roots(tmp_path: Path):
     runner = _load_runner()
-    first = runner.run_local_acceptance(
-        root=tmp_path / "first-root", run_id="task2-deterministic", scenario="root"
-    )
-    second = runner.run_local_acceptance(
-        root=tmp_path / "second-root", run_id="task2-deterministic", scenario="root"
-    )
+    first = _run_root(runner, tmp_path / "first-root", "task2-deterministic")
+    second = _run_root(runner, tmp_path / "second-root", "task2-deterministic")
     assert first["record_digest"] == second["record_digest"]
     assert runner.canonical_json(first) == runner.canonical_json(second)
     assert len(first["facts"]["git_readback"]["candidate_objects"]) == 4
+
+
+def test_local_only_root_uses_real_manifest_and_projects_local_batch_proofs(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+
+    record = runner.run_local_acceptance(
+        root=tmp_path,
+        run_id="task2-local-only",
+        scenario="root",
+        tickets=ROOT_TICKETS,
+    )
+
+    assert record["schema_version"] == "gwo.v8.local-root-acceptance.v1"
+    assert record["acceptance_mode"] == "local-only-v1"
+    assert [item["ticket_key"] for item in record["facts"]["tickets"]] == [
+        "issue:195",
+        "issue:196",
+        "issue:197",
+        "issue:198",
+    ]
+    assert [item["ticket_key"] for item in record["facts"]["work_runs"]] == [
+        "issue:195",
+        "issue:196",
+        "issue:197",
+        "issue:198",
+    ]
+
+    batches = record["local_evidence"]["batches"]
+    assert len(batches) == 2
+    assert [item["member_ticket_keys"] for item in batches] == [
+        ["issue:195", "issue:196", "issue:197"],
+        ["issue:198"],
+    ]
+    for batch in batches:
+        assert batch["schema_version"] == "local_batch_proof.v1"
+        assert batch["batch_ref"]["sha"] == batch["batch_sha"]
+        assert batch["batch_tree_oid"]
+        assert batch["candidate_receipt_digests"]
+        assert batch["candidate_diff_record_digests"]
+        assert batch["finding_ledger_digests"]
+        assert batch["local_suite"]["batch_sha"] == batch["batch_sha"]
+        assert batch["local_suite"]["status"] == "passed"
+        assert batch["local_suite"]["receipt_digest"]
+        assert batch["integration_lease"]["serialized"]
+        assert batch["integration_lease"]["stable_action_id"]
+        assert batch["integration_lease"]["writer"]
+        assert batch["integration_lease"]["activation"]
+        assert batch["integration_lease"]["digest"]
+        assert batch["target_readback"]["target_before"]["commit_sha"]
+        assert batch["target_readback"]["target_after"]["commit_sha"]
+        assert batch["target_readback"]["cas"]["updated"] is True
+        assert batch["target_readback"]["ancestry"]["is_ancestor"] is True
+        assert batch["target_readback"]["digest"]
+        assert batch["receipt_digest"]
+
+    _assert_local_evidence_has_no_hosted_or_remote_keys(record["local_evidence"])
+
+
+def test_local_only_root_binds_candidate_parents_to_manifest_source_digests(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+    manifest = json.loads(ROOT_TICKETS.read_text(encoding="utf-8"))
+    source_digests = {
+        ticket["key"]: ticket["source"]["digest"]
+        for ticket in manifest["tickets"]
+    }
+
+    record = runner.run_local_acceptance(
+        root=tmp_path,
+        run_id="task2-manifest-parent",
+        scenario="root",
+        tickets=manifest,
+    )
+
+    accepted_transitions = [
+        transition
+        for transition in record["facts"]["candidate_gate"]["transitions"]
+        if transition["status"] in {"review_accepted", "repair_accepted"}
+    ]
+    assert len(accepted_transitions) == 4
+    for transition in accepted_transitions:
+        ticket_key = transition["ticket_key"]
+        assert (
+            transition["review_subject"]["ticket_contract_digest"]
+            == source_digests[ticket_key]
+        )
+        assert (
+            transition["candidate_receipt"]["parent_digest"]
+            == transition["review_subject"]["parent_digest"]
+        )
+
+
+def test_real_root_ticket_manifest_is_required_before_creating_an_isolated_root(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+
+    with pytest.raises(runner.LocalAcceptanceFailure, match="ROOT_TICKET_MANIFEST_REQUIRED"):
+        runner.run_local_acceptance(root=tmp_path, run_id="missing", scenario="root")
+
+    invalid = tmp_path / "invalid.json"
+    invalid_manifest = json.loads(ROOT_TICKETS.read_text(encoding="utf-8"))
+    invalid_manifest["ready_refs"][0] = "issue:196"
+    invalid.write_bytes(runner.manifest_json_bytes(invalid_manifest))
+    with pytest.raises(runner.LocalAcceptanceFailure, match="ROOT_TICKET_REAL_ISSUES_REQUIRED"):
+        runner.run_local_acceptance(
+            root=tmp_path / "invalid-root",
+            run_id="invalid",
+            scenario="root",
+            tickets=invalid,
+        )
+    assert not (tmp_path / "invalid-root").exists()
