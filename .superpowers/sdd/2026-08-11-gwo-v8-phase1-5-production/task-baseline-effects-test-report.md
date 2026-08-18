@@ -3,8 +3,11 @@
 - Date: 2026-08-18 (Asia/Shanghai)
 - Repository: `D:\Workstation\github-work-orchestrator`
 - Baseline branch commit: `23abca3`
+- Previous repair commit: `e3e9748d9f082714d902002a8e452f543d7b4053`
 - `origin/main`: `c2a3805`
-- Scope: one test-only timing adjustment for
+- Scope: test-only timing adjustments for both restart recovery tests:
+  `test_restart_recovers_a_dispatched_runtime_effect_without_duplicate_provider_call`
+  and
   `test_restart_recovers_an_unmarked_runtime_effect_without_duplicate_provider_call`.
 
 ## TDD evidence
@@ -22,12 +25,19 @@ The same focused command happened to pass 20/20 times during this session;
 that is consistent with the reported intermittent failure and is not treated
 as evidence that the original timing bound was reliable.
 
+After the first repair, a fresh full pytest run reported `2961 passed, 52
+skipped, 1 failed`; the remaining failure was
+`test_restart_recovers_a_dispatched_runtime_effect_without_duplicate_provider_call`
+with `EFFECT_EXECUTION_IN_PROGRESS`. The sibling test still used the same
+non-contractual `0.01` second override, and it also used `0.01` at exact
+`origin/main`.
+
 ### GREEN
 
 The only code change is in
-`tests/test_v8_production_effects.py`: the target test now monkeypatches
-`_EFFECT_CLAIM_WAIT_SECONDS` to `0.05` instead of `0.01`. The poll interval and
-all recovery assertions are unchanged.
+`tests/test_v8_production_effects.py`: both restart recovery tests now
+monkeypatch `_EFFECT_CLAIM_WAIT_SECONDS` to `0.05` instead of `0.01`. The poll
+intervals and all recovery assertions are unchanged.
 
 ## Why the timing bound is non-contractual
 
@@ -41,24 +51,20 @@ semantics were not changed.
 
 ## Verification
 
-Focused repeated run, ten independent pytest processes with unique temporary
-directories:
+Both restart recovery tests were run together in ten independent pytest
+processes with unique temporary directories:
 
 ```powershell
-for($i=1;$i -le 10;$i++) {
-  $base=Join-Path $env:TEMP ("gwo-v8-final-focused-{0}-{1}" -f $PID,$i)
-  py -3.13 -B -m pytest -q tests/test_v8_production_effects.py `
-    -k test_restart_recovers_an_unmarked_runtime_effect_without_duplicate_provider_call `
-    --basetemp $base
-}
+$passed=0; $failed=0; $lines=@(); for($i=1;$i -le 10;$i++){ $base=Join-Path $env:TEMP ("gwo-v8-restart-pair-{0}-{1}" -f $PID,$i); & py -3.13 -B -m pytest -q 'tests/test_v8_production_effects.py' -k '(test_restart_recovers_a_dispatched_runtime_effect_without_duplicate_provider_call or test_restart_recovers_an_unmarked_runtime_effect_without_duplicate_provider_call)' --basetemp $base 2>&1 | Out-Null; $code=$LASTEXITCODE; if($code -eq 0){$passed++}else{$failed++}; $lines += ('run {0}: exit {1}' -f $i,$code); }; $lines; 'restart-pair summary: {0} passed, {1} failed' -f $passed,$failed; if($failed -ne 0){exit 1}
 ```
 
-Result: **10 passed, 0 failed** (each run exited 0).
+Result: **10 passed, 0 failed** (each process ran both tests: 20 test
+executions, all passed; every process exited 0).
 
 Whole production-effects suite:
 
 ```powershell
-$base=Join-Path $env:TEMP ("gwo-v8-final-suite-{0}" -f $PID)
+$base=Join-Path $env:TEMP ("gwo-v8-final-suite-second-{0}" -f $PID)
 py -3.13 -B -m pytest -q tests/test_v8_production_effects.py --basetemp $base
 ```
 
