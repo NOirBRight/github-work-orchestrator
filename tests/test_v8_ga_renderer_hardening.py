@@ -16,6 +16,68 @@ from tests.test_v8_release_metadata import (
 )
 
 
+def _rehash_bridge(bridge: dict[str, object]) -> dict[str, object]:
+    body = {key: value for key, value in bridge.items() if key != "bridge_digest"}
+    return body | {"bridge_digest": renderer.digest_value(body)}
+
+
+def _with_canonical_receipt(payload: dict[str, object]) -> dict[str, object]:
+    body = {key: value for key, value in payload.items() if key != "receipt_digest"}
+    return body | {"receipt_digest": renderer.digest_value(body)}
+
+
+def _valid_renderer_bridge_fixture(tmp_path):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    evidence_refs = [f"github://canary-evidence/{index}" for index in range(19)]
+
+    canary_payload = json.loads(
+        json.dumps(source_payloads["production_canary"][1])
+    )
+    canary_payload.update(
+        {
+            "evidence_readback_count": 19,
+            "evidence_refs": evidence_refs,
+        }
+    )
+    canary_payload = _with_canonical_receipt(canary_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_canary", canary_payload
+    )
+    bridge["production_canary"]["readback_receipt_digest"] = canary_payload[
+        "receipt_digest"
+    ]
+    bridge = _rehash_bridge(bridge)
+
+    activation_payload = json.loads(
+        json.dumps(source_payloads["production_activation"][1])
+    )
+    activation_payload["transition_record"]["canary_evidence_refs"] = evidence_refs
+    activation_payload = _with_canonical_receipt(activation_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_activation", activation_payload
+    )
+    bridge["production_activation"]["readback_receipt_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+
+    default_payload = json.loads(
+        (tmp_path / "default-writer-readback.json").read_text(encoding="utf-8")
+    )
+    default_payload["activation_readback_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+    default_payload = _with_canonical_receipt(default_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "default_writer", default_payload
+    )
+    bridge["default_writer"]["readback_receipt_digest"] = default_payload[
+        "receipt_digest"
+    ]
+    bridge = _rehash_bridge(bridge)
+
+    return _rehash_bridge(bridge), evidence_refs
+
+
 def _canary_payload_with_digest(
     payload: dict[str, object], digest: str
 ) -> dict[str, object]:
@@ -240,3 +302,92 @@ def test_direct_renderer_script_help_has_a_working_import_path():
 
     assert result.returncode == 0, result.stderr
     assert "--evidence-bridge" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("evidence_ref_count", "evidence_refs"),
+    (
+        (1, []),
+        (19, []),
+        (19, ["github://canary-evidence/0"]),
+        (18, [f"github://canary-evidence/{index}" for index in range(18)]),
+    ),
+)
+def test_renderer_rejects_incomplete_production_canary_evidence_refs(
+    tmp_path, evidence_ref_count, evidence_refs
+):
+    bridge, _complete_refs = _valid_renderer_bridge_fixture(tmp_path)
+    canary_payload = json.loads(
+        (tmp_path / "production-canary-readback.json").read_text(encoding="utf-8")
+    )
+    canary_payload.update(
+        {
+            "evidence_ref_count": evidence_ref_count,
+            "evidence_readback_count": evidence_ref_count,
+            "evidence_refs": evidence_refs,
+        }
+    )
+    canary_payload = _with_canonical_receipt(canary_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_canary", canary_payload
+    )
+    bridge["production_canary"]["evidence_ref_count"] = evidence_ref_count
+    bridge["production_canary"]["readback_receipt_digest"] = canary_payload[
+        "receipt_digest"
+    ]
+
+    activation_payload = json.loads(
+        (tmp_path / "production-activation-readback.json").read_text(encoding="utf-8")
+    )
+    activation_payload["transition_record"]["canary_evidence_refs"] = evidence_refs
+    activation_payload = _with_canonical_receipt(activation_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_activation", activation_payload
+    )
+    bridge["production_activation"]["readback_receipt_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+
+    default_payload = json.loads(
+        (tmp_path / "default-writer-readback.json").read_text(encoding="utf-8")
+    )
+    default_payload["activation_readback_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+    default_payload = _with_canonical_receipt(default_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "default_writer", default_payload
+    )
+    bridge["default_writer"]["readback_receipt_digest"] = default_payload[
+        "receipt_digest"
+    ]
+    bridge = _rehash_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize(
+    "section",
+    ("production_activation", "default_writer", "production_canary"),
+)
+def test_renderer_recomputes_complete_producer_receipt_digest(
+    tmp_path, section
+):
+    bridge, _complete_refs = _valid_renderer_bridge_fixture(tmp_path)
+    _render_with_bridge(tmp_path / "baseline", bridge)
+
+    payload_path = {
+        "production_activation": tmp_path / "production-activation-readback.json",
+        "default_writer": tmp_path / "default-writer-readback.json",
+        "production_canary": tmp_path / "production-canary-readback.json",
+    }[section]
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    if section == "production_activation":
+        payload["transition_record"]["integrity_mutation"] = {"changed": True}
+    else:
+        payload["integrity_mutation"] = {"changed": True}
+    bridge = _renderer_bridge_with_source_payload(tmp_path, bridge, section, payload)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path / "tampered", bridge)

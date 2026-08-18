@@ -24,7 +24,9 @@ if __package__ in {None, ""}:
 
 from scripts.verify_v8_ga_release import (
     DYNAMIC_METADATA_FIELDS,
+    PRODUCTION_CANARY_EVIDENCE_REF_COUNT,
     ReleaseGateError,
+    _canonical_readback_payload,
     digest_value,
     _reject_local_hosted_fields,
     _strict_canonical_json_loads,
@@ -487,7 +489,10 @@ def _renderer_evidence_bridge_context(
         "GA evidence package receipt digest",
     )
     evidence_ref_count = production_canary.get("evidence_ref_count")
-    if type(evidence_ref_count) is not int or evidence_ref_count < 1:
+    if (
+        type(evidence_ref_count) is not int
+        or evidence_ref_count != PRODUCTION_CANARY_EVIDENCE_REF_COUNT
+    ):
         raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
     _bridge_text(production_canary.get("source_file"), "GA evidence package source")
     _bridge_sha256(
@@ -578,18 +583,27 @@ def _renderer_evidence_bridge_context(
     local_payload = _read_bridge_source(
         local_root, "root-canary-acceptance.json", "GA evidence local source"
     )
-    canary_payload = _read_bridge_source(
+    canary_source_payload = _read_bridge_source(
         production_canary,
         "production-canary-readback.json",
         "GA evidence package source",
     )
-    activation_payload = _read_bridge_source(
+    activation_source_payload = _read_bridge_source(
         production_activation,
         "production-activation-readback.json",
         "GA evidence activation source",
     )
-    default_payload = _read_bridge_source(
+    default_source_payload = _read_bridge_source(
         default_writer, "default-writer-readback.json", "GA evidence default source"
+    )
+    canary_payload, canary_receipt_digest = _canonical_readback_payload(
+        canary_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    )
+    activation_payload, activation_receipt_digest = _canonical_readback_payload(
+        activation_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
+    )
+    default_payload, default_receipt_digest = _canonical_readback_payload(
+        default_source_payload, "GA_METADATA_BRIDGE_RECEIPT_DIGEST_INVALID"
     )
 
     _assert_source_equal(
@@ -618,8 +632,7 @@ def _renderer_evidence_bridge_context(
         and canary_payload.get("manifest_ref") == production_canary["manifest_ref"]
         and canary_payload.get("evidence_ref_count") == evidence_ref_count
         and canary_payload.get("evidence_readback_count") == evidence_ref_count
-        and _source_sha256(canary_payload, "receipt_digest")
-        == production_canary["readback_receipt_digest"]
+        and canary_receipt_digest == production_canary["readback_receipt_digest"]
         and canary_payload.get("accepted") is True
         and canary_payload.get("all_evidence_exact") is True
         and canary_payload.get("blockers") == []
@@ -673,12 +686,13 @@ def _renderer_evidence_bridge_context(
         transition_record, "canary_evidence_refs"
     )
     package_evidence_refs = _source_list(canary_payload, "evidence_refs")
+    if len(package_evidence_refs) != PRODUCTION_CANARY_EVIDENCE_REF_COUNT:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
     _assert_source_equal(
         _source_text(activation_payload, "schema")
         == "gwo-v8-production-activation-readback.v1"
         and _source_text(activation_payload, "repository") == repository
-        and _source_sha256(activation_payload, "receipt_digest")
-        == production_activation_receipt_digest
+        and activation_receipt_digest == production_activation_receipt_digest
         and _source_text(execute_outcome, "activation_id")
         == production_activation_id
         and _source_text(execute_outcome, "record_id") == transition_record_id
@@ -760,8 +774,7 @@ def _renderer_evidence_bridge_context(
         and _source_sha256(default_payload, "plan_digest") == activation_plan_digest
         and _source_sha256(default_payload, "activation_readback_digest")
         == production_activation_receipt_digest
-        and _source_sha256(default_payload, "receipt_digest")
-        == default_receipt_digest
+        and default_receipt_digest == default_writer["readback_receipt_digest"]
         and default_payload.get("legacy_writer_fence_stopped") is True
         and default_control_ref == activation_control_ref,
     )
