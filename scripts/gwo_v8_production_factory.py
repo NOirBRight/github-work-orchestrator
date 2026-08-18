@@ -42,6 +42,7 @@ from gwo_v8.production_activation import (
     ProductionActivationAuthorization,
     ProductionActivationComposition,
     WRITER_TRANSITION,
+    _durable_canary_ref,
 )
 from gwo_v8.production_effects import ProductionCompositionError
 from gwo_v8_live_guard_host import LiveGuardHostError, install_live_guard_host
@@ -88,7 +89,9 @@ _STORE_TABLE_COLUMNS = {
 }
 _STORE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _MISSING_INSTALLED_HOST_CODE = "CUTOVER_GUARD_COMPOSITION_INVALID"
-_MISSING_INSTALLED_HOST_DETAIL = "installed host is unavailable"
+_MISSING_INSTALLED_HOST_DETAIL = (
+    "the installed default host is not the composed V3 start host"
+)
 
 
 def _error(code: str, detail: str) -> ProductionCompositionError:
@@ -565,11 +568,12 @@ def _validate_identity(
         canary.accepted is not True
         or canary.blockers
         or not _digest(canary.evidence_package_digest)
-        or not _text(canary.manifest_ref)
+        or not _durable_canary_ref(canary.manifest_ref)
         or type(canary.evidence_refs) is not tuple
         or not canary.evidence_refs
-        or any(not _text(value) for value in canary.evidence_refs)
+        or any(not _durable_canary_ref(value) for value in canary.evidence_refs)
         or len(set(canary.evidence_refs)) != len(canary.evidence_refs)
+        or tuple(sorted(canary.evidence_refs)) != canary.evidence_refs
     ):
         raise _error(
             "FACTORY_CANARY_INVALID",

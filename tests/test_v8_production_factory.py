@@ -345,6 +345,50 @@ def test_factory_rejects_invalid_plan_or_canary_identity_before_store_access(
     }
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("non_durable_manifest", "non_durable_evidence", "unsorted_evidence"),
+)
+def test_factory_rejects_noncanonical_canary_refs_before_store_access(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    import gwo_v8_production_factory as module
+
+    monkeypatch.setattr(
+        module,
+        "_validate_store",
+        lambda *args, **kwargs: pytest.fail(
+            "store must not be opened for invalid durable Canary references"
+        ),
+    )
+    canary = _canary()
+    if mutation == "non_durable_manifest":
+        canary = replace(canary, manifest_ref="https://example.invalid/manifest")
+    elif mutation == "non_durable_evidence":
+        canary = replace(
+            canary,
+            evidence_refs=("https://example.invalid/evidence",),
+        )
+    else:
+        canary = replace(
+            canary,
+            evidence_refs=(
+                "github://evidence/2",
+                "github://evidence/1",
+            ),
+        )
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(_config(tmp_path)),
+            canary=canary,
+        )
+
+    assert raised.value.code == "FACTORY_CANARY_INVALID"
+
+
 @pytest.mark.parametrize("case", ("missing", "directory", "invalid_sqlite", "sidecar"))
 def test_factory_rejects_missing_wrong_or_unsafe_store(tmp_path, case):
     if case == "missing":
@@ -586,7 +630,7 @@ def test_factory_bootstraps_live_host_only_for_missing_installed_host(
         if load_calls == 1:
             raise PlanControlError(
                 "CUTOVER_GUARD_COMPOSITION_INVALID",
-                "installed host is unavailable",
+                "the installed default host is not the composed V3 start host",
             )
         return host
 
