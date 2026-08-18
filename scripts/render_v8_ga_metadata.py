@@ -491,6 +491,7 @@ def render_ga_documents(
     common: dict[str, object] = {
         "repository": repository,
         "campaign_key": campaign_key,
+        "verification_mode": "local-only-v1",
         "evidence_base_sha": evidence_base_sha,
         "canary_target_sha": canary_target_sha,
         "ticket_manifest": static_tickets,
@@ -513,8 +514,11 @@ def render_ga_documents(
         f"- Accepted root Canary receipt `{common['canary_receipt_digest']}`.\n"
         f"- Evidence base `{evidence_base_sha}` and Canary target `"
         f"{canary_target_sha}` were read back.\n"
-        "- Final tag-candidate SHA and exact CI are verified by the pre-tag "
-        "receipt after this metadata commit is merged.\n"
+        "- Repository release verification is Local Verification Only "
+        "(`local-only-v1`); the pre-tag receipt binds the exact subject "
+        "SHA/tree and successful full pytest readback.\n"
+        "- Product Hosted-CI delivery remains separate and is not satisfied "
+        "by repository release verification.\n"
     )
     previous = changelog.read_text(encoding="utf-8") if changelog.exists() else ""
     if "## 8.0.0" in previous:
@@ -546,7 +550,8 @@ def render_ga_documents(
             | {
                 "release": {
                     "version": "8.0.0",
-                    "tag_and_ci_source": "pre-tag ReleaseGateReceipt",
+                    "verification_mode": "local-only-v1",
+                    "verification_source": "local verification manifest and Git readback",
                 }
             },
         )
