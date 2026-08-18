@@ -1338,6 +1338,100 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
     assert "pytest_pass_count" not in combined
 
 
+def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
+    bridge = {
+        "bridge_digest": "97c173547a4bfd1444503cfb3ed76cc0ea03e1eba2d800a4d8fa2d854fb70ea4",
+        "default_writer": {
+            "activation_id": "activation:47895d07122a3d9827ecdf63",
+            "legacy_writer_fence_stopped": True,
+            "readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
+            "record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\default-writer-readback.json"
+            ),
+            "source_file_sha256": "4c9f165b7e1df535cfcd3fe86cc43b2fb57dc21872cb65980b3d9abdec3d4ffc",
+            "writer_generation": "v8-generation-1",
+        },
+        "local_root_canary": {
+            "acceptance_mode": "local-only-v1",
+            "activation_id": "campaign:fd16e735a23425ee5071e881",
+            "campaign_key": "campaign:fd16e735a23425ee5071e881",
+            "canary_target_sha": "d31d5787df8ff53f081ed45df42389ef2e505ffb",
+            "producer_receipt_digest": "ea642b5606efc10adaf3671174b10e3df2f1a5f2dfc8b60a86b251db5845c938",
+            "repository": "NOirBRight/github-work-orchestrator",
+            "schema": "gwo-v8-root-canary-acceptance.v2",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\root-canary-acceptance.json"
+            ),
+            "source_file_sha256": "2e1d740729c22f60718097ab5bf3c6e3e404d54948154707a46a2dc38fb51c5f",
+            "writer_generation": "writer:local",
+        },
+        "production_activation": {
+            "activation_id": "activation:47895d07122a3d9827ecdf63",
+            "previous_writer_generation": "v8-generation-1",
+            "readback_receipt_digest": "98eb2d5f6a75f0e12b290836c72939c44bd03052f1d28257cae410ed30d25c06",
+            "run_id": "phase5-production-activation-2df47f9",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\production-activation-readback.json"
+            ),
+            "source_file_sha256": "848536847b2fa47f3b10bb38d419234d94d81139d119528d4ff7575a78733319",
+            "transition_record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+            "writer_generation": "v8-generation-1",
+        },
+        "production_canary": {
+            "evidence_ref_count": 19,
+            "manifest_ref": (
+                "github://canary-manifest/"
+                "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30"
+            ),
+            "package_digest": "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30",
+            "package_repository": "NOirBRight/gwo-v8-canary",
+            "readback_receipt_digest": "84e4b4e904679d2f841f843ca58da9dda0e5a81a47d251bc18cdd396c64c710e",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\production-canary-readback.json"
+            ),
+            "source_file_sha256": "354092b2e186096e7f7693683f1ad7d449b4ffe13ff56eca6254b4f83e77baca",
+        },
+        "release_subject": {
+            "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
+            "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
+            "release_subject_digest": "f4a260c1bfb39d6541c33f8f8f4449edc5453bd94cedbc1f1a244c9daf28a969",
+        },
+        "repository": "NOirBRight/github-work-orchestrator",
+        "schema": "gwo-v8-ga-evidence-bridge.v1",
+    }
+
+    paths = render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        evidence_bridge=bridge,
+    )
+
+    payload = json.loads(
+        paths[1]
+        .read_text(encoding="utf-8")
+        .split("```json\n", 1)[1]
+        .split("\n```\n", 1)[0]
+    )
+
+    assert payload["evidence_bridge"]["bridge_digest"] == bridge["bridge_digest"]
+    assert payload["evidence_bridge_links"] == {
+        "activation_id": "activation:47895d07122a3d9827ecdf63",
+        "default_writer_readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
+        "local_root_canary_receipt_digest": "ea642b5606efc10adaf3671174b10e3df2f1a5f2dfc8b60a86b251db5845c938",
+        "production_activation_readback_receipt_digest": "98eb2d5f6a75f0e12b290836c72939c44bd03052f1d28257cae410ed30d25c06",
+        "production_canary_package_digest": "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30",
+        "production_canary_repository": "NOirBRight/gwo-v8-canary",
+        "transition_record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+        "writer_generation": "v8-generation-1",
+    }
+
+
 def test_renderer_labels_repository_verification_local_only(tmp_path):
     paths = render_ga_documents(
         tmp_path,
@@ -1500,7 +1594,9 @@ def test_renderer_cross_binds_named_admission_identity(tmp_path):
 
 def test_renderer_syncs_staged_documents_before_publication(tmp_path, monkeypatch):
     fsync_calls = []
-    monkeypatch.setattr(renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+    monkeypatch.setattr(
+        renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor)
+    )
 
     render_ga_documents(
         tmp_path,
@@ -1590,9 +1686,7 @@ def test_post_release_rechecks_pre_tag_commit_tree_invariants_before_archive(
         tmp_path / "record.json", CompleteReleaseFixture()
     )
     pre_tag = tmp_path / "pre-tag.json"
-    pre_tag.write_bytes(
-        verifier.canonical_json_bytes(_post_release_receipt_payload())
-    )
+    pre_tag.write_bytes(verifier.canonical_json_bytes(_post_release_receipt_payload()))
 
     class FakeGit:
         repository = "NOirBRight/github-work-orchestrator"
@@ -1642,9 +1736,7 @@ def test_post_release_archives_tag_subject_by_immutable_commit_sha(
         tmp_path / "record.json", CompleteReleaseFixture()
     )
     pre_tag = tmp_path / "pre-tag.json"
-    pre_tag.write_bytes(
-        verifier.canonical_json_bytes(_post_release_receipt_payload())
-    )
+    pre_tag.write_bytes(verifier.canonical_json_bytes(_post_release_receipt_payload()))
     archived_subjects: list[str] = []
 
     class FakeGit:

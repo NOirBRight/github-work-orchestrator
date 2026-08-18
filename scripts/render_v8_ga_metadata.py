@@ -18,6 +18,7 @@ from typing import Sequence
 from scripts.verify_v8_ga_release import (
     DYNAMIC_METADATA_FIELDS,
     ReleaseGateError,
+    digest_value,
     _reject_local_hosted_fields,
     _strict_canonical_json_loads,
     canonical_json_bytes,
@@ -26,6 +27,9 @@ from scripts.verify_v8_ga_release import (
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_PRODUCTION_WRITER_GENERATION = "v8-generation-1"
+_METADATA_BRIDGE_SCHEMA = "gwo-v8-ga-metadata-bridge.v1"
 
 
 def _require_sha(name: str, value: str) -> str:
@@ -74,6 +78,70 @@ _DYNAMIC_KEY_ALIASES = frozenset(
         "workflow_run",
         "workflow_run_id",
     }
+)
+
+_EVIDENCE_BRIDGE_FIELDS = frozenset(
+    {
+        "bridge_digest",
+        "default_writer",
+        "local_root_canary",
+        "production_activation",
+        "production_canary",
+        "release_subject",
+        "repository",
+        "schema",
+    }
+)
+_EVIDENCE_LOCAL_FIELDS = frozenset(
+    {
+        "acceptance_mode",
+        "activation_id",
+        "campaign_key",
+        "canary_target_sha",
+        "producer_receipt_digest",
+        "repository",
+        "schema",
+        "source_file",
+        "source_file_sha256",
+        "writer_generation",
+    }
+)
+_EVIDENCE_CANARY_FIELDS = frozenset(
+    {
+        "evidence_ref_count",
+        "manifest_ref",
+        "package_digest",
+        "package_repository",
+        "readback_receipt_digest",
+        "source_file",
+        "source_file_sha256",
+    }
+)
+_EVIDENCE_ACTIVATION_FIELDS = frozenset(
+    {
+        "activation_id",
+        "previous_writer_generation",
+        "readback_receipt_digest",
+        "run_id",
+        "source_file",
+        "source_file_sha256",
+        "transition_record_id",
+        "writer_generation",
+    }
+)
+_EVIDENCE_DEFAULT_FIELDS = frozenset(
+    {
+        "activation_id",
+        "legacy_writer_fence_stopped",
+        "readback_receipt_digest",
+        "record_id",
+        "source_file",
+        "source_file_sha256",
+        "writer_generation",
+    }
+)
+_EVIDENCE_RELEASE_SUBJECT_FIELDS = frozenset(
+    {"merged_main_sha", "merged_main_tree", "release_subject_digest"}
 )
 
 
@@ -194,6 +262,239 @@ def _renderer_identity_context(
     return repository, campaign_key, activation_id, writer_generation
 
 
+def _bridge_text(value: object, field: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID", field)
+    return value
+
+
+def _bridge_sha256(value: object, field: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_DIGEST_INVALID", field)
+    return value
+
+
+def _bridge_fields(value: Mapping[str, object], allowed: frozenset[str]) -> None:
+    if set(value) - allowed:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_FIELDS_INVALID")
+
+
+def _renderer_evidence_bridge_context(
+    evidence_bridge: Mapping[str, object],
+) -> dict[str, object]:
+    _bridge_fields(evidence_bridge, _EVIDENCE_BRIDGE_FIELDS)
+    if evidence_bridge.get("schema") != "gwo-v8-ga-evidence-bridge.v1":
+        raise ReleaseGateError("GA_METADATA_BRIDGE_SCHEMA_INVALID")
+    bridge_digest = _bridge_sha256(
+        evidence_bridge.get("bridge_digest"), "GA evidence bridge digest"
+    )
+    payload = dict(evidence_bridge)
+    payload.pop("bridge_digest", None)
+    if digest_value(payload) != bridge_digest:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_DIGEST_MISMATCH")
+
+    repository = _bridge_text(
+        evidence_bridge.get("repository"), "GA evidence bridge repository"
+    )
+    local_root = evidence_bridge.get("local_root_canary")
+    production_canary = evidence_bridge.get("production_canary")
+    production_activation = evidence_bridge.get("production_activation")
+    default_writer = evidence_bridge.get("default_writer")
+    release_subject = evidence_bridge.get("release_subject")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            local_root,
+            production_canary,
+            production_activation,
+            default_writer,
+            release_subject,
+        )
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+
+    _bridge_fields(local_root, _EVIDENCE_LOCAL_FIELDS)
+    if (
+        local_root.get("schema") != "gwo-v8-root-canary-acceptance.v2"
+        or local_root.get("acceptance_mode") != "local-only-v1"
+        or local_root.get("repository") != repository
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_LOCAL_ROOT_INVALID")
+    local_campaign = _bridge_text(
+        local_root.get("campaign_key"), "GA evidence local campaign"
+    )
+    local_activation_id = _bridge_text(
+        local_root.get("activation_id"), "GA evidence local activation"
+    )
+    local_writer_generation = _bridge_text(
+        local_root.get("writer_generation"), "GA evidence local writer"
+    )
+    local_target_sha = _require_sha(
+        "canary_target", local_root.get("canary_target_sha")
+    )
+    local_receipt_digest = _bridge_sha256(
+        local_root.get("producer_receipt_digest"),
+        "GA evidence local receipt digest",
+    )
+    _bridge_text(local_root.get("source_file"), "GA evidence local source file")
+    _bridge_sha256(
+        local_root.get("source_file_sha256"), "GA evidence local source digest"
+    )
+
+    _bridge_fields(production_canary, _EVIDENCE_CANARY_FIELDS)
+    package_repository = _bridge_text(
+        production_canary.get("package_repository"),
+        "GA evidence package repository",
+    )
+    if package_repository != "NOirBRight/gwo-v8-canary":
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    package_digest = _bridge_sha256(
+        production_canary.get("package_digest"),
+        "GA evidence package digest",
+    )
+    _bridge_text(
+        production_canary.get("manifest_ref"), "GA evidence package manifest ref"
+    )
+    _bridge_sha256(
+        production_canary.get("readback_receipt_digest"),
+        "GA evidence package receipt digest",
+    )
+    evidence_ref_count = production_canary.get("evidence_ref_count")
+    if type(evidence_ref_count) is not int or evidence_ref_count < 1:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    _bridge_text(production_canary.get("source_file"), "GA evidence package source")
+    _bridge_sha256(
+        production_canary.get("source_file_sha256"),
+        "GA evidence package source digest",
+    )
+
+    _bridge_fields(production_activation, _EVIDENCE_ACTIVATION_FIELDS)
+    production_activation_id = _bridge_text(
+        production_activation.get("activation_id"),
+        "GA evidence production activation",
+    )
+    production_writer_generation = _bridge_text(
+        production_activation.get("writer_generation"),
+        "GA evidence production writer",
+    )
+    if production_writer_generation != _PRODUCTION_WRITER_GENERATION:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID")
+    production_activation_receipt_digest = _bridge_sha256(
+        production_activation.get("readback_receipt_digest"),
+        "GA evidence activation receipt digest",
+    )
+    transition_record_id = _bridge_text(
+        production_activation.get("transition_record_id"),
+        "GA evidence transition record",
+    )
+    _bridge_text(production_activation.get("run_id"), "GA evidence activation run")
+    _bridge_text(
+        production_activation.get("previous_writer_generation"),
+        "GA evidence previous writer",
+    )
+    _bridge_text(
+        production_activation.get("source_file"), "GA evidence activation source"
+    )
+    _bridge_sha256(
+        production_activation.get("source_file_sha256"),
+        "GA evidence activation source digest",
+    )
+
+    _bridge_fields(default_writer, _EVIDENCE_DEFAULT_FIELDS)
+    if default_writer.get("legacy_writer_fence_stopped") is not True:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_DEFAULT_WRITER_INVALID")
+    if (
+        _bridge_text(
+            default_writer.get("activation_id"), "GA evidence default activation"
+        )
+        != production_activation_id
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    if (
+        _bridge_text(
+            default_writer.get("writer_generation"), "GA evidence default writer"
+        )
+        != production_writer_generation
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID")
+    if (
+        _bridge_text(default_writer.get("record_id"), "GA evidence default record")
+        != transition_record_id
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    default_receipt_digest = _bridge_sha256(
+        default_writer.get("readback_receipt_digest"),
+        "GA evidence default readback digest",
+    )
+    _bridge_text(default_writer.get("source_file"), "GA evidence default source")
+    _bridge_sha256(
+        default_writer.get("source_file_sha256"),
+        "GA evidence default source digest",
+    )
+    if local_activation_id == production_activation_id or (
+        local_writer_generation == production_writer_generation
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_COLLISION")
+
+    _bridge_fields(release_subject, _EVIDENCE_RELEASE_SUBJECT_FIELDS)
+    _require_sha("merged_main", release_subject.get("merged_main_sha"))
+    _require_sha("merged_main_tree", release_subject.get("merged_main_tree"))
+    _bridge_sha256(
+        release_subject.get("release_subject_digest"),
+        "GA evidence release subject digest",
+    )
+
+    links = {
+        "activation_id": production_activation_id,
+        "default_writer_readback_receipt_digest": default_receipt_digest,
+        "local_root_canary_receipt_digest": local_receipt_digest,
+        "production_activation_readback_receipt_digest": production_activation_receipt_digest,
+        "production_canary_package_digest": package_digest,
+        "production_canary_repository": package_repository,
+        "transition_record_id": transition_record_id,
+        "writer_generation": production_writer_generation,
+    }
+    normalized_acceptance = {
+        "acceptance_mode": local_root["acceptance_mode"],
+        "activation_id": local_activation_id,
+        "campaign_key": local_campaign,
+        "canary_target_sha": local_target_sha,
+        "receipt_digest": local_receipt_digest,
+        "repository": repository,
+        "schema": local_root["schema"],
+        "writer_generation": local_writer_generation,
+    }
+    normalized_default_writer = {
+        "activation_id": production_activation_id,
+        "campaign_key": None,
+        "mode": "default_v8",
+        "receipt_digest": default_receipt_digest,
+        "repository": repository,
+        "writer_generation": production_writer_generation,
+    }
+    normalized_named_admission = {
+        "activation_id": production_activation_id,
+        "receipt_digest": production_activation_receipt_digest,
+        "repository": repository,
+        "writer_generation": production_writer_generation,
+    }
+    return {
+        "acceptance": normalized_acceptance,
+        "bridge": dict(evidence_bridge),
+        "default_writer": normalized_default_writer,
+        "links": links,
+        "named_admission": normalized_named_admission,
+        "repository": repository,
+        "campaign_key": local_campaign,
+        "activation_id": production_activation_id,
+        "writer_generation": production_writer_generation,
+        "canary_target_sha": local_target_sha,
+        "canary_receipt_digest": local_receipt_digest,
+        "named_receipt_digest": production_activation_receipt_digest,
+        "default_receipt_digest": default_receipt_digest,
+    }
+
+
 def _write_markdown_json(path: Path, title: str, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fence = "`" * 3
@@ -201,7 +502,7 @@ def _write_markdown_json(path: Path, title: str, payload: Mapping[str, object]) 
         f"# {title}\n\n"
         + fence
         + "json\n"
-            + json.dumps(payload, allow_nan=False, sort_keys=True, indent=2)
+        + json.dumps(payload, allow_nan=False, sort_keys=True, indent=2)
         + "\n"
         + fence
         + "\n",
@@ -247,8 +548,7 @@ def _reject_reparse_path(path: Path) -> None:
             raise ReleaseGateError("GA_METADATA_PUBLICATION_TARGET_INVALID") from error
         else:
             if stat.S_ISLNK(observed.st_mode) or bool(
-                getattr(observed, "st_file_attributes", 0)
-                & _REPARSE_POINT_ATTRIBUTE
+                getattr(observed, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE
             ):
                 raise ReleaseGateError("GA_METADATA_PUBLICATION_TARGET_INVALID")
         parent = current.parent
@@ -285,7 +585,13 @@ def _read_publication_journal(path: Path) -> dict[str, object]:
         if canonical_json_bytes(value) != raw or not isinstance(value, dict):
             raise ValueError("publication journal is not canonical")
         return value
-    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        UnicodeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED") from error
 
 
@@ -433,17 +739,38 @@ def render_ga_documents(
     *,
     evidence_base_sha: str,
     tickets: Mapping[str, object],
-    acceptance: Mapping[str, object],
-    named_admission: Mapping[str, object],
-    default_writer: Mapping[str, object],
+    acceptance: Mapping[str, object] | None = None,
+    named_admission: Mapping[str, object] | None = None,
+    default_writer: Mapping[str, object] | None = None,
+    evidence_bridge: Mapping[str, object] | None = None,
 ) -> tuple[Path, Path, Path]:
     evidence_base_sha = _require_sha("evidence_base", evidence_base_sha)
-    for name, value in (
+    evidence_context: dict[str, object] | None = None
+    if evidence_bridge is not None:
+        if not isinstance(evidence_bridge, Mapping):
+            raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+        _validate_metadata_json(evidence_bridge, "evidence_bridge")
+        evidence_context = _renderer_evidence_bridge_context(evidence_bridge)
+        if acceptance is None:
+            acceptance = evidence_context["acceptance"]
+        if named_admission is None:
+            named_admission = evidence_context["named_admission"]
+        if default_writer is None:
+            default_writer = evidence_context["default_writer"]
+    static_named_admission = named_admission
+    inputs: list[tuple[str, object | None]] = [
         ("tickets", tickets),
         ("acceptance", acceptance),
-        ("named_admission", named_admission),
+        ("named_admission", static_named_admission),
         ("default_writer", default_writer),
-    ):
+    ]
+    for name, value in inputs:
+        if value is None:
+            if name == "named_admission" and evidence_context is not None:
+                continue
+            raise ReleaseGateError(
+                "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
+            )
         if not isinstance(value, Mapping):
             raise ReleaseGateError(
                 "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
@@ -454,7 +781,6 @@ def render_ga_documents(
         _validate_metadata_json(value, name)
     static_tickets = tickets
     static_acceptance = acceptance
-    static_named_admission = named_admission
     static_default_writer = default_writer
     if not all(
         isinstance(value, Mapping)
@@ -469,27 +795,53 @@ def render_ga_documents(
     try:
         canary_receipt_digest = static_acceptance["receipt_digest"]
         canary_target_value = static_acceptance["canary_target_sha"]
-        named_receipt_digest = static_named_admission["receipt_digest"]
         default_receipt_digest = static_default_writer["receipt_digest"]
     except KeyError as error:
         raise ReleaseGateError("GA_METADATA_INPUT_INVALID") from error
-    for value in (canary_receipt_digest, named_receipt_digest, default_receipt_digest):
-        if type(value) is not str or not value.strip():
-            raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+    if type(canary_receipt_digest) is not str or not canary_receipt_digest.strip():
+        raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+    if type(default_receipt_digest) is not str or not default_receipt_digest.strip():
+        raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
     canary_target_sha = _require_sha("canary_target", canary_target_value)
-    repository, campaign_key, activation_id, writer_generation = (
-        _renderer_identity_context(
-            static_acceptance,
-            static_named_admission,
-            static_default_writer,
+    bridge: dict[str, object] | None = None
+    if evidence_context is not None:
+        bridge = evidence_context["bridge"]
+        repository = evidence_context["repository"]
+        campaign_key = evidence_context["campaign_key"]
+        activation_id = evidence_context["activation_id"]
+        writer_generation = evidence_context["writer_generation"]
+        canary_target_sha = evidence_context["canary_target_sha"]
+        canary_receipt_digest = evidence_context["canary_receipt_digest"]
+        named_receipt_digest = evidence_context["named_receipt_digest"]
+        default_receipt_digest = evidence_context["default_receipt_digest"]
+        expected_identity = {
+            "repository": repository,
+            "campaign_key": campaign_key,
+            "activation_id": evidence_context["acceptance"]["activation_id"],
+            "writer_generation": evidence_context["acceptance"]["writer_generation"],
+        }
+    else:
+        if not isinstance(static_named_admission, Mapping):
+            raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+        try:
+            named_receipt_digest = static_named_admission["receipt_digest"]
+        except KeyError as error:
+            raise ReleaseGateError("GA_METADATA_INPUT_INVALID") from error
+        if type(named_receipt_digest) is not str or not named_receipt_digest.strip():
+            raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+        repository, campaign_key, activation_id, writer_generation = (
+            _renderer_identity_context(
+                static_acceptance,
+                static_named_admission,
+                static_default_writer,
+            )
         )
-    )
-    expected_identity = {
-        "repository": repository,
-        "campaign_key": campaign_key,
-        "activation_id": activation_id,
-        "writer_generation": writer_generation,
-    }
+        expected_identity = {
+            "repository": repository,
+            "campaign_key": campaign_key,
+            "activation_id": activation_id,
+            "writer_generation": writer_generation,
+        }
     _assert_input_identities(static_tickets, expected_identity)
     common: dict[str, object] = {
         "repository": repository,
@@ -504,6 +856,13 @@ def render_ga_documents(
         "activation_id": activation_id,
         "writer_generation": writer_generation,
     }
+    if bridge is not None:
+        common["evidence_bridge"] = bridge
+        if evidence_context is not None:
+            common["evidence_bridge_links"] = evidence_context["links"]
+            common["production_canary_package_digest"] = evidence_context["links"][
+                "production_canary_package_digest"
+            ]
     _reject_reparse_path(output_root)
     changelog = output_root / "CHANGELOG.md"
     acceptance_doc = output_root / "docs/e2e/gwo-v8-root-canary.md"
@@ -523,6 +882,13 @@ def render_ga_documents(
         "- Product Hosted-CI delivery remains separate and is not satisfied "
         "by repository release verification.\n"
     )
+    if bridge is not None:
+        entry += (
+            "- Local Root Canary evidence is explicitly bridged to the external "
+            "Production Canary package, Production Activation, and the exact "
+            "default-writer readback; their Campaign/activation identities are "
+            "not treated as interchangeable.\n"
+        )
     previous = changelog.read_text(encoding="utf-8") if changelog.exists() else ""
     if "## 8.0.0" in previous:
         raise ReleaseGateError("GA_CHANGELOG_VERSION_ALREADY_PRESENT")
@@ -567,34 +933,72 @@ def write_live_release_record(
     path: Path,
     *,
     evidence_base_sha: str,
-    acceptance: Mapping[str, object],
-    named_admission: Mapping[str, object],
-    default_writer: Mapping[str, object],
+    acceptance: Mapping[str, object] | None = None,
+    named_admission: Mapping[str, object] | None = None,
+    default_writer: Mapping[str, object] | None = None,
+    evidence_bridge: Mapping[str, object] | None = None,
 ) -> Path:
+    evidence_context: dict[str, object] | None = None
+    if evidence_bridge is not None:
+        if not isinstance(evidence_bridge, Mapping):
+            raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
+        _validate_metadata_json(evidence_bridge, "evidence_bridge")
+        evidence_context = _renderer_evidence_bridge_context(evidence_bridge)
+        if acceptance is None:
+            acceptance = evidence_context["acceptance"]
+        if named_admission is None:
+            named_admission = evidence_context["named_admission"]
+        if default_writer is None:
+            default_writer = evidence_context["default_writer"]
+    static_named_admission = named_admission
     for name, value in (
         ("acceptance", acceptance),
-        ("named_admission", named_admission),
+        ("named_admission", static_named_admission),
         ("default_writer", default_writer),
     ):
+        if value is None:
+            raise ReleaseGateError(
+                "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
+            )
         if not isinstance(value, Mapping):
-            raise ReleaseGateError("GA_METADATA_INPUT_INVALID", f"{name} is not an object")
+            raise ReleaseGateError(
+                "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
+            )
         _reject_dynamic_metadata(value, name)
         _reject_local_hosted_fields(value)
         _validate_metadata_json(value, name)
-    _renderer_identity_context(acceptance, named_admission, default_writer)
+    if evidence_context is not None:
+        repository = evidence_context["repository"]
+        campaign_key = evidence_context["campaign_key"]
+        activation_id = evidence_context["activation_id"]
+        writer_generation = evidence_context["writer_generation"]
+        canary_receipt_digest = evidence_context["canary_receipt_digest"]
+        canary_target_sha = evidence_context["canary_target_sha"]
+        activation_receipt_digest = evidence_context["named_receipt_digest"]
+    else:
+        repository, campaign_key, activation_id, writer_generation = (
+            _renderer_identity_context(
+                acceptance,
+                static_named_admission,
+                default_writer,
+            )
+        )
+        canary_receipt_digest = str(acceptance["receipt_digest"])
+        canary_target_sha = _require_sha(
+            "canary_target", str(acceptance["canary_target_sha"])
+        )
+        activation_receipt_digest = str(static_named_admission["receipt_digest"])
     fixture = SimpleNamespace(
         version="8.0.0",
-        repository=str(acceptance["repository"]),
+        repository=repository,
         evidence_base_sha=_require_sha("evidence_base", evidence_base_sha),
-        canary_target_sha=_require_sha(
-            "canary_target", str(acceptance["canary_target_sha"])
-        ),
-        canary_receipt_digest=str(acceptance["receipt_digest"]),
-        activation_receipt_digest=str(named_admission["receipt_digest"]),
+        canary_target_sha=canary_target_sha,
+        canary_receipt_digest=canary_receipt_digest,
+        activation_receipt_digest=activation_receipt_digest,
         default_writer_receipt_digest=str(default_writer["receipt_digest"]),
-        campaign_key=str(acceptance["campaign_key"]),
-        activation_id=str(default_writer["activation_id"]),
-        writer_generation=str(default_writer["writer_generation"]),
+        campaign_key=campaign_key,
+        activation_id=activation_id,
+        writer_generation=writer_generation,
     )
     return write_ga_release_record(path, fixture)
 
@@ -614,17 +1018,31 @@ def render_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--evidence-base-sha", required=True)
     parser.add_argument("--tickets", type=Path, required=True)
-    parser.add_argument("--acceptance", type=Path, required=True)
-    parser.add_argument("--named-admission", type=Path, required=True)
-    parser.add_argument("--default-writer", type=Path, required=True)
+    parser.add_argument("--acceptance", type=Path)
+    parser.add_argument("--named-admission", type=Path)
+    parser.add_argument("--evidence-bridge", type=Path)
+    parser.add_argument("--default-writer", type=Path)
     parser.add_argument("--release-record", type=Path)
     args = parser.parse_args(argv)
     inputs = {
         "evidence_base_sha": args.evidence_base_sha,
         "tickets": _read_json(args.tickets),
-        "acceptance": _read_json(args.acceptance),
-        "named_admission": _read_json(args.named_admission),
-        "default_writer": _read_json(args.default_writer),
+        "acceptance": (
+            _read_json(args.acceptance) if args.acceptance is not None else None
+        ),
+        "named_admission": (
+            _read_json(args.named_admission)
+            if args.named_admission is not None
+            else None
+        ),
+        "evidence_bridge": (
+            _read_json(args.evidence_bridge)
+            if args.evidence_bridge is not None
+            else None
+        ),
+        "default_writer": (
+            _read_json(args.default_writer) if args.default_writer is not None else None
+        ),
     }
     render_ga_documents(
         args.root,
@@ -633,6 +1051,7 @@ def render_main(argv: Sequence[str] | None = None) -> int:
         acceptance=inputs["acceptance"],
         named_admission=inputs["named_admission"],
         default_writer=inputs["default_writer"],
+        evidence_bridge=inputs["evidence_bridge"],
     )
     if args.release_record is not None:
         write_live_release_record(
@@ -641,6 +1060,7 @@ def render_main(argv: Sequence[str] | None = None) -> int:
             acceptance=inputs["acceptance"],
             named_admission=inputs["named_admission"],
             default_writer=inputs["default_writer"],
+            evidence_bridge=inputs["evidence_bridge"],
         )
     return 0
 

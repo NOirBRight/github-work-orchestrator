@@ -108,6 +108,36 @@ Examples include `ROOT_TICKET_READBACK_INVALID`,
 `EFFECT_PROOF_INCOMPLETE`, `BATCH_BOUNDARY_COLLAPSED`, `DUPLICATE_EFFECT`,
 `POLICY_EVIDENCE_INCOMPLETE`, and `ROOT_REPOSITORY_MISMATCH`.
 
+## GA metadata bridge
+
+The GA metadata renderer may project a separate, canonical bridge after this
+local receipt has been accepted. The bridge keeps these identities explicit:
+
+| Role | Authoritative identity |
+| --- | --- |
+| Local Root Canary | `campaign:fd16e735a23425ee5071e881`, `writer:local`, and the local receipt path |
+| External Production Canary package | `NOirBRight/gwo-v8-canary`, package digest `2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30`, and its readback path |
+| Production Activation | `activation:47895d07122a3d9827ecdf63`, transition `writer-transition:ce14291c00b0c5bfe7251729`, and `v8-generation-1` |
+| Default-writer readback | the target repository's `default_v8` readback, bound to the activation and exact `v8-generation-1` |
+
+The target repository is `NOirBRight/github-work-orchestrator`; the external
+Canary package is not the target repository. The local Root Canary Campaign and
+writer identities are therefore not copied into the Production Activation or
+default-writer readback. The bridge binds the package evidence to the
+activation's `canary_repository` and `canary_evidence_digest`, then binds that
+activation ID and writer generation to the default-writer readback. It also
+records the readback control ref
+`origin/gwo-control@5d463d2ecd3e98644fa72dce01326bd553ecbb39`.
+
+The renderer accepts the derived `gwo-v8-ga-evidence-bridge.v1` object (for
+example, `D:\gwo-release-evidence\2026-08-19-gwo-v8-ga-production-cutover\ga-evidence-bridge.json`)
+through `--evidence-bridge`. Its `bridge_digest` is recomputed over the
+canonical payload before projection. The bridge has a role-specific allow-list
+so unrecognized dynamic SHA/CI fields and unknown role fields are rejected;
+repository, package, activation, generation, and default-writer mismatches
+fail closed. The original bridge digest and the renderer's explicit
+`evidence_bridge_links` are both retained in the generated metadata.
+
 ## Limitations
 
 This implementation verifies the exact bytes and cross-links supplied to it;
