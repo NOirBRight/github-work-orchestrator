@@ -126,6 +126,21 @@ needed by the existing resolver-backed live Guard host. The module-level
 `factory` is intentionally unconfigured; an omitted configuration never
 selects a Store or an in-memory test double.
 
+`ProductionCompositionConfig.canary_repository` is the optional, host-owned
+identity for the named Canary. When omitted, it defaults to
+`target_repository`. When configured, `CanaryAcceptance.repository` must match
+it exactly; for the Phase 5 external consumer this is
+`NOirBRight/gwo-v8-canary`. The factory binds the durable Canary manifest
+readback to that repository. An omitted configuration for an external Canary,
+or any configured/input mismatch, fails closed with
+`FACTORY_IDENTITY_DISJOINT`.
+
+This identity is independent of the writer target: `compiled_plan.repository`,
+`CutoverSubject.repository`, and `CutoverGuardReceipt.repository` remain bound
+to `target_repository` and are not mirrored or relaxed for the external
+Canary. The Facade accepts the named Canary only when its package repository
+and every typed Evidence readback match `CanaryAcceptance.repository`.
+
 The factory keeps `store_generation` separate from
 `target_writer_generation`. If the configured Store already has a
 `v8_writer_generations` row for the target repository, its value must exactly

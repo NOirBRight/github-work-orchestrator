@@ -55,6 +55,7 @@ from tests.cutover_guard_test_support import GuardHarness  # noqa: E402
 
 
 REPOSITORY = "NOirBRight/github-work-orchestrator"
+CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 
 
 def _create_store(path: Path) -> None:
@@ -278,6 +279,49 @@ def test_factory_rejects_disjoint_activation_identity_before_store_access(
         _compose(factory, authorization=_authorization(target_repository="other/repo"))
 
     assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+@pytest.mark.parametrize(
+    ("configured_canary_repository", "canary_repository"),
+    (
+        (CANARY_REPOSITORY, CANARY_REPOSITORY),
+        (None, CANARY_REPOSITORY),
+        (CANARY_REPOSITORY, REPOSITORY),
+    ),
+)
+def test_factory_requires_exact_named_canary_repository_identity(
+    tmp_path,
+    monkeypatch,
+    configured_canary_repository,
+    canary_repository,
+):
+    _install_test_live_guard(monkeypatch)
+    config = _config(tmp_path)
+    if configured_canary_repository is not None:
+        config = replace(
+            config,
+            canary_repository=configured_canary_repository,
+        )
+    canary = replace(_canary(), repository=canary_repository)
+
+    if configured_canary_repository == canary_repository:
+        composition = _compose(
+            ProductionActivationCompositionFactory(config),
+            canary=canary,
+        )
+
+        assert (
+            composition.canary_evidence_control.manifest_repository
+            == CANARY_REPOSITORY
+        )
+    else:
+        with pytest.raises(ProductionCompositionError) as raised:
+            _compose(
+                ProductionActivationCompositionFactory(config),
+                canary=canary,
+            )
+
+        assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
 
 
 def test_factory_rejects_a_guard_receipt_bound_to_another_subject_before_store_access(

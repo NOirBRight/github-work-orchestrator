@@ -682,7 +682,7 @@ class ProductionActivationFacade:
                 "CanaryAcceptance is not an accepted, blocker-free result",
             )
         if (
-            canary.repository != authorization.target_repository
+            not _nonempty_text(canary.repository)
             or not _is_digest(canary.evidence_package_digest)
             or not _nonempty_text(canary.manifest_ref)
             or type(canary.evidence_refs) is not tuple
@@ -692,9 +692,9 @@ class ProductionActivationFacade:
         ):
             _reject(
                 "CANARY_EVIDENCE_IDENTITY_INVALID",
-                "Canary evidence is not bound to the authorized repository and package identity",
+                "Canary evidence is not bound to its named repository and package identity",
             )
-        self._validate_canary_readback(canary, authorization.target_repository)
+        self._validate_canary_readback(canary, canary.repository)
 
         receipt = request.guard_receipt
         if receipt is None:

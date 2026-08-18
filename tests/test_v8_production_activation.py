@@ -12,7 +12,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8.transition import (  # noqa: E402
+    CanaryRunVerifier,
     CurrentWriter,
+    InMemoryCanaryEvidenceControl,
     WriterTransitionRecord,
 )
 from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value  # noqa: E402
@@ -24,6 +26,22 @@ from gwo_v8.production_activation import (  # noqa: E402
     ProductionActivationRequest,
 )
 from tests.cutover_guard_test_support import activation_fixture  # noqa: E402
+
+
+CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
+
+
+def _external_canary():
+    from test_orchestrator_v8_phase4bc import _accepted_canary
+
+    readback = _accepted_canary(repository=CANARY_REPOSITORY)
+    evidence = (
+        *readback.scenario_evidence.values(),
+        *readback.candidate_evidence.values(),
+        *readback.review_evidence.values(),
+    )
+    control = InMemoryCanaryEvidenceControl(tuple(evidence))
+    return CanaryRunVerifier(control).verify(readback), control
 
 
 def _authorization(fixture, tmp_path):
@@ -330,6 +348,25 @@ def test_preflight_revalidates_canary_manifest_repository(tmp_path):
 
     assert raised.value.code == "CANARY_EVIDENCE_READBACK_INVALID"
     assert fixture.mutation_calls() == ()
+
+
+def test_preflight_accepts_external_canary_when_named_package_readback_matches(
+    tmp_path,
+):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    canary, control = _external_canary()
+
+    preflight = _facade(
+        fixture,
+        authorization,
+        canary_control=control,
+    ).preflight(
+        replace(_request(fixture, authorization), canary=canary),
+    )
+
+    assert preflight.canary_evidence_digest == canary.evidence_package_digest
+    assert preflight.current_writer.repository == fixture.repository
 
 
 @pytest.mark.parametrize(

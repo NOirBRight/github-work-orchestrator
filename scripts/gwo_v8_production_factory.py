@@ -188,6 +188,7 @@ class ProductionCompositionConfig:
     store_path: Path
     rollback_lineage: RollbackLineage
     target_repository: str | None = None
+    canary_repository: str | None = None
     control_branch: str = "gwo-control"
     store_generation: str | None = None
     source_writer_generation: str | None = None
@@ -219,6 +220,7 @@ class ProductionCompositionConfig:
                 raise ValueError(f"{name} is required")
         for name in (
             "target_repository",
+            "canary_repository",
             "store_generation",
             "source_writer_generation",
             "target_writer_generation",
@@ -523,6 +525,11 @@ def _validate_identity(
         if config.store_generation is not None
         else subject.store_generation
     )
+    expected_canary = (
+        config.canary_repository
+        if config.canary_repository is not None
+        else target
+    )
     if expected_source != EXPECTED_SOURCE_WRITER_GENERATION:
         raise _error(
             "FACTORY_IDENTITY_DISJOINT",
@@ -530,7 +537,7 @@ def _validate_identity(
         )
     if (
         compiled_plan.repository != target
-        or canary.repository != target
+        or canary.repository != expected_canary
         or subject.repository != target
         or receipt.repository != target
         or subject.control_branch != config.control_branch
@@ -839,7 +846,11 @@ class ProductionActivationCompositionFactory:
         canary_control = GitHubCanaryEvidenceControl(
             client,
             locations,
-            manifest_repository=authorization.target_repository,
+            manifest_repository=(
+                config.canary_repository
+                if config.canary_repository is not None
+                else authorization.target_repository
+            ),
             manifest_branch=config.control_branch,
         )
         composition = ProductionActivationComposition(
