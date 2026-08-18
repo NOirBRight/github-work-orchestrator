@@ -546,6 +546,18 @@ def _write_manifest_payload(path, payload):
     path.write_bytes(canonical_json_bytes(payload))
 
 
+def _refresh_manifest_ticket_source_digest(payload, index=0):
+    item = payload["tickets"][index]
+    projection = {
+        "number": item["contract"]["number"],
+        "contract": item["contract"],
+        "labels": item["labels"],
+        "source_ref": item["key"],
+        "native_blockers": item["native_blockers"],
+    }
+    item["source"]["digest"] = digest_value(projection)
+
+
 def test_real_manifest_loader_accepts_authoritative_four_ticket_fixture():
     manifest = load_ticket_manifest(
         REAL_TICKET_MANIFEST,
@@ -625,6 +637,38 @@ def test_manifest_loader_rejects_repository_mismatch(tmp_path):
     with pytest.raises(
         RootCanaryProvisionError,
         match="ROOT_REPOSITORY_MISMATCH",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_empty_contract_body_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["body"] = ""
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "empty-body.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_uppercase_open_state_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["state"] = "OPEN"
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "uppercase-open.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
     ):
         load_ticket_manifest(path, require_real_root_numbers=True)
 

@@ -1187,9 +1187,8 @@ def _validate_manifest_ticket(
     ):
         raise RootCanaryProvisionError(code)
     _manifest_text(contract.get("title"), code)
-    if type(contract.get("body")) is not str:
-        raise RootCanaryProvisionError(code)
-    state = _manifest_text(contract.get("state"), code).lower()
+    _manifest_text(contract.get("body"), code)
+    state = _manifest_text(contract.get("state"), code)
     if state not in {"open", "closed"}:
         raise RootCanaryProvisionError(code)
     state_reason = contract.get("state_reason")
