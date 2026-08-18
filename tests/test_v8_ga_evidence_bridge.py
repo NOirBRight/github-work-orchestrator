@@ -40,7 +40,8 @@ PRODUCTION_RECORD_ID = "writer-transition:ce14291c00b0c5bfe7251729"
 CONTROL_REF_SHA = "5d463d2ecd3e98644fa72dce01326bd553ecbb39"
 PLAN_DIGEST = "bb4c0848982c574cdce2d50241701b5920fc93caedb78a04fddcf6e5d0ad661a"
 PRODUCTION_GENERATION = "v8-generation-1"
-PREVIOUS_WRITER_GENERATION = "v6.1"
+PREVIOUS_WRITER_GENERATION = PRODUCTION_GENERATION
+GUARD_SOURCE_WRITER_GENERATION = "v6.1"
 ACTIVATION_RECEIPT_DIGEST = (
     "98eb2d5f6a75f0e12b290836c72939c44bd03052f1d28257cae410ed30d25c06"
 )
@@ -74,18 +75,18 @@ def _case(tmp_path: Path):
     assert activation["receipt_digest"] == ACTIVATION_RECEIPT_DIGEST
     assert activation["control_ref"]["commit_sha"] == CONTROL_REF_SHA
     assert activation["active_plan"]["active_plan_digest"] == PLAN_DIGEST
+    assert (
+        activation["transition_record"]["previous_writer_generation"]
+        == PREVIOUS_WRITER_GENERATION
+    )
     assert admission["receipt_digest"] == DEFAULT_WRITER_RECEIPT_DIGEST
+    assert admission["previous_writer_generation"] == PREVIOUS_WRITER_GENERATION
     assert (
         bridge_payload["bridge_digest"]
         == "97c173547a4bfd1444503cfb3ed76cc0ea03e1eba2d800a4d8fa2d854fb70ea4"
     )
-    # The activation readback is immutable production evidence.  Its transition
-    # record carries the cutover record's own V8 lineage field; the source
-    # writer is proven by the Guard/authorization readbacks instead.
-    bridge_payload["production_activation"] = {
-        **bridge_payload["production_activation"],
-        "previous_writer_generation": PREVIOUS_WRITER_GENERATION,
-    }
+    # Keep the immutable V8 transition lineage separate from the Guard's V6.1
+    # source-writer proof.
     bridge_payload["activation_release_subject"] = bridge_payload.pop("release_subject")
     bridge_payload["release_subject"] = {
         "merged_main_sha": MAIN_SHA,
@@ -97,6 +98,7 @@ def _case(tmp_path: Path):
     default_writer_raw = canonical_json_bytes(admission)
     bridge_payload["default_writer"] = {
         **bridge_payload["default_writer"],
+        "previous_writer_generation": admission["previous_writer_generation"],
         "source_file": str(tmp_path / "default-writer-readback.json"),
         "source_file_sha256": hashlib.sha256(default_writer_raw).hexdigest(),
     }
@@ -113,6 +115,7 @@ def _case(tmp_path: Path):
         bridge.production_activation["previous_writer_generation"]
         == PREVIOUS_WRITER_GENERATION
     )
+    assert bridge.default_writer["previous_writer_generation"] == PREVIOUS_WRITER_GENERATION
     assert bridge.activation_release_subject["merged_main_sha"] == MAIN_SHA
     record = GaReleaseRecord(
         version="8.0.0",
@@ -151,6 +154,25 @@ def _case(tmp_path: Path):
 def _rehash_bridge(payload: dict[str, object]) -> dict[str, object]:
     body = {key: value for key, value in payload.items() if key != "bridge_digest"}
     return body | {"bridge_digest": digest_value(body)}
+
+
+def _bridge_with_source(
+    tmp_path: Path,
+    bridge: GaEvidenceBridge,
+    section: str,
+    payload: dict[str, object],
+    filename: str,
+) -> GaEvidenceBridge:
+    raw = canonical_json_bytes(payload)
+    source = tmp_path / filename
+    source.write_bytes(raw)
+    bridge_payload = bridge.to_mapping()
+    bridge_payload[section] = {
+        **bridge_payload[section],
+        "source_file": str(source),
+        "source_file_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    return GaEvidenceBridge.from_mapping(_rehash_bridge(bridge_payload))
 
 
 def test_bridge_accepts_local_root_and_external_production_canary_with_disjoint_identities(
@@ -222,14 +244,15 @@ def test_bridge_rejects_a_non_v8_generation_before_readback_is_accepted(tmp_path
     assert error.value.code == "GA_EVIDENCE_BRIDGE_WRITER_INVALID"
 
 
-def test_bridge_rejects_a_v8_previous_writer_generation(tmp_path):
-    _record, _canary, _activation, _admission, bridge, _local_verification, _git = (
-        _case(tmp_path)
+@pytest.mark.parametrize("section", ("production_activation", "default_writer"))
+def test_bridge_rejects_a_non_v8_previous_writer_generation(tmp_path, section):
+    _record, _canary, _activation, _admission, bridge, _local_verification, _git = _case(
+        tmp_path
     )
     wrong_payload = bridge.to_mapping()
-    wrong_payload["production_activation"] = {
-        **wrong_payload["production_activation"],
-        "previous_writer_generation": PRODUCTION_GENERATION,
+    wrong_payload[section] = {
+        **wrong_payload[section],
+        "previous_writer_generation": GUARD_SOURCE_WRITER_GENERATION,
     }
     wrong_payload = _rehash_bridge(wrong_payload)
 
@@ -237,6 +260,119 @@ def test_bridge_rejects_a_v8_previous_writer_generation(tmp_path):
         GaEvidenceBridge.from_mapping(wrong_payload)
 
     assert error.value.code == "GA_EVIDENCE_BRIDGE_WRITER_INVALID"
+
+
+@pytest.mark.parametrize("section", ("production_activation", "default_writer"))
+def test_bridge_rejects_missing_previous_writer_generation(tmp_path, section):
+    _record, _canary, _activation, _admission, bridge, _local_verification, _git = _case(
+        tmp_path
+    )
+    wrong_payload = bridge.to_mapping()
+    wrong_payload[section] = {
+        key: value
+        for key, value in wrong_payload[section].items()
+        if key != "previous_writer_generation"
+    }
+    wrong_payload = _rehash_bridge(wrong_payload)
+
+    with pytest.raises(ReleaseGateError) as error:
+        GaEvidenceBridge.from_mapping(wrong_payload)
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_FIELDS_INVALID"
+
+
+@pytest.mark.parametrize("source_generation", (PRODUCTION_GENERATION, None))
+def test_bridge_rejects_guard_source_generation_not_v6_1(tmp_path, source_generation):
+    record, canary, activation, admission, bridge, local_verification, git = _case(
+        tmp_path
+    )
+    wrong_activation = {
+        **activation,
+        "guard_receipt": {
+            **activation["guard_receipt"],
+            "source_writer_generation": source_generation,
+        },
+    }
+    wrong_bridge = _bridge_with_source(
+        tmp_path,
+        bridge,
+        "production_activation",
+        wrong_activation,
+        "production-activation-readback.json",
+    )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=MAIN_SHA,
+            canary=canary,
+            activation=wrong_activation,
+            admission=admission,
+            git=git,
+            local_verification=local_verification,
+            evidence_bridge=wrong_bridge,
+        )
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("section", "missing"),
+    (
+        ("production_activation", False),
+        ("production_activation", True),
+        ("default_writer", False),
+        ("default_writer", True),
+    ),
+)
+def test_bridge_rejects_readback_previous_lineage_mismatch(tmp_path, section, missing):
+    record, canary, activation, admission, bridge, local_verification, git = _case(
+        tmp_path
+    )
+    if section == "production_activation":
+        transition = {
+            **activation["transition_record"],
+            "previous_writer_generation": GUARD_SOURCE_WRITER_GENERATION,
+        }
+        if missing:
+            transition.pop("previous_writer_generation")
+        wrong_activation = {**activation, "transition_record": transition}
+        wrong_admission = admission
+        wrong_bridge = _bridge_with_source(
+            tmp_path,
+            bridge,
+            section,
+            wrong_activation,
+            "production-activation-readback.json",
+        )
+    else:
+        wrong_activation = activation
+        wrong_admission = dict(admission)
+        if missing:
+            wrong_admission.pop("previous_writer_generation")
+        else:
+            wrong_admission["previous_writer_generation"] = GUARD_SOURCE_WRITER_GENERATION
+        wrong_bridge = _bridge_with_source(
+            tmp_path,
+            bridge,
+            section,
+            wrong_admission,
+            "default-writer-readback.json",
+        )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=MAIN_SHA,
+            canary=canary,
+            activation=wrong_activation,
+            admission=wrong_admission,
+            git=git,
+            local_verification=local_verification,
+            evidence_bridge=wrong_bridge,
+        )
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
 
 
 def test_bridge_keeps_activation_subject_when_final_ga_subject_moves(tmp_path):
@@ -309,6 +445,51 @@ def test_bridge_rejects_an_activation_subject_mismatch(tmp_path):
             git=git,
             local_verification=local_verification,
             evidence_bridge=mismatched,
+        )
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "authorization_field",
+    ("merged_main_sha", "merged_main_git_tree", "release_subject_digest"),
+)
+def test_bridge_rejects_activation_authorization_subject_mismatch(
+    tmp_path, authorization_field
+):
+    record, canary, activation, admission, bridge, local_verification, git = _case(
+        tmp_path
+    )
+    wrong_values = {
+        "merged_main_sha": FINAL_MAIN_SHA,
+        "merged_main_git_tree": FINAL_MAIN_TREE_SHA,
+        "release_subject_digest": FINAL_RELEASE_SUBJECT_DIGEST,
+    }
+    wrong_activation = {
+        **activation,
+        "authorization": {
+            **activation["authorization"],
+            authorization_field: wrong_values[authorization_field],
+        },
+    }
+    wrong_bridge = _bridge_with_source(
+        tmp_path,
+        bridge,
+        "production_activation",
+        wrong_activation,
+        "production-activation-readback.json",
+    )
+
+    with pytest.raises(ReleaseGateError) as error:
+        verify_pre_tag(
+            record,
+            main_sha=MAIN_SHA,
+            canary=canary,
+            activation=wrong_activation,
+            admission=admission,
+            git=git,
+            local_verification=local_verification,
+            evidence_bridge=wrong_bridge,
         )
 
     assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"

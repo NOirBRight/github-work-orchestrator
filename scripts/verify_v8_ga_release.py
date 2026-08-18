@@ -309,6 +309,7 @@ class GaEvidenceBridge:
         {
             "activation_id",
             "legacy_writer_fence_stopped",
+            "previous_writer_generation",
             "readback_receipt_digest",
             "record_id",
             "source_file",
@@ -427,7 +428,7 @@ class GaEvidenceBridge:
             != V8_WRITER_FAMILY
         ):
             raise ReleaseGateError("GA_EVIDENCE_BRIDGE_WRITER_INVALID")
-        if activation["previous_writer_generation"] != V6_1_WRITER_GENERATION:
+        if activation["previous_writer_generation"] != V8_WRITER_GENERATION:
             raise ReleaseGateError("GA_EVIDENCE_BRIDGE_WRITER_INVALID")
         _require_sha256(
             activation["readback_receipt_digest"],
@@ -450,6 +451,8 @@ class GaEvidenceBridge:
             str(default_writer["writer_generation"]).split("-generation-", 1)[0]
             != V8_WRITER_FAMILY
         ):
+            raise ReleaseGateError("GA_EVIDENCE_BRIDGE_WRITER_INVALID")
+        if default_writer["previous_writer_generation"] != V8_WRITER_GENERATION:
             raise ReleaseGateError("GA_EVIDENCE_BRIDGE_WRITER_INVALID")
         if default_writer["legacy_writer_fence_stopped"] is not True:
             raise ReleaseGateError("GA_EVIDENCE_BRIDGE_FENCE_INVALID")
@@ -1993,6 +1996,15 @@ def _verify_pre_tag_bridge(
     activation_release_subject = _bridge_mapping_field(
         activation_payload, "release_subject", "GA_EVIDENCE_BRIDGE_MISMATCH"
     )
+    authorization_merged_main_sha = _bridge_required_sha(
+        authorization, "merged_main_sha", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    authorization_merged_main_tree = _bridge_required_sha(
+        authorization, "merged_main_git_tree", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
+    authorization_release_subject_digest = _bridge_required_sha256(
+        authorization, "release_subject_digest", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    )
     if (
         activation_payload.get("schema") != "gwo-v8-production-activation-readback.v1"
         or activation_payload.get("repository") != record.repository
@@ -2009,6 +2021,8 @@ def _verify_pre_tag_bridge(
         or execute_outcome.get("status") != "cut_over"
         or execute_outcome.get("writer_generation") != writer_generation
         or transition.get("writer_generation") != writer_generation
+        or transition.get("previous_writer_generation")
+        != activation_section["previous_writer_generation"]
         or transition_current.get("writer_generation") != writer_generation
         or record.activation_id != activation_id
         or record.writer_generation != writer_generation
@@ -2028,8 +2042,14 @@ def _verify_pre_tag_bridge(
         or transition.get("status") != "cut_over"
         or transition.get("repository") != record.repository
         or guard_receipt.get("source_writer_generation")
-        != activation_section["previous_writer_generation"]
+        != V6_1_WRITER_GENERATION
         or activation_release_subject != bridge.activation_release_subject
+        or activation_release_subject.get("merged_main_sha")
+        != authorization_merged_main_sha
+        or activation_release_subject.get("merged_main_tree")
+        != authorization_merged_main_tree
+        or activation_release_subject.get("release_subject_digest")
+        != authorization_release_subject_digest
     ):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     admission_activation_id = _bridge_text_field(
@@ -2057,6 +2077,8 @@ def _verify_pre_tag_bridge(
         or admission_record_id != default_section["record_id"]
         or admission_payload.get("legacy_writer_fence_stopped") is not True
         or admission_payload.get("plan_digest") != plan_digest
+        or admission_payload.get("previous_writer_generation")
+        != default_section["previous_writer_generation"]
     ):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     admission_control_ref = _bridge_control_ref(admission_payload)
