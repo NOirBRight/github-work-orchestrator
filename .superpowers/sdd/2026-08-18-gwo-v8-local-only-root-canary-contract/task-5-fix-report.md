@@ -299,3 +299,28 @@ PASS
 git diff --check
 PASS
 ```
+
+## Fresh deterministic local root evidence
+
+Using the checked-in real manifest
+`tests/fixtures/gwo-v8-root-canary-tickets-195-198.json`, two independent
+temporary roots under `%TEMP%\\gwo-v8-local-evidence-20260818-final` were run
+with the fixed run id `phase5-local-root-final` and verified through the
+read-only CLI. The producer records and verifier receipts were byte-identical:
+
+```text
+record_a_sha256=2d2cde7a0874c909b2d1ebdd64046bd9e61444499995257f7e5b509bd8372551
+record_b_sha256=2d2cde7a0874c909b2d1ebdd64046bd9e61444499995257f7e5b509bd8372551
+receipt_a_sha256=67a0d9017a49033af55573af7904130d7fb02048443a65a0f01cbb4e50a90317
+receipt_b_sha256=67a0d9017a49033af55573af7904130d7fb02048443a65a0f01cbb4e50a90317
+canonical_records_equal=True
+gate=LOCAL_ROOT_CANARY_GO
+acceptance_mode=local-only-v1
+status=Complete
+record_digest=824ae8af2b72ba68e80e002c6311c4eca7b9cc0cae2a115249a672c5683f4c7e
+receipt_digest=355ee542ff7f44368789f12e539279b12bb721c737240777dbc21c58e4b4433a
+```
+
+Recursive scans of the local evidence projection and v2 receipt found zero
+forbidden Hosted-CI/PR/publication/remote/workflow/check/URL keys and zero null
+placeholders.
