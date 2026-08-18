@@ -20,7 +20,7 @@ from pathlib import Path
 import secrets
 import stat
 import sys
-from threading import Condition, get_ident
+from threading import RLock, Timer, current_thread
 from typing import Callable
 
 
@@ -248,90 +248,124 @@ class _LiveAttestationSnapshot:
         return getattr(self._bundle, name)
 
 
+class _LiveAttestationState:
+    __slots__ = ("snapshot", "lease", "next_field", "timer", "closed")
+
+    def __init__(self, snapshot: object, lease: object) -> None:
+        self.snapshot = snapshot
+        self.lease = lease
+        self.next_field = 0
+        self.timer: Timer | None = None
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.timer is not None:
+            self.timer.cancel()
+        self.lease.close()
+
+
 class _LiveAttestationCycle:
-    """Share one fresh attestation across the four Store/control reads."""
+    """Bind one fresh, bounded attestation to one four-read evaluation."""
 
     _FIELDS = ("legacy", "durable_state", "writer_fence", "ownership")
+    _MAX_HOLD_SECONDS = 30.0
 
-    __slots__ = (
-        "_capture",
-        "_condition",
-        "_owner",
-        "_remaining",
-        "_snapshot",
-        "_lease",
-        "_next_field",
-    )
+    __slots__ = ("_capture", "_lock", "_states")
 
     def __init__(self, capture: Callable[[], object]) -> None:
         self._capture = capture
-        self._condition = Condition()
-        self._owner: int | None = None
-        self._remaining = 0
-        self._snapshot: object | None = None
-        self._lease: object | None = None
-        self._next_field = 0
+        self._lock = RLock()
+        self._states: dict[object, _LiveAttestationState] = {}
 
-    def _reset(self) -> None:
-        self._owner = None
-        self._remaining = 0
-        self._snapshot = None
-        self._lease = None
-        self._next_field = 0
-        self._condition.notify_all()
+    def _close_state(self, owner: object, state: _LiveAttestationState) -> None:
+        if self._states.get(owner) is state:
+            self._states.pop(owner, None)
+        state.close()
 
-    def _close(self) -> None:
-        lease = self._lease
+    def _expire(self, owner: object, state: _LiveAttestationState) -> None:
+        with self._lock:
+            if self._states.get(owner) is not state:
+                return
+            self._states.pop(owner, None)
+            try:
+                state.close()
+            except Exception:
+                pass
+
+    def _start_state(self, owner: object) -> _LiveAttestationState:
+        snapshot = self._capture()
+        lease = getattr(snapshot, "lease", None)
+        if not callable(getattr(lease, "assert_stable", None)) or not callable(
+            getattr(lease, "close", None)
+        ):
+            _fail(
+                "LIVE_GUARD_READ_UNAVAILABLE",
+                "live attestation lease contract is unavailable",
+            )
+        state = _LiveAttestationState(snapshot, lease)
+        self._states[owner] = state
+        timer = Timer(
+            self._MAX_HOLD_SECONDS,
+            self._expire,
+            args=(owner, state),
+        )
+        timer.daemon = True
+        state.timer = timer
         try:
-            if lease is not None:
-                lease.close()
-        finally:
-            self._reset()
+            timer.start()
+        except Exception:
+            self._close_state(owner, state)
+            raise
+        return state
 
     def read(self, field: str, repository: str) -> object:
-        current_thread = get_ident()
-        with self._condition:
-            while self._owner is not None and self._owner != current_thread:
-                self._condition.wait()
-            if self._snapshot is None:
-                snapshot = self._capture()
-                lease = getattr(snapshot, "lease", None)
-                if not callable(getattr(lease, "close", None)):
-                    _fail(
-                        "LIVE_GUARD_READ_UNAVAILABLE",
-                        "live attestation has no closable lease",
-                    )
-                self._owner = current_thread
-                self._remaining = len(self._FIELDS)
-                self._snapshot = snapshot
-                self._lease = lease
-                self._next_field = 0
-            if field != self._FIELDS[self._next_field]:
-                self._close()
+        owner = current_thread()
+        with self._lock:
+            state = self._states.get(owner)
+            if field == "legacy":
+                if state is not None:
+                    try:
+                        state.lease.assert_stable()
+                    except Exception:
+                        self._close_state(owner, state)
+                        raise
+                    self._close_state(owner, state)
+                state = self._start_state(owner)
+            elif state is None:
+                _fail(
+                    "LIVE_GUARD_READ_UNAVAILABLE",
+                    "Guard reads must start with one legacy read",
+                )
+            if field != self._FIELDS[state.next_field]:
+                self._close_state(owner, state)
                 _fail(
                     "LIVE_GUARD_READ_UNAVAILABLE",
                     "Guard reads did not consume one ordered live snapshot",
                 )
-            snapshot = self._snapshot
             try:
-                if getattr(snapshot, "subject").repository != repository:
+                state.lease.assert_stable()
+                if getattr(state.snapshot, "subject").repository != repository:
                     _fail(
                         "LIVE_GUARD_READ_UNAVAILABLE",
                         "Guard read repository differs from the live subject",
                     )
-                value = getattr(snapshot, field, None)
+                value = getattr(state.snapshot, field, None)
                 if value is None:
                     _fail(
                         "LIVE_GUARD_READ_UNAVAILABLE",
                         f"live attestation has no {field} readback",
                     )
+                if state.next_field == len(self._FIELDS) - 1:
+                    state.lease.assert_stable()
             except Exception:
-                self._close()
+                self._close_state(owner, state)
                 raise
-            self._next_field += 1
-            self._remaining -= 1
-            if self._remaining == 0:
-                self._close()
+            state.next_field += 1
+            if state.next_field == len(self._FIELDS):
+                self._close_state(owner, state)
             return value
 
 

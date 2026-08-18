@@ -284,12 +284,15 @@ def test_live_host_uses_the_release_subject_bound_attestor_path(monkeypatch, tmp
     ]
 
 
-def test_live_attestation_cycle_holds_each_lease_and_serializes_evaluations():
+def test_live_attestation_cycle_holds_each_lease_and_isolates_evaluations():
     import gwo_v8_live_guard_host as module
 
     class Lease:
         def __init__(self):
             self.close_count = 0
+
+        def assert_stable(self):
+            return None
 
         def close(self):
             self.close_count += 1
@@ -345,7 +348,7 @@ def test_live_attestation_cycle_holds_each_lease_and_serializes_evaluations():
     assert first_read.wait(2)
     second_thread.start()
     try:
-        assert not second_read_finished.wait(0.1)
+        assert second_read_finished.wait(1)
     finally:
         allow_first_evaluation.set()
     first_thread.join(2)
@@ -356,3 +359,145 @@ def test_live_attestation_cycle_holds_each_lease_and_serializes_evaluations():
     assert errors == []
     assert second_values == ["legacy-2"]
     assert [snapshot.lease.close_count for snapshot in snapshots] == [1, 1]
+
+
+def test_live_attestation_cycle_restarts_after_a_one_shot_legacy_read():
+    import gwo_v8_live_guard_host as module
+
+    class Lease:
+        def __init__(self):
+            self.close_count = 0
+
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            self.close_count += 1
+
+    snapshots: list[SimpleNamespace] = []
+
+    def capture():
+        generation = len(snapshots) + 1
+        snapshot = SimpleNamespace(
+            subject=SimpleNamespace(repository="owner/repo"),
+            legacy=f"legacy-{generation}",
+            durable_state=f"durable-{generation}",
+            writer_fence=f"writer-{generation}",
+            ownership=f"ownership-{generation}",
+            lease=Lease(),
+        )
+        snapshots.append(snapshot)
+        return snapshot
+
+    cycle = module._LiveAttestationCycle(capture)
+
+    assert cycle.read("legacy", "owner/repo") == "legacy-1"
+    values = tuple(
+        cycle.read(field, "owner/repo")
+        for field in ("legacy", "durable_state", "writer_fence", "ownership")
+    )
+
+    assert values == ("legacy-2", "durable-2", "writer-2", "ownership-2")
+    assert [snapshot.lease.close_count for snapshot in snapshots] == [1, 1]
+
+
+def test_live_attestation_cycle_releases_an_abandoned_thread_snapshot(monkeypatch):
+    import gwo_v8_live_guard_host as module
+
+    monkeypatch.setattr(module._LiveAttestationCycle, "_MAX_HOLD_SECONDS", 0.05, raising=False)
+
+    class Lease:
+        def __init__(self):
+            self.close_count = 0
+            self.closed = threading.Event()
+
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            self.close_count += 1
+            self.closed.set()
+
+    snapshots: list[SimpleNamespace] = []
+
+    def capture():
+        generation = len(snapshots) + 1
+        snapshot = SimpleNamespace(
+            subject=SimpleNamespace(repository="owner/repo"),
+            legacy=f"legacy-{generation}",
+            durable_state=f"durable-{generation}",
+            writer_fence=f"writer-{generation}",
+            ownership=f"ownership-{generation}",
+            lease=Lease(),
+        )
+        snapshots.append(snapshot)
+        return snapshot
+
+    cycle = module._LiveAttestationCycle(capture)
+
+    abandoned = threading.Thread(
+        target=lambda: cycle.read("legacy", "owner/repo"),
+        daemon=True,
+    )
+    abandoned.start()
+    abandoned.join(1)
+    assert not abandoned.is_alive()
+
+    values: list[str] = []
+    errors: list[BaseException] = []
+
+    def evaluate():
+        try:
+            values.extend(
+                cycle.read(field, "owner/repo")
+                for field in ("legacy", "durable_state", "writer_fence", "ownership")
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    survivor = threading.Thread(target=evaluate, daemon=True)
+    survivor.start()
+    survivor.join(1)
+
+    assert not survivor.is_alive()
+    assert errors == []
+    assert values == ["legacy-2", "durable-2", "writer-2", "ownership-2"]
+    assert snapshots[0].lease.closed.wait(1)
+    assert [snapshot.lease.close_count for snapshot in snapshots] == [1, 1]
+
+
+def test_live_attestation_cycle_asserts_lease_stability_before_each_read():
+    import gwo_v8_live_guard_host as module
+
+    class Lease:
+        def __init__(self):
+            self.assertions = 0
+            self.close_count = 0
+            self.drifted = False
+
+        def assert_stable(self):
+            self.assertions += 1
+            if self.drifted:
+                raise RuntimeError("source drift")
+
+        def close(self):
+            self.close_count += 1
+
+    lease = Lease()
+    snapshot = SimpleNamespace(
+        subject=SimpleNamespace(repository="owner/repo"),
+        legacy="legacy",
+        durable_state="durable",
+        writer_fence="writer",
+        ownership="ownership",
+        lease=lease,
+    )
+    cycle = module._LiveAttestationCycle(lambda: snapshot)
+
+    assert cycle.read("legacy", "owner/repo") == "legacy"
+    lease.drifted = True
+    with pytest.raises(RuntimeError, match="source drift"):
+        cycle.read("durable_state", "owner/repo")
+
+    assert lease.assertions == 2
+    assert lease.close_count == 1
