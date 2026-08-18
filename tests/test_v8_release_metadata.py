@@ -794,6 +794,30 @@ def test_canonical_local_verification_requires_full_pytest_readback(tmp_path):
     assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING"
 
 
+@pytest.mark.parametrize("evidence_name", ["full_suite", "full_pytest"])
+def test_canonical_local_verification_rejects_commandless_full_pytest_evidence(
+    tmp_path, evidence_name
+):
+    manifest = _canonical_local_verification_manifest(
+        commands=None,
+        **{
+            evidence_name: {
+                "exit_code": 0,
+                "status": "passed",
+                "passed": 42,
+                "summary": "42 passed in 1.0s",
+            }
+        },
+    )
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_FAILED"
+
+
 @pytest.mark.parametrize(
     "command",
     [

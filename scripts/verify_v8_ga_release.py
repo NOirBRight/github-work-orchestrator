@@ -672,12 +672,10 @@ def _canonical_pytest_result_count(
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
     count = counts[0]
 
-    if any(
-        name in result for name in ("name", "command", "arguments", "argv")
-    ):
-        _require_canonical_full_command(
-            result, require_name=require_command_name
-        )
+    command_fields = ("name", "command", "arguments", "argv")
+    if not any(name in result for name in command_fields):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    _require_canonical_full_command(result, require_name=require_command_name)
     summary_count = _pytest_summary_count(
         result.get("summary", result.get("output"))
     )
