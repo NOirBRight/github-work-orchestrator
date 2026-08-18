@@ -528,8 +528,16 @@ def _validate_identity(
     expected_canary = (
         config.canary_repository
         if config.canary_repository is not None
-        else target
+        else authorization.canary_repository
     )
+    if (
+        config.canary_repository is not None
+        and config.canary_repository != authorization.canary_repository
+    ):
+        raise _error(
+            "FACTORY_IDENTITY_DISJOINT",
+            "configured Canary repository is not authorized",
+        )
     if any(
         location[1] != expected_canary
         for location in config.canary_locations
@@ -847,6 +855,11 @@ class ProductionActivationCompositionFactory:
             publication=publication,
             guard=guard,
         )
+        expected_canary = (
+            config.canary_repository
+            if config.canary_repository is not None
+            else authorization.canary_repository
+        )
         locations = {
             source_ref: (repository, branch, path)
             for source_ref, repository, branch, path in config.canary_locations
@@ -854,16 +867,13 @@ class ProductionActivationCompositionFactory:
         canary_control = GitHubCanaryEvidenceControl(
             client,
             locations,
-            manifest_repository=(
-                config.canary_repository
-                if config.canary_repository is not None
-                else authorization.target_repository
-            ),
+            manifest_repository=expected_canary,
             manifest_branch=config.control_branch,
         )
         composition = ProductionActivationComposition(
             controller=controller,
             canary_evidence_control=canary_control,
+            expected_canary_repository=expected_canary,
         )
         if type(composition) is not ProductionActivationComposition:
             raise _error(

@@ -83,6 +83,7 @@ class ProductionActivationAuthorization:
     release_subject_digest: str
     evidence_root: str
     target_repository: str
+    canary_repository: str
     writer_transition: str
     target_writer_generation: str
 
@@ -95,6 +96,7 @@ class ProductionActivationAuthorization:
         release_subject_digest: str | None = None,
         evidence_root: str | None = None,
         target_repository: str | None = None,
+        canary_repository: str | None = None,
         writer_transition: str = WRITER_TRANSITION,
         target_writer_generation: str | None = None,
         *,
@@ -114,6 +116,11 @@ class ProductionActivationAuthorization:
         object.__setattr__(self, "release_subject_digest", release_subject_digest)
         object.__setattr__(self, "evidence_root", evidence_root)
         object.__setattr__(self, "target_repository", target_repository)
+        object.__setattr__(
+            self,
+            "canary_repository",
+            target_repository if canary_repository is None else canary_repository,
+        )
         object.__setattr__(self, "writer_transition", writer_transition)
         object.__setattr__(self, "target_writer_generation", target_writer_generation)
         self.__post_init__()
@@ -167,6 +174,7 @@ class ProductionActivationAuthorization:
             "release_subject_digest": self.release_subject_digest,
             "evidence_root": self.evidence_root,
             "target_repository": self.target_repository,
+            "canary_repository": self.canary_repository,
             "writer_transition": self.writer_transition,
             "target_writer_generation": self.target_writer_generation,
         }
@@ -200,6 +208,7 @@ class ProductionActivationAuthorizationReceipt:
     release_subject_digest: str
     evidence_root: str
     target_repository: str
+    canary_repository: str
     writer_transition: str
     target_writer_generation: str
     approval_ref: str
@@ -214,6 +223,7 @@ class ProductionActivationAuthorizationReceipt:
         release_subject_digest: str | None = None,
         evidence_root: str | None = None,
         target_repository: str | None = None,
+        canary_repository: str | None = None,
         writer_transition: str = WRITER_TRANSITION,
         target_writer_generation: str | None = None,
         approval_ref: str | None = None,
@@ -235,6 +245,11 @@ class ProductionActivationAuthorizationReceipt:
         object.__setattr__(self, "release_subject_digest", release_subject_digest)
         object.__setattr__(self, "evidence_root", evidence_root)
         object.__setattr__(self, "target_repository", target_repository)
+        object.__setattr__(
+            self,
+            "canary_repository",
+            target_repository if canary_repository is None else canary_repository,
+        )
         object.__setattr__(self, "writer_transition", writer_transition)
         object.__setattr__(self, "target_writer_generation", target_writer_generation)
         object.__setattr__(self, "approval_ref", approval_ref)
@@ -247,6 +262,7 @@ class ProductionActivationAuthorizationReceipt:
             "repository",
             "evidence_root",
             "target_repository",
+            "canary_repository",
             "writer_transition",
             "target_writer_generation",
             "approval_ref",
@@ -299,6 +315,7 @@ class ProductionActivationAuthorizationReceipt:
             "release_subject_digest": self.release_subject_digest,
             "evidence_root": self.evidence_root,
             "target_repository": self.target_repository,
+            "canary_repository": self.canary_repository,
             "writer_transition": self.writer_transition,
             "target_writer_generation": self.target_writer_generation,
             "approval_ref": self.approval_ref,
@@ -395,6 +412,7 @@ class ProductionActivationComposition:
 
     controller: WriterCutoverController
     canary_evidence_control: CanaryEvidenceControl
+    expected_canary_repository: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.controller) is not WriterCutoverController:
@@ -408,6 +426,13 @@ class ProductionActivationComposition:
             raise TypeError(
                 "ProductionActivationComposition.canary_evidence_control must expose "
                 "durable read operations"
+            )
+        if self.expected_canary_repository is not None and not _nonempty_text(
+            self.expected_canary_repository
+        ):
+            raise ValueError(
+                "ProductionActivationComposition.expected_canary_repository must be "
+                "non-empty text when configured"
             )
 
 
@@ -442,10 +467,12 @@ class ProductionActivationFacade:
         *,
         authorization_source: ProductionActivationAuthorizationSource | None = None,
         canary_evidence_control: CanaryEvidenceControl | None = None,
+        expected_canary_repository: str | None = None,
     ):
         self._controller = controller
         self._authorization_source = authorization_source
         self._canary_evidence_control = canary_evidence_control
+        self._expected_canary_repository = expected_canary_repository
 
     def preflight(
         self,
@@ -644,6 +671,7 @@ class ProductionActivationFacade:
         authorization_receipt = self._read_authorization_receipt(authorization)
         plan = request.compiled_plan if compiled_plan is None else compiled_plan
         subject = request.guard_subject
+        expected_canary_repository = self._expected_canary_repository_for(request)
 
         if (
             plan.repository != authorization.target_repository
@@ -683,6 +711,7 @@ class ProductionActivationFacade:
             )
         if (
             not _nonempty_text(canary.repository)
+            or canary.repository != expected_canary_repository
             or not _is_digest(canary.evidence_package_digest)
             or not _nonempty_text(canary.manifest_ref)
             or type(canary.evidence_refs) is not tuple
@@ -694,7 +723,7 @@ class ProductionActivationFacade:
                 "CANARY_EVIDENCE_IDENTITY_INVALID",
                 "Canary evidence is not bound to its named repository and package identity",
             )
-        self._validate_canary_readback(canary, canary.repository)
+        self._validate_canary_readback(canary, expected_canary_repository)
 
         receipt = request.guard_receipt
         if receipt is None:
@@ -934,6 +963,22 @@ class ProductionActivationFacade:
                 "Canary package Evidence refs are incomplete or reordered",
             )
 
+    def _expected_canary_repository_for(
+        self,
+        request: ProductionActivationRequest,
+    ) -> str:
+        expected = (
+            request.authorization.canary_repository
+            if self._expected_canary_repository is None
+            else self._expected_canary_repository
+        )
+        if expected != request.authorization.canary_repository:
+            _reject(
+                "CANARY_EVIDENCE_IDENTITY_INVALID",
+                "Facade expected Canary repository does not match owner authorization",
+            )
+        return expected
+
     def _read_authorization_receipt(
         self,
         authorization: ProductionActivationAuthorization,
@@ -966,6 +1011,7 @@ class ProductionActivationFacade:
             or receipt.merged_main_git_tree != authorization.merged_main_git_tree
             or receipt.release_subject_digest != authorization.release_subject_digest
             or receipt.target_repository != authorization.target_repository
+            or receipt.canary_repository != authorization.canary_repository
             or receipt.writer_transition != authorization.writer_transition
             or receipt.target_writer_generation
             != authorization.target_writer_generation
@@ -1032,6 +1078,7 @@ class ProductionActivationFacade:
             or record.plan_digest != plan.digest
             or record.canary_evidence_digest
             != request.canary.evidence_package_digest
+            or record.canary_repository != request.authorization.canary_repository
             or record.worker_capacity != request.worker_capacity
             or record.coordinator_capacity != request.coordinator_capacity
         ):
@@ -1100,6 +1147,7 @@ class ProductionActivationFacade:
             and record.plan_digest == plan.digest
             and record.canary_evidence_digest
             == request.canary.evidence_package_digest
+            and record.canary_repository == request.authorization.canary_repository
             and record.canary_evidence_refs == request.canary.evidence_refs
             and record.canary_manifest_ref == request.canary.manifest_ref
             and record.worker_capacity == 0
@@ -1161,6 +1209,7 @@ class ProductionActivationFacade:
             or record.plan_digest != plan.digest
             or record.canary_evidence_digest
             != request.canary.evidence_package_digest
+            or record.canary_repository != request.authorization.canary_repository
             or record.canary_evidence_refs != request.canary.evidence_refs
             or record.canary_manifest_ref != request.canary.manifest_ref
             or record.worker_capacity != _EXPECTED_WORKER_CAPACITY

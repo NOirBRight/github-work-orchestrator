@@ -172,7 +172,10 @@ def test_activation_bundle_builds_all_typed_inputs_and_controller_wiring(tmp_pat
 
 def test_cli_preserves_named_external_canary_through_composition_wiring(tmp_path):
     fixture = activation_fixture(tmp_path)
-    authorization = _authorization(fixture, tmp_path)
+    authorization = replace(
+        _authorization(fixture, tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+    )
     receipt = _authorization_receipt(authorization)
     canary, canary_control = _external_canary()
     bundle = build_activation_bundle(
@@ -204,6 +207,21 @@ def test_activation_bundle_rejects_tampered_owner_identity_before_factory(tmp_pa
         build_activation_bundle(payload)
 
     assert raised.value.code == "AUTHORIZATION_IDENTITY_INVALID"
+
+
+def test_cli_requires_explicit_canary_repository_in_closed_authorization_schema(
+    tmp_path,
+):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    receipt = _authorization_receipt(authorization)
+    payload = _payload(fixture, authorization, receipt)
+    payload["authorization"].pop("canary_repository", None)
+
+    with pytest.raises(ProductionActivationError) as raised:
+        build_activation_bundle(payload)
+
+    assert raised.value.code == "ACTIVATION_INPUT_INVALID"
 
 
 def test_preflight_mode_does_not_call_controller_mutation(tmp_path):

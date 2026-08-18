@@ -495,6 +495,7 @@ class _RefContentClient:
         *,
         status="cut_over",
         repository="owner/repository",
+        canary_repository=None,
     ):
         from gwo_v8._canonical import digest_value
 
@@ -517,6 +518,8 @@ class _RefContentClient:
                     "reason",
                 )
             }
+            if canary_repository is not None:
+                identity["canary_repository"] = value["canary_repository"]
             return f"writer-transition:{digest_value(identity)[:24]}"
 
         pending = {
@@ -536,6 +539,8 @@ class _RefContentClient:
             "reason": None,
             "created_at": "2026-07-30T00:00:00+00:00",
         }
+        if canary_repository is not None:
+            pending["canary_repository"] = canary_repository
         record = {
             **pending,
             "record_id": "",
@@ -724,6 +729,31 @@ class _RefContentClient:
         )
         self.head = f"commit:{len(self._commits) + 1}"
         self._commits[self.head] = tree
+
+
+def test_writer_authority_readback_preserves_named_canary_repository():
+    from gwo_v8._canonical import canonical_bytes
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+
+    client = _RefContentClient()
+    writer = client._writer_value(
+        "writer:one",
+        canary_repository="owner/canary",
+    )
+    client._commits[client.head][".gwo-v8/writer-transition.json"] = (
+        client._content_type(canonical_bytes(writer), "blob:external-canary")
+    )
+
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+
+    authority = repository._writer_authority_at_ref(client.head)
+
+    assert authority["canary_repository"] == "owner/canary"
 
 
 class _PlanSource:

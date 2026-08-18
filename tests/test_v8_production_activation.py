@@ -103,7 +103,14 @@ class _CanaryControl:
         return self.delegate.read_manifest(manifest_ref)
 
 
-def _facade(fixture, authorization, *, canary=True, canary_control=None):
+def _facade(
+    fixture,
+    authorization,
+    *,
+    canary=True,
+    canary_control=None,
+    expected_canary_repository=None,
+):
     arguments = {
         "authorization_source": _AuthorizationSource(
             _authorization_receipt(authorization),
@@ -115,6 +122,8 @@ def _facade(fixture, authorization, *, canary=True, canary_control=None):
             if canary_control is None
             else canary_control
         )
+    if expected_canary_repository is not None:
+        arguments["expected_canary_repository"] = expected_canary_repository
     return ProductionActivationFacade(fixture.controller, **arguments)
 
 
@@ -135,7 +144,14 @@ def _request(fixture, authorization):
     )
 
 
-def _publish_pending(fixture, request, *, manifest_ref=None, plan_digest=None):
+def _publish_pending(
+    fixture,
+    request,
+    *,
+    manifest_ref=None,
+    plan_digest=None,
+    canary_repository=None,
+):
     authorization = request.authorization
     canary = request.canary
     fixture.transitions.publish(
@@ -156,6 +172,11 @@ def _publish_pending(fixture, request, *, manifest_ref=None, plan_digest=None):
             canary_evidence_refs=canary.evidence_refs,
             canary_manifest_ref=(
                 canary.manifest_ref if manifest_ref is None else manifest_ref
+            ),
+            canary_repository=(
+                canary.repository
+                if canary_repository is None
+                else canary_repository
             ),
             worker_capacity=0,
             coordinator_capacity=0,
@@ -255,7 +276,10 @@ def test_preflight_rejects_authorization_provenance_readback_mismatch(
     tmp_path,
 ):
     fixture = activation_fixture(tmp_path)
-    authorization = _authorization(fixture, tmp_path)
+    authorization = replace(
+        _authorization(fixture, tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+    )
     request = _request(fixture, authorization)
     changed = replace(authorization, **{field: value})
     facade = ProductionActivationFacade(
@@ -284,6 +308,23 @@ def test_source_main_tree_is_not_guard_subject_source_tree_digest(tmp_path):
     assert preflight.authorization_receipt.source_main_tree == (
         authorization.source_main_tree
     )
+
+
+def test_authorization_and_receipt_bind_canary_repository_in_identity(tmp_path):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    receipt = _authorization_receipt(authorization)
+
+    assert authorization.canary_repository == authorization.target_repository
+    assert (
+        authorization.canonical_without_receipt_fields()["canary_repository"]
+        == authorization.target_repository
+    )
+    assert receipt.canary_repository == authorization.canary_repository
+    assert receipt.has_valid_digest()
+
+    changed = replace(receipt, canary_repository="other/canary")
+    assert not changed.has_valid_digest()
 
 
 def test_preflight_requires_durable_canary_evidence_readback_dependency(tmp_path):
@@ -354,7 +395,10 @@ def test_preflight_accepts_external_canary_when_named_package_readback_matches(
     tmp_path,
 ):
     fixture = activation_fixture(tmp_path)
-    authorization = _authorization(fixture, tmp_path)
+    authorization = replace(
+        _authorization(fixture, tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+    )
     canary, control = _external_canary()
 
     preflight = _facade(
@@ -367,6 +411,27 @@ def test_preflight_accepts_external_canary_when_named_package_readback_matches(
 
     assert preflight.canary_evidence_digest == canary.evidence_package_digest
     assert preflight.current_writer.repository == fixture.repository
+
+
+def test_preflight_rejects_canary_repository_outside_facade_expected_identity(
+    tmp_path,
+):
+    fixture = activation_fixture(tmp_path)
+    authorization = replace(
+        _authorization(fixture, tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+    )
+    request = _request(fixture, authorization)
+
+    with pytest.raises(ProductionActivationError) as raised:
+        _facade(
+            fixture,
+            authorization,
+            expected_canary_repository=CANARY_REPOSITORY,
+        ).preflight(request)
+
+    assert raised.value.code == "CANARY_EVIDENCE_IDENTITY_INVALID"
+    assert fixture.mutation_calls() == ()
 
 
 @pytest.mark.parametrize(
@@ -461,6 +526,26 @@ def test_execute_rejects_a_nonmatching_pending_cutover_without_resuming(tmp_path
     assert raised.value.code == "ACTIVATION_READBACK_INVALID"
     assert fixture.mutation_calls() == ()
     assert len(fixture.transitions.history(fixture.repository)) == 1
+
+
+def test_execute_rejects_pending_record_from_another_canary_repository(tmp_path):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    request = _request(fixture, authorization)
+    _publish_pending(
+        fixture,
+        request,
+        canary_repository="other/canary",
+    )
+
+    with pytest.raises(ProductionActivationError) as raised:
+        _facade(fixture, authorization).execute(
+            request,
+            authorization=authorization,
+        )
+
+    assert raised.value.code == "ACTIVATION_READBACK_INVALID"
+    assert fixture.mutation_calls() == ()
 
 
 def test_execute_rejects_compilation_record_mutation_after_preflight(tmp_path):

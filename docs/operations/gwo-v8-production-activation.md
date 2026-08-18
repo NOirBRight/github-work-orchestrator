@@ -21,14 +21,15 @@ required and is included in the authorization receipt digest:
 | `run_id` | One operator activation attempt |
 | `evidence_root` | Exact evidence root for that attempt |
 | `target_repository` | Repository whose writer authority is changed |
+| `canary_repository` | Exact repository that owns the accepted Canary package and Evidence |
 | `writer_transition` | Must equal the literal `v6.1 -> v8` |
 | `target_writer_generation` | Exact V8 writer-generation identity |
 
 `ProductionActivationAuthorizationReceipt` repeats those fields and adds
 `approval_ref` and `receipt_digest`. The digest covers every field except
 `receipt_digest`; a receipt with a changed repository, merged-main identity,
-subject digest, run, evidence root, target, or transition is rejected before
-any cutover control is called.
+subject digest, run, evidence root, target, Canary source, or transition is
+rejected before any cutover control is called.
 
 `source_main_sha` and `source_main_tree` remain read-only compatibility aliases
 for the merged-main fields. They are not emitted by the canonical contract.
@@ -134,6 +135,13 @@ it exactly; for the Phase 5 external consumer this is
 readback to that repository. An omitted configuration for an external Canary,
 or any configured/input mismatch, fails closed with
 `FACTORY_IDENTITY_DISJOINT`.
+
+The authorization and receipt carry the same `canary_repository`, so the
+external source is not merely a factory-local setting. Transition records also
+persist that repository alongside the package digest, manifest reference, and
+Evidence references. Pending, cut-over, replay, drain, and rollback readback
+must preserve the exact value; a record from another Canary source cannot be
+resumed or treated as the authorized activation.
 
 This identity is independent of the writer target: `compiled_plan.repository`,
 `CutoverSubject.repository`, and `CutoverGuardReceipt.repository` remain bound
