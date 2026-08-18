@@ -45,10 +45,12 @@ Release sequencing and publication boundaries are recorded in
 metadata and exit-criteria work; it does not redefine V8 mechanics or
 authorize a production writer.
 
-Repository release acceptance is Local Verification Only. Beta1 uses exact
-SHA/tree evidence from Python 3.13 and the retained hash-locked requirements
-file before tag or Release publication. GWO product Hosted CI remains the
-product-layer delivery mechanism for product acceptance.
+Repository release acceptance is explicitly `local-only-v1` (Local
+Verification Only). Beta1 requires exact SHA/tree evidence, a successful full
+pytest readback, `workflow_count: 0`, explicit disabled Actions/workflows, and
+no CI, Hosted-CI, or pull-request fields before tag or Release publication.
+GWO product Hosted CI (Hosted-CI) remains the separate product-layer delivery mechanism;
+repository verification does not satisfy that product boundary.
 
 | Release | Required merged state | Production authority |
 | --- | --- | --- |
@@ -368,10 +370,12 @@ Exit criteria for #119:
   bounded repair and binding replacement, and cleanup. Its three
   Standard-Assurance accepted Candidates form one compatible multi-member
   Batch, while its Strict-Assurance accepted Candidate forms a separate
-  Singleton Batch and is never co-batched. Each Batch has its own exact Batch
-  SHA, repository-equivalent local verification, pull-request, GWO product Hosted CI,
-  Integration-Lease-serialized target integration, and target-readback
-  boundary;
+  Singleton Batch and is never co-batched. The repository acceptance is a
+  `local-only-v1` projection: each Batch has its own exact Batch SHA, local
+  suite, Integration-Lease-serialized target integration, and target-readback
+  boundary, with no PR or Hosted-CI fields. Product Hosted-CI remains a
+  separate BatchIntegrator concern and is not satisfied by this repository
+  receipt;
 - Canary acceptance reads back the frozen Authority Grants, Policy Witness, and
   PlanSpec authority-root digest exactly. For each Work Run, it proves no more
   than three distinct Candidate SHAs, one initial Worker binding, and at most

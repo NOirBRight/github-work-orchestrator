@@ -1,8 +1,8 @@
 # GWO V8 Root Canary Acceptance
 
-This document defines the read-only acceptance projection for Root Canary Task
-4. It is a verifier contract and runbook; it does **not** claim live GitHub or
-Paseo execution.
+This document defines the read-only `local-only-v1` acceptance projection for
+the Root Canary. It is a verifier contract and runbook; it does **not** claim
+live GitHub, Hosted-CI, or Paseo execution.
 
 ## Acceptance boundary
 
@@ -21,11 +21,11 @@ when all of these readbacks agree:
   Issue number;
 - every Candidate receipt and Review Finding ledger is present, linked to the
   exact Ticket and receipt digest, and closed with no open Finding;
-- each Batch has a passed local suite, the same Batch SHA at its PR head and
-  hosted-CI readback, a serialized Integration Lease, merge integration, and a
-  target readback proving Batch ancestry, PR identity, and the PR-to-merge
-  target mapping;
-- the two Batch PR numbers and hosted run identities are distinct;
+- each Batch has a passed local suite, a Batch ref/SHA readback, a serialized
+  Integration Lease, CAS target integration, Batch ancestry, and final target
+  readback; and
+- local evidence contains no pull-request, Hosted-CI, workflow-run, or remote
+  publication identity field;
 - the read-only recovery proof records a four-slot peak and a complete refill,
   preserves every permission request on the same Runtime Binding through an
   authorization link, authorizes each stale diagnosis at most once, and
@@ -47,7 +47,7 @@ and performs no workflow, Issue, PR, CI, target, or Paseo mutation.
 
 The normal inputs are:
 
-1. Task 1's `gwo-v8-root-canary-tickets.v1` manifest, including all four
+1. Task 1's `gwo-v8-root-canary-tickets.v2` manifest, including all four
    authoritative Issue readbacks;
 2. a fresh-process public `inspect` JSON projection containing the acceptance
    bundle, a required complete diagnostics status, and recovery proof;
@@ -88,7 +88,8 @@ evidence into a claim that a live GitHub or Paseo Campaign ran.
 ## Generated acceptance projection
 
 `write_acceptance_document(path, receipt)` writes a Markdown document with
-schema `gwo-v8-root-canary-acceptance.v1`, the receipt's canonical fields,
+schema `gwo-v8-root-canary-acceptance.v2` and `acceptance_mode:
+local-only-v1`, the receipt's canonical fields,
 complete `authoritative_evidence`, and the final `receipt_digest`. The generated
 document repeats the local/read-only limitation so it cannot be mistaken for
 live GA evidence.

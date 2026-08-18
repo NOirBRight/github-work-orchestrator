@@ -6,11 +6,19 @@ production writer cutover. The normative order remains `CONTEXT.md`, accepted
 ADRs, the integrated architecture, the stabilization specification, and the
 lean roadmap.
 
-Repository release acceptance is Local Verification Only, and this repository's
-GitHub Actions acceptance is disabled. Release gates use exact SHA/tree
-evidence from a Python 3.13 environment installed from the retained
-hash-locked requirements file. GWO product Hosted CI remains the separate
-product-layer delivery mechanism.
+Repository release acceptance is explicitly `local-only-v1` (Local
+Verification Only), and this repository's GitHub Actions acceptance is
+disabled. The local manifest must read back `workflow_count: 0`, disabled
+Actions/workflows, a successful full pytest suite, and the exact subject
+SHA/tree, with no CI, Hosted-CI, or pull-request fields. GWO product Hosted CI
+(Hosted-CI) remains the separate product-layer delivery mechanism and is not
+satisfied by
+repository release verification.
+
+| Evidence boundary | Proves | Does not prove |
+| --- | --- | --- |
+| Repository release (`local-only-v1`) | Exact local SHA/tree, full pytest, disabled repository workflows, and release metadata | Product Batch Hosted-CI, PR publication, or production writer authority |
+| Product delivery | The product BatchIntegrator's own Hosted-CI and target-delivery contract | Repository release acceptance or local-only evidence retroactively |
 
 ## Release sequence
 

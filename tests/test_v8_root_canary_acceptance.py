@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +15,29 @@ from scripts.verify_v8_root_canary import (
     ROOT_REPOSITORY,
     RootCanaryAcceptanceReceiptV1,
     RootCanaryVerificationError,
+    digest_value,
     verify_main,
     verify_root_canary,
     write_acceptance_document,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ROOT_TICKETS = ROOT / "tests" / "fixtures" / "gwo-v8-root-canary-tickets-195-198.json"
+
+
+def _load_local_acceptance_runner():
+    """Load the runner from this checkout, not a namespace-package sibling."""
+
+    runner_path = ROOT / "scripts" / "run_v8_local_acceptance.py"
+    spec = importlib.util.spec_from_file_location(
+        "gwo_v8_root_local_acceptance_test", runner_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _batch(
@@ -452,6 +473,21 @@ def valid_bundle() -> AcceptanceFixture:
             "diagnostics": {"status": "Complete", "proof": proof},
         }
     )
+
+
+@pytest.fixture(scope="module")
+def local_only_bundle(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    runner = _load_local_acceptance_runner()
+    record = runner.run_local_acceptance(
+        root=tmp_path_factory.mktemp("local-root-producer"),
+        run_id="task3-local-verifier",
+        scenario="root",
+        tickets=ROOT_TICKETS,
+    )
+    manifest = json.loads(ROOT_TICKETS.read_text(encoding="utf-8"))
+    record["tickets"] = copy.deepcopy(manifest["tickets"])
+    record["ready_refs"] = list(manifest["ready_refs"])
+    return record
 
 
 def test_acceptance_requires_three_standard_in_one_batch_and_strict_singleton(
@@ -1092,3 +1128,631 @@ def test_assurance_is_not_defaulted_when_candidate_readback_omits_it(
 
     with pytest.raises(RootCanaryVerificationError, match="ASSURANCE_SHAPE_INVALID"):
         verify_root_canary(data)
+
+
+def test_local_only_verifier_accepts_the_manifest_backed_local_projection(
+    local_only_bundle: dict[str, object],
+    tmp_path: Path,
+):
+    receipt = verify_root_canary(copy.deepcopy(local_only_bundle))
+
+    assert receipt.acceptance_mode == "local-only-v1"
+    assert receipt.standard_ticket_keys == (
+        "issue:195",
+        "issue:196",
+        "issue:197",
+    )
+    assert receipt.strict_ticket_key == "issue:198"
+    assert receipt.standard_batch.member_count == 3
+    assert receipt.strict_batch.member_count == 1
+    assert receipt.standard_batch.pull_request_number is None
+    assert receipt.standard_batch.hosted_run_id is None
+    assert receipt.strict_batch.pull_request_number is None
+    assert receipt.strict_batch.hosted_run_id is None
+    assert (
+        receipt.authoritative_evidence["local_evidence"]
+        == local_only_bundle["local_evidence"]
+    )
+
+    document = tmp_path / "local-receipt.md"
+    write_acceptance_document(document, receipt)
+    assert "gwo-v8-root-canary-acceptance.v2" in document.read_text("utf-8")
+
+
+def test_local_only_mode_is_required_and_invalid_modes_do_not_use_legacy_hosted_path(
+    local_only_bundle: dict[str, object],
+):
+    missing = copy.deepcopy(local_only_bundle)
+    missing.pop("acceptance_mode")
+    with pytest.raises(
+        RootCanaryVerificationError, match="ROOT_ACCEPTANCE_MODE_REQUIRED"
+    ):
+        verify_root_canary(missing)
+
+    invalid = copy.deepcopy(local_only_bundle)
+    invalid["acceptance_mode"] = "hosted-v1"
+    with pytest.raises(
+        RootCanaryVerificationError, match="ROOT_ACCEPTANCE_MODE_INVALID"
+    ):
+        verify_root_canary(invalid)
+
+    explicit_local_without_local_evidence = copy.deepcopy(local_only_bundle)
+    explicit_local_without_local_evidence.pop("local_evidence")
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_EVIDENCE_INCOMPLETE"
+    ):
+        verify_root_canary(explicit_local_without_local_evidence)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "tamper"])
+def test_local_only_requires_and_recomputes_the_producer_record_digest(
+    local_only_bundle: dict[str, object], mutation: str
+):
+    data = copy.deepcopy(local_only_bundle)
+    if mutation == "remove":
+        data.pop("record_digest")
+    else:
+        data["record_digest"] = "0" * 64
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_RECORD_DIGEST_INVALID"
+    ):
+        verify_root_canary(data)
+
+
+@pytest.mark.parametrize("missing", ["transcript", "replay", "tickets", "work_runs"])
+def test_local_only_requires_complete_public_root_facts(
+    local_only_bundle: dict[str, object], missing: str
+):
+    data = copy.deepcopy(local_only_bundle)
+    if missing in {"tickets", "work_runs"}:
+        data["facts"].pop(missing)
+    else:
+        data.pop(missing)
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_EVIDENCE_INCOMPLETE"
+    ):
+        verify_root_canary(data)
+
+
+def test_local_only_binds_candidate_parent_and_review_subject_identity_to_manifest(
+    local_only_bundle: dict[str, object],
+):
+    data = copy.deepcopy(local_only_bundle)
+    accepted_transition = next(
+        item
+        for item in data["facts"]["candidate_gate"]["transitions"]
+        if item["status"] == "review_accepted"
+    )
+    accepted_transition["review_subject"]["parent_digest"] = "0" * 64
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
+    ):
+        verify_root_canary(data)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "result_digest",
+        "batch_delivery_proof_digest",
+        "batch_delivery_stable_action_id",
+        "local_check_receipt_digest",
+        "integration_lease_digest",
+        "target_readback_digest",
+    ],
+)
+def test_local_only_validates_authoritative_result_integrity_crosslinks(
+    local_only_bundle: dict[str, object], field: str
+):
+    data = copy.deepcopy(local_only_bundle)
+    data["facts"]["readback"]["result_integrities"][0][field] = (
+        "0" * 64 if field.endswith("digest") else "tampered-action"
+    )
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_RESULT_CROSSLINK_INVALID"
+    ):
+        verify_root_canary(data)
+
+
+def test_local_only_cli_uses_the_authoritative_manifest_loader(
+    tmp_path: Path, local_only_bundle: dict[str, object]
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    tickets_path = tmp_path / "tickets.json"
+    output_path = tmp_path / "receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+    manifest = json.loads(ROOT_TICKETS.read_text(encoding="utf-8"))
+    tickets_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="ROOT_TICKET_MANIFEST_INVALID"
+    ):
+        verify_main(
+            [
+                "--tickets",
+                str(tickets_path),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    (
+        "hosted_ci",
+        "pull_request",
+        "publication_receipt",
+        "remote_target_sha",
+        "url",
+        "workflow_url",
+        "run_id",
+        "check_id",
+    ),
+)
+def test_local_only_rejects_forbidden_fields_recursively(
+    local_only_bundle: dict[str, object],
+    forbidden_key: str,
+):
+    data = copy.deepcopy(local_only_bundle)
+    data["local_evidence"]["batches"][0]["target_readback"][forbidden_key] = "forbidden"  # type: ignore[index]
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_BATCH_HOSTED_FIELD_FORBIDDEN"
+    ):
+        verify_root_canary(data)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    (
+        ("batch_ref_sha", "LOCAL_BATCH_SHA_MISMATCH"),
+        ("suite_sha", "LOCAL_BATCH_SHA_MISMATCH"),
+        ("lease", "LOCAL_INTEGRATION_LEASE_INVALID"),
+        ("target_after", "LOCAL_TARGET_READBACK_INVALID"),
+        ("target_cas", "LOCAL_TARGET_READBACK_INVALID"),
+        ("target_ancestry", "LOCAL_TARGET_ANCESTRY_INVALID"),
+    ),
+)
+def test_local_only_rejects_batch_lease_and_target_tampering(
+    local_only_bundle: dict[str, object],
+    mutation: str,
+    code: str,
+):
+    data = copy.deepcopy(local_only_bundle)
+    batch = data["local_evidence"]["batches"][0]  # type: ignore[index]
+    if mutation == "batch_ref_sha":
+        batch["batch_ref"]["sha"] = "0" * 40
+    elif mutation == "suite_sha":
+        batch["local_suite"]["batch_sha"] = "0" * 40
+    elif mutation == "lease":
+        batch["integration_lease"]["serialized"]["holder"] = "0" * 64
+    elif mutation == "target_after":
+        batch["target_readback"]["target_after"]["commit_sha"] = "0" * 40
+    elif mutation == "target_cas":
+        batch["target_readback"]["cas"]["readback_sha"] = "0" * 40
+    elif mutation == "target_ancestry":
+        batch["target_readback"]["ancestry"]["is_ancestor"] = False
+
+    with pytest.raises(RootCanaryVerificationError, match=code):
+        verify_root_canary(data)
+
+
+def test_local_only_receipt_digest_binds_mode_and_complete_local_evidence(
+    local_only_bundle: dict[str, object],
+):
+    receipt = verify_root_canary(copy.deepcopy(local_only_bundle))
+    payload = receipt.canonical_digest_payload()
+
+    assert payload["acceptance_mode"] == "local-only-v1"
+    assert payload["authoritative_evidence"] == receipt.authoritative_evidence
+
+    mode_changed = copy.deepcopy(payload)
+    mode_changed["acceptance_mode"] = "different-mode"
+    assert digest_value(mode_changed) != receipt.receipt_digest
+
+    evidence_changed = copy.deepcopy(payload)
+    evidence_changed["authoritative_evidence"]["local_evidence"]["batches"][0][
+        "batch_sha"
+    ] = "0" * 40
+    assert digest_value(evidence_changed) != receipt.receipt_digest
+
+
+def test_local_only_requires_digest_bound_public_recovery_evidence(
+    local_only_bundle: dict[str, object],
+):
+    missing_record_digest = copy.deepcopy(local_only_bundle)
+    missing_record_digest.pop("record_digest")
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_RECORD_DIGEST_INVALID"):
+        verify_root_canary(missing_record_digest)
+
+    missing_work_runs = copy.deepcopy(local_only_bundle)
+    missing_work_runs["facts"].pop("work_runs")  # type: ignore[index]
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_EVIDENCE_INCOMPLETE"):
+        verify_root_canary(missing_work_runs)
+
+    missing_transitions = copy.deepcopy(local_only_bundle)
+    missing_transitions["facts"]["candidate_gate"].pop("transitions")  # type: ignore[index]
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
+    ):
+        verify_root_canary(missing_transitions)
+
+
+def test_local_only_requires_bound_suite_receipt_and_lease_release(
+    local_only_bundle: dict[str, object],
+):
+    missing_definition = copy.deepcopy(local_only_bundle)
+    missing_definition["local_evidence"]["batches"][0]["local_suite"].pop(  # type: ignore[index]
+        "definition", None
+    )
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_BATCH_PROOF_INCOMPLETE"):
+        verify_root_canary(missing_definition)
+
+    missing_release = copy.deepcopy(local_only_bundle)
+    missing_release["local_evidence"]["batches"][0]["integration_lease"].pop(  # type: ignore[index]
+        "release", None
+    )
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_INTEGRATION_LEASE_INVALID"
+    ):
+        verify_root_canary(missing_release)
+
+
+def test_local_only_validates_result_digest_crosslinks(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    tampered["facts"]["readback"]["result_integrities"][0]["result_digest"] = "0" * 64  # type: ignore[index]
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_RESULT_CROSSLINK_INVALID"):
+        verify_root_canary(tampered)
+
+
+def test_local_only_binds_work_run_delivery_receipt_to_result_integrity(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    tampered["facts"]["work_runs"][0]["delivery_receipt_digest"] = _task_digest(  # type: ignore[index]
+        {"kind": "tampered-delivery-receipt.v1"}
+    )
+    tampered["record_digest"] = _task_digest(  # type: ignore[index]
+        {key: value for key, value in tampered.items() if key != "record_digest"}
+    )
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_RESULT_CROSSLINK_INVALID"
+    ):
+        verify_root_canary(tampered)
+
+
+def test_local_only_binds_batch_and_delivery_action_identity(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    result = tampered["facts"]["readback"]["result_integrities"][0]  # type: ignore[index]
+    result["batch_delivery_stable_action_id"] = (  # type: ignore[index]
+        result["delivery_stable_action_id"] + ":tampered"
+    )
+    result["result_digest"] = _task_digest(  # type: ignore[index]
+        {
+            "kind": "gwo.result.v1",
+            **{key: value for key, value in result.items() if key != "result_digest"},
+        }
+    )
+    tampered["record_digest"] = _task_digest(  # type: ignore[index]
+        {key: value for key, value in tampered.items() if key != "record_digest"}
+    )
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_RESULT_CROSSLINK_INVALID"
+    ):
+        verify_root_canary(tampered)
+
+
+def _restamp_local_record(data: dict[str, object]) -> None:
+    data["record_digest"] = _task_digest(
+        {key: value for key, value in data.items() if key != "record_digest"}
+    )
+
+
+def _restamp_result_delivery_proof(result: dict[str, object]) -> None:
+    body = {
+        key: result[key]
+        for key in (
+            "delivery_stable_action_id",
+            "delivery_request_digest",
+            "batch_id",
+            "batch_sha",
+            "local_check_receipt_digest",
+            "publication_receipt_digest",
+            "pull_request_number",
+            "pull_request_head_sha",
+            "hosted_result_receipt_digest",
+            "integration_lease_digest",
+            "target_branch",
+            "target_head_sha",
+            "target_readback_digest",
+            "target_contains_batch_sha",
+            "pull_request_merge_target_sha",
+            "merge_method",
+        )
+    }
+    body["member_ticket_keys"] = result["delivery_member_ticket_keys"]
+    result["batch_delivery_proof_digest"] = _task_digest(
+        {"kind": "batch-delivery-proof.v1", **body}
+    )
+    result["result_digest"] = _task_digest(
+        {
+            "kind": "gwo.result.v1",
+            **{key: value for key, value in result.items() if key != "result_digest"},
+        }
+    )
+
+
+def test_local_only_rejects_synthetic_transcript_with_a_recomputed_record_digest(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    final_inspect = next(
+        item
+        for item in reversed(tampered["transcript"])
+        if item["operation"] == "inspect"
+    )
+    tampered["transcript"] = [
+        {
+            "operation": "start",
+            "campaign_key": tampered["campaign"]["campaign_key"],
+        },
+        {
+            "operation": "advance",
+            "wake_ref": "synthetic",
+            "outcome": {"status": "Complete", "reason": "AllRequiredWorkComplete"},
+        },
+        copy.deepcopy(final_inspect),
+    ]
+    _restamp_local_record(tampered)
+
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_TRANSCRIPT_INVALID"):
+        verify_root_canary(tampered)
+
+
+def test_local_only_requires_repair_and_rejection_history(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    tampered["facts"]["candidate_gate"]["transitions"] = [  # type: ignore[index]
+        transition
+        for transition in tampered["facts"]["candidate_gate"]["transitions"]  # type: ignore[index]
+        if transition["status"] not in {"repair_required", "ordinary_rejected"}
+    ]
+    _restamp_local_record(tampered)
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
+    ):
+        verify_root_canary(tampered)
+
+
+def test_local_only_binds_the_complete_review_subject_digest(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    transition = next(
+        item
+        for item in tampered["facts"]["candidate_gate"]["transitions"]  # type: ignore[index]
+        if item["status"] == "review_accepted"
+    )
+    subject = transition["review_subject"]
+    subject["unexpected_field"] = "tampered"  # type: ignore[index]
+    subject["subject_digest"] = _task_digest(  # type: ignore[index]
+        {key: value for key, value in subject.items() if key != "subject_digest"}
+    )
+    _restamp_local_record(tampered)
+
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_REVIEW_SUBJECT_INVALID"):
+        verify_root_canary(tampered)
+
+
+def test_local_root_producer_binds_review_subject_to_bound_candidate(
+    local_only_bundle: dict[str, object],
+):
+    for transition in local_only_bundle["facts"]["candidate_gate"]["transitions"]:  # type: ignore[index]
+        accepted = transition["accepted_candidate_receipt"]
+        if accepted is None:
+            continue
+        candidate = transition["candidate_receipt"]
+        subject = transition["review_subject"]
+        assert subject["candidate_receipt_digest"] == candidate["receipt_digest"]
+        assert subject["runtime_subject_digest"] == candidate["runtime_subject_digest"]
+        assert subject["subject_digest"] == accepted["review_subject_digest"]
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["observations", "candidate_diffs", "delivery_proofs", "git_readback"],
+)
+def test_local_only_requires_complete_readback_projection(
+    local_only_bundle: dict[str, object], missing: str
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    tampered["facts"]["readback"].pop(missing)  # type: ignore[index]
+    _restamp_local_record(tampered)
+
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_READBACK_INCOMPLETE"):
+        verify_root_canary(tampered)
+
+
+@pytest.mark.parametrize("field", ["candidate_receipts", "accepted_candidate_receipts"])
+def test_local_only_does_not_fallback_from_null_authoritative_candidate_readback(
+    local_only_bundle: dict[str, object], field: str
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    authoritative = tampered["facts"]["readback"][field]  # type: ignore[index]
+    fallback_key = (
+        "candidates" if field == "candidate_receipts" else "accepted_candidate_receipts"
+    )
+    tampered[fallback_key] = copy.deepcopy(authoritative)
+    tampered["facts"]["readback"][field] = None  # type: ignore[index]
+    _restamp_local_record(tampered)
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="CANDIDATE_RECEIPT_INCOMPLETE"
+    ):
+        verify_root_canary(tampered)
+
+
+def test_local_only_requires_facts_replay_readback(
+    local_only_bundle: dict[str, object],
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    tampered["facts"]["replay"] = copy.deepcopy(tampered["replay"])  # type: ignore[index]
+    tampered["facts"].pop("replay")
+    _restamp_local_record(tampered)
+
+    with pytest.raises(RootCanaryVerificationError, match="LOCAL_EVIDENCE_INCOMPLETE"):
+        verify_root_canary(tampered)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["local_check_receipt_digest", "integration_lease_digest", "target_readback_digest"],
+)
+def test_local_only_binds_result_to_authoritative_batch_readbacks(
+    local_only_bundle: dict[str, object], field: str
+):
+    tampered = copy.deepcopy(local_only_bundle)
+    result = tampered["facts"]["readback"]["result_integrities"][0]  # type: ignore[index]
+    result[field] = _task_digest({"kind": "tampered-result-link.v1", "field": field})  # type: ignore[index]
+    _restamp_result_delivery_proof(result)
+    _restamp_local_record(tampered)
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_RESULT_CROSSLINK_INVALID"
+    ):
+        verify_root_canary(tampered)
+
+
+def test_local_cli_uses_authoritative_manifest_loader_for_local_mode(
+    tmp_path: Path,
+    local_only_bundle: dict[str, object],
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    tickets_path = tmp_path / "tickets.json"
+    output_path = tmp_path / "receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+    tickets_path.write_text(
+        json.dumps(json.loads(ROOT_TICKETS.read_text(encoding="utf-8")), indent=2),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RootCanaryVerificationError, match="ROOT_TICKET_MANIFEST_INVALID"):
+        verify_main(
+            [
+                "--tickets",
+                str(tickets_path),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+
+
+def test_local_only_cli_round_trip_uses_the_real_ticket_fixture(
+    tmp_path: Path,
+    local_only_bundle: dict[str, object],
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    output_path = tmp_path / "local-receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+
+    assert (
+        verify_main(
+            [
+                "--tickets",
+                str(ROOT_TICKETS),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(output_path.read_text("utf-8"))
+    assert output["acceptance_mode"] == "local-only-v1"
+    assert output["schema"] == "gwo-v8-root-canary-acceptance.v2"
+    assert [
+        batch["member_ticket_keys"]
+        for batch in output["authoritative_evidence"]["local_evidence"]["batches"]
+    ] == [
+        ["issue:195", "issue:196", "issue:197"],
+        ["issue:198"],
+    ]
+    assert output["receipt_digest"] == verify_root_canary(
+        copy.deepcopy(local_only_bundle)
+    ).receipt_digest
+
+
+def test_local_only_v2_receipt_has_no_hosted_or_pr_batch_placeholders(
+    tmp_path: Path,
+    local_only_bundle: dict[str, object],
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    output_path = tmp_path / "local-receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+
+    assert (
+        verify_main(
+            [
+                "--tickets",
+                str(ROOT_TICKETS),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(output_path.read_text("utf-8"))
+    forbidden_paths: list[str] = []
+    null_paths: list[str] = []
+
+    def inspect(value: object, path: tuple[str, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = "".join(
+                    character for character in str(key).lower() if character.isalnum()
+                )
+                if (
+                    normalized in {"ci", "pr", "run", "runid", "url"}
+                    or normalized.startswith(
+                        ("hosted", "pullrequest", "publication", "remote", "workflow", "check")
+                    )
+                    or normalized.endswith("url")
+                ):
+                    forbidden_paths.append(".".join(path + (str(key),)))
+                inspect(item, path + (str(key),))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                inspect(item, path + (str(index),))
+        elif value is None:
+            null_paths.append(".".join(path))
+
+    inspect(output)
+
+    assert output["schema"] == "gwo-v8-root-canary-acceptance.v2"
+    assert not forbidden_paths
+    assert not null_paths
+    assert output["receipt_digest"] == verify_root_canary(
+        copy.deepcopy(local_only_bundle)
+    ).receipt_digest

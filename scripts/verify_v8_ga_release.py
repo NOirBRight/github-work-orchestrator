@@ -69,8 +69,9 @@ _LOCAL_VERIFICATION_SCHEMAS = frozenset(
     }
 )
 _LOCAL_VERIFICATION_MODES = frozenset(
-    {"local-only", "Local Verification Only"}
+    {"local-only-v1", "local-only", "Local Verification Only"}
 )
+_CANONICAL_LOCAL_VERIFICATION_MODE = "local-only-v1"
 _LOCAL_HOSTED_FIELDS = frozenset(
     {
         "ci",
@@ -89,6 +90,15 @@ _LOCAL_HOSTED_FIELDS = frozenset(
         "hosted_head_sha",
         "hosted_run_id",
         "hosted_url",
+        "github_actions",
+        "github_workflow",
+        "github_workflows",
+        "pr",
+        "pr_head_sha",
+        "pr_number",
+        "pull_request",
+        "pull_request_head",
+        "pull_request_number",
         "repository_check",
         "run_id",
         "status_check",
@@ -97,7 +107,30 @@ _LOCAL_HOSTED_FIELDS = frozenset(
         "workflow_run",
         "workflow_run_id",
         "workflow_url",
+        "release_url",
+        "release_receipt",
+        "release_receipt_digest",
     }
+)
+_CANONICAL_FULL_COMMAND_NAMES = frozenset({"full", "full-suite", "full_pytest"})
+_CANONICAL_PYTEST_SUCCESS_STATUSES = frozenset(
+    {"go", "ok", "pass", "passed", "success", "successful"}
+)
+_LOCAL_FORBIDDEN_FIELD_PREFIXES = (
+    "check_",
+    "ci_",
+    "github_",
+    "git_hub_",
+    "hosted_",
+    "pr_",
+    "publication_",
+    "publish_",
+    "pull_request_",
+    "remote_",
+    "status_check",
+    "target_remote_",
+    "workflow_run",
+    "workflow_url",
 )
 
 
@@ -437,14 +470,72 @@ def clean_install_and_smoke(source: Path, run_root: Path) -> CleanInstallResult:
 
 
 def _normalized_field_name(value: object) -> str:
-    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(value))
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
     return re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+
+
+def _is_local_hosted_field(value: object) -> bool:
+    normalized = _normalized_field_name(value)
+    compact = normalized.replace("_", "")
+    return normalized in _LOCAL_HOSTED_FIELDS or normalized in {
+        "publication",
+        "remote",
+        "remote_target",
+        "target_remote",
+    } or compact in {
+        "ci",
+        "checkrun",
+        "checkruns",
+        "cirun",
+        "cirunid",
+        "githubactions",
+        "githubworkflow",
+        "githubworkflows",
+        "hosted",
+        "hostedci",
+        "hostedcheck",
+        "hostedconclusion",
+        "hostedheadsha",
+        "hostedrun",
+        "hostedrunid",
+        "hostedurl",
+        "pr",
+        "prheadsha",
+        "prnumber",
+        "pullrequest",
+        "publication",
+        "publicationreceipt",
+        "remotetarget",
+        "releaseurl",
+        "releasereceipt",
+        "releasereceiptdigest",
+        "run",
+        "runid",
+        "statuscheck",
+        "statuschecks",
+        "workflow",
+        "workflowrun",
+        "workflowrunid",
+        "workflowurl",
+        "githubactionsenabled",
+        "githubworkflowrun",
+        "githubworkflowurl",
+        "hostedcisuite",
+        "pullrequestheadsha",
+        "pullrequestmergemapping",
+        "pullrequestnumber",
+        "publicationreceiptdigest",
+        "remotetargetsha",
+        "checkrunid",
+        "statuscheckid",
+    } or normalized.startswith(_LOCAL_FORBIDDEN_FIELD_PREFIXES)
 
 
 def _reject_local_hosted_fields(value: object) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if _normalized_field_name(key) in _LOCAL_HOSTED_FIELDS:
+            if _is_local_hosted_field(key):
                 raise ReleaseGateError("GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE")
             _reject_local_hosted_fields(child)
     elif isinstance(value, (list, tuple)):
@@ -560,6 +651,171 @@ def _command_pytest_count(command: Mapping[str, object]) -> int | None:
     return log_count if log_count is not None else summary_count
 
 
+def _canonical_command_tokens(command: Mapping[str, object]) -> list[str]:
+    arguments = command.get("arguments", command.get("argv"))
+    if isinstance(arguments, (list, tuple)):
+        return [str(value).strip('"\'') for value in arguments]
+    command_text = command.get("command")
+    if isinstance(command_text, str):
+        return [value.strip('"\'') for value in command_text.split()]
+    return []
+
+
+def _require_canonical_full_command(
+    command: Mapping[str, object], *, require_name: bool
+) -> None:
+    representations = [
+        name for name in ("command", "arguments", "argv") if name in command
+    ]
+    if len(representations) > 1:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    command_name = str(command.get("name", "")).casefold()
+    if require_name and command_name not in _CANONICAL_FULL_COMMAND_NAMES:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    if command_name and command_name not in _CANONICAL_FULL_COMMAND_NAMES:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    tokens = _canonical_command_tokens(command)
+    pytest_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.casefold() in {"pytest", "py.test", "pytest.exe", "py.test.exe"}
+        ),
+        None,
+    )
+    if pytest_index is None:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    selected_flags = (
+        "-k",
+        "--keyword",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--pyargs",
+        "--lf",
+        "--last-failed",
+        "--ff",
+        "--failed-first",
+        "--nf",
+        "--new-first",
+        "--sw",
+        "--stepwise",
+        "--stepwise-skip",
+        "--sw-skip",
+        "--stepwise-reset",
+        "--sw-reset",
+        "--last-failed-no-failures",
+        "--lfnf",
+        "-x",
+        "--exitfirst",
+        "--maxfail",
+        "--continue-on-collection-errors",
+        "--collect-only",
+        "--co",
+        "--setup-only",
+        "--setup-plan",
+        "--doctest-only",
+        "--fixtures",
+        "--funcargs",
+        "--fixtures-per-test",
+        "--markers",
+        "--keep-duplicates",
+        "--collect-in-virtualenv",
+        "--noconftest",
+        "--doctest-modules",
+        "--doctest-glob",
+        "--doctest-ignore-import-errors",
+        "--doctest-continue-on-failure",
+        "--doctest-report",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+        "-c",
+        "--config-file",
+        "--override-ini",
+        "-o",
+        "--confcutdir",
+        "--rootdir",
+        "--basetemp",
+        "--import-mode",
+        "--strict-config",
+        "--strict-markers",
+        "--strict",
+        "--assert",
+        "--setup-show",
+        "--testpaths",
+        "--trace-config",
+        "--disable-plugin-autoload",
+        "-p",
+        "--pdb",
+        "--pdbcls",
+        "--trace",
+        "--runxfail",
+        "--cache-show",
+        "--cache-clear",
+        "--debug",
+    )
+    for token in tokens[pytest_index + 1 :]:
+        if token == "-m" or token.startswith("-m="):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        if token in selected_flags or token.startswith(
+            tuple(f"{flag}=" for flag in selected_flags)
+        ):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        if token == "--" or not token.startswith("-"):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+
+def _canonical_pytest_result_count(
+    result: Mapping[str, object], *, require_command_name: bool
+) -> int:
+    if type(result.get("exit_code")) is not int:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    if result["exit_code"] != 0:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    status = result.get("status")
+    if (
+        not isinstance(status, str)
+        or status.casefold() not in _CANONICAL_PYTEST_SUCCESS_STATUSES
+    ):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_STATUS_INVALID")
+
+    counts: list[int] = []
+    for name in ("count", "passed", "pytest_pass_count"):
+        if name not in result:
+            continue
+        count = result[name]
+        if type(count) is not int or count < 1:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_INVALID")
+        counts.append(count)
+    if not counts:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+    if any(count != counts[0] for count in counts[1:]):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    count = counts[0]
+
+    command_fields = ("name", "command", "arguments", "argv")
+    if not any(name in result for name in command_fields):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    _require_canonical_full_command(result, require_name=require_command_name)
+    summary_count = _pytest_summary_count(
+        result.get("summary", result.get("output"))
+    )
+    log_count = _read_local_log_count(
+        result.get("log_path", result.get("log")),
+        result.get("log_digest", result.get("sha256")),
+    )
+    for observed in (summary_count, log_count):
+        if observed is not None and observed != count:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    return count
+
+
 def _local_pytest_count(raw: Mapping[str, object]) -> int:
     for collection_name in ("focused_suites", "commands"):
         collection = raw.get(collection_name)
@@ -667,6 +923,39 @@ def _local_pytest_count(raw: Mapping[str, object]) -> int:
     raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
 
 
+def _canonical_full_pytest_count(raw: Mapping[str, object]) -> int:
+    candidates: list[int] = []
+    for name in ("full_suite", "full_pytest"):
+        if name not in raw:
+            continue
+        suite = raw[name]
+        if not isinstance(suite, Mapping):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        candidates.append(
+            _canonical_pytest_result_count(suite, require_command_name=False)
+        )
+
+    collection = raw.get("commands")
+    if collection is not None:
+        if not isinstance(collection, (list, tuple)):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        for command in collection:
+            if not isinstance(command, Mapping):
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+            command_name = str(command.get("name", "")).casefold()
+            if command_name not in _CANONICAL_FULL_COMMAND_NAMES:
+                continue
+            candidates.append(
+                _canonical_pytest_result_count(command, require_command_name=True)
+            )
+
+    if not candidates:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+    if any(count != candidates[0] for count in candidates[1:]):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    return candidates[0]
+
+
 @dataclass(frozen=True, slots=True)
 class LocalVerificationReadback:
     schema: str
@@ -701,7 +990,11 @@ class LocalVerificationReadback:
         if mode not in _LOCAL_VERIFICATION_MODES:
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_MODE_INVALID")
         workflow_count = raw.get("workflow_count")
-        if workflow_count is not None and (
+        if mode == "local-only-v1" and (
+            type(workflow_count) is not int or workflow_count != 0
+        ):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        if mode != "local-only-v1" and workflow_count is not None and (
             type(workflow_count) is not int or workflow_count != 0
         ):
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
@@ -717,6 +1010,14 @@ class LocalVerificationReadback:
         for name in ("actions_enabled", "github_actions_enabled"):
             if name in raw and raw[name] is not False:
                 raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
+        if mode == "local-only-v1":
+            disabled_actions_readback = any(
+                name in raw for name in ("actions_enabled", "github_actions_enabled")
+            )
+            if isinstance(actions_policy, Mapping):
+                disabled_actions_readback = True
+            if not disabled_actions_readback:
+                raise ReleaseGateError("GA_LOCAL_VERIFICATION_WORKFLOW_INVALID")
         schema_text = str(schema)
         if schema_text == "gwo-v8-phase4-local-verification.v1":
             if raw.get("workspace") != "clean":
@@ -731,12 +1032,16 @@ class LocalVerificationReadback:
         elif raw.get("final_outcome") not in {"pass", "passed"}:
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_OUTCOME_INVALID")
         subject_sha, subject_tree_sha = _local_subject(raw)
+        if mode == "local-only-v1":
+            pytest_pass_count = _canonical_full_pytest_count(raw)
+        else:
+            pytest_pass_count = _local_pytest_count(raw)
         return cls(
             schema=str(schema),
             verification_mode=str(mode),
             subject_sha=subject_sha,
             subject_tree_sha=subject_tree_sha,
-            pytest_pass_count=_local_pytest_count(raw),
+            pytest_pass_count=pytest_pass_count,
             manifest_sha256=manifest_sha256,
         )
 
@@ -798,9 +1103,18 @@ class ReleaseGateReceipt:
             _require_sha(value, "GA_RELEASE_RECEIPT_SHA_INVALID")
         if type(self.pytest_pass_count) is not int or self.pytest_pass_count < 1:
             raise ReleaseGateError("GA_RELEASE_RECEIPT_VERIFICATION_INVALID")
-        if self.verification_mode not in {"hosted-ci", "local-only"}:
+        if self.verification_mode not in {
+            "hosted-ci",
+            "local-only-v1",
+            "local-only",
+            "Local Verification Only",
+        }:
             raise ReleaseGateError("GA_RELEASE_RECEIPT_VERIFICATION_INVALID")
-        if self.verification_mode == "local-only":
+        if self.verification_mode in {
+            "local-only-v1",
+            "local-only",
+            "Local Verification Only",
+        }:
             if self.ci_run_id is not None or self.ci_head_sha is not None:
                 raise ReleaseGateError("GA_RELEASE_RECEIPT_HOSTED_EVIDENCE")
             _require_sha256(
@@ -868,7 +1182,12 @@ class ReleaseGateReceipt:
                 campaign_key=campaign_key or record.campaign_key or "",
                 activation_id=activation_id or record.activation_id or "",
                 writer_generation=writer_generation or record.writer_generation or "",
-                verification_mode="local-only",
+                verification_mode=(
+                    _CANONICAL_LOCAL_VERIFICATION_MODE
+                    if local_verification.verification_mode
+                    == _CANONICAL_LOCAL_VERIFICATION_MODE
+                    else "local-only"
+                ),
                 local_verification_manifest_sha256=local_verification.manifest_sha256,
             )
         return cls(
@@ -905,10 +1224,14 @@ class ReleaseGateReceipt:
             "activation_id": self.activation_id,
             "writer_generation": self.writer_generation,
         }
-        if self.verification_mode == "local-only":
+        if self.verification_mode in {
+            "local-only-v1",
+            "local-only",
+            "Local Verification Only",
+        }:
             payload.update(
                 {
-                    "verification_mode": "local-only",
+                    "verification_mode": self.verification_mode,
                     "local_verification_manifest_sha256": self.local_verification_manifest_sha256,
                 }
             )
@@ -945,7 +1268,11 @@ class ReleaseGateReceipt:
         if set(raw) != local_fields or mode not in _LOCAL_VERIFICATION_MODES:
             raise ReleaseGateError("GA_PRE_TAG_RECEIPT_FIELDS_INVALID")
         payload = dict(raw)
-        payload["verification_mode"] = "local-only"
+        payload["verification_mode"] = (
+            _CANONICAL_LOCAL_VERIFICATION_MODE
+            if mode == _CANONICAL_LOCAL_VERIFICATION_MODE
+            else "local-only"
+        )
         payload.update(ci_run_id=None, ci_head_sha=None)
         return cls._from_payload(payload)
 
@@ -1135,6 +1462,10 @@ def verify_pre_tag(
     admission_payload, default_writer_receipt_digest = _canonical_readback_payload(
         admission, "GA_DEFAULT_WRITER_READBACK_INVALID"
     )
+    if local_verification is not None:
+        if canary_payload.get("acceptance_mode") != _CANONICAL_LOCAL_VERIFICATION_MODE:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_CANARY_MODE_INVALID")
+        _reject_local_hosted_fields(canary_payload)
 
     canary_repository = _required_readback_text(
         canary_payload, "repository", "GA_CANARY_RECEIPT_MISMATCH"
@@ -1622,6 +1953,13 @@ release acceptance is Local Verification Only. The pre-tag command obtains the
 dynamic tag-candidate SHA/tree and pytest count from the current `origin/main`
 and a content-addressed local verification manifest, then writes a separate
 `ReleaseGateReceipt`.
+
+The canonical repository verification mode is `local-only-v1`. Its manifest
+must explicitly read back `workflow_count: 0`, disabled Actions/workflows, a
+successful full pytest suite, and the exact subject commit and tree. CI,
+Hosted-CI, and pull-request fields are rejected recursively; product
+Hosted-CI delivery is a separate concern and is not satisfied by repository
+release verification.
 
 Every pre-tag receipt input is strict canonical JSON: duplicate names,
 non-canonical bytes, and `NaN`/`Infinity` are rejected. Its complete payload

@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from scripts.provision_v8_root_canary import (
     canonical_body,
     canonical_json_bytes,
     digest_value,
+    load_ticket_manifest,
     provision_root_tickets,
     root_ticket_specs,
     write_ticket_manifest,
@@ -529,6 +531,210 @@ def test_manifest_tickets_are_consumable_by_current_plancontrol_snapshot_parser(
         _normalize_ticket(item, repository=ROOT_REPOSITORY)
         for item in payload["tickets"]
     ] == payload["tickets"]
+
+
+REAL_TICKET_MANIFEST = (
+    ROOT / "tests" / "fixtures" / "gwo-v8-root-canary-tickets-195-198.json"
+)
+
+
+def _real_ticket_manifest_payload():
+    return json.loads(REAL_TICKET_MANIFEST.read_text("utf-8"))
+
+
+def _write_manifest_payload(path, payload):
+    path.write_bytes(canonical_json_bytes(payload))
+
+
+def _refresh_manifest_ticket_source_digest(payload, index=0):
+    item = payload["tickets"][index]
+    projection = {
+        "number": item["contract"]["number"],
+        "contract": item["contract"],
+        "labels": item["labels"],
+        "source_ref": item["key"],
+        "native_blockers": item["native_blockers"],
+    }
+    item["source"]["digest"] = digest_value(projection)
+
+
+def test_real_manifest_loader_accepts_authoritative_four_ticket_fixture():
+    manifest = load_ticket_manifest(
+        REAL_TICKET_MANIFEST,
+        require_real_root_numbers=True,
+    )
+
+    assert manifest["schema"] == "gwo-v8-root-canary-tickets.v2"
+    assert manifest["repository"] == ROOT_REPOSITORY
+    assert manifest["ready_refs"] == [
+        "issue:195",
+        "issue:196",
+        "issue:197",
+        "issue:198",
+    ]
+    assert [ticket["key"] for ticket in manifest["tickets"]] == manifest[
+        "ready_refs"
+    ]
+
+    manifest["tickets"][0]["contract"]["title"] = "detached"
+    assert _real_ticket_manifest_payload()["tickets"][0]["contract"]["title"] != (
+        "detached"
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate"),
+    [
+        (
+            "missing",
+            lambda payload: payload["ready_refs"].pop(),
+        ),
+        (
+            "duplicate",
+            lambda payload: payload["ready_refs"].__setitem__(1, "issue:195"),
+        ),
+        (
+            "reordered",
+            lambda payload: payload.__setitem__(
+                "ready_refs",
+                ["issue:196", "issue:195", "issue:197", "issue:198"],
+            ),
+        ),
+    ],
+)
+def test_manifest_loader_rejects_invalid_real_ticket_order(tmp_path, name, mutate):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    mutate(payload)
+    path = tmp_path / f"{name}.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_REAL_ISSUES_REQUIRED",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_tampered_source_digest(tmp_path):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["source"]["digest"] = "0" * 64
+    path = tmp_path / "tampered.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="TICKET_CONTRACT_DIGEST_MISMATCH",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_repository_mismatch(tmp_path):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["repository"] = "other/repository"
+    path = tmp_path / "foreign.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_REPOSITORY_MISMATCH",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_empty_contract_body_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["body"] = ""
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "empty-body.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_uppercase_open_state_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["state"] = "OPEN"
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "uppercase-open.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_float_contract_number_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+    payload["tickets"][0]["contract"]["number"] = 195.0
+    item = payload["tickets"][0]
+    item["source"]["digest"] = digest_value(
+        {
+            "number": 195,
+            "contract": item["contract"],
+            "labels": item["labels"],
+            "source_ref": item["key"],
+            "native_blockers": item["native_blockers"],
+        }
+    )
+    path = tmp_path / "float-number.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
+
+
+def test_manifest_loader_rejects_reordered_comment_ids_when_source_digest_matches(
+    tmp_path,
+):
+    payload = deepcopy(_real_ticket_manifest_payload())
+
+    def comment(comment_id, body):
+        return {
+            "id": comment_id,
+            "node_id": f"comment-node-{comment_id}",
+            "url": (
+                f"https://api.github.com/repos/{ROOT_REPOSITORY}/issues/comments/"
+                f"{comment_id}"
+            ),
+            "html_url": (
+                f"https://github.com/{ROOT_REPOSITORY}/issues/195"
+                f"#issuecomment-{comment_id}"
+            ),
+            "body": body,
+            "user": {"login": "reviewer"},
+            "created_at": "2026-08-18T00:00:00Z",
+            "updated_at": "2026-08-18T00:00:00Z",
+            "author_association": "MEMBER",
+        }
+
+    payload["tickets"][0]["contract"]["comments"] = [
+        comment(2, "second"),
+        comment(1, "first"),
+    ]
+    _refresh_manifest_ticket_source_digest(payload)
+    path = tmp_path / "reordered-comments.json"
+    _write_manifest_payload(path, payload)
+
+    with pytest.raises(
+        RootCanaryProvisionError,
+        match="ROOT_TICKET_MANIFEST_INVALID",
+    ):
+        load_ticket_manifest(path, require_real_root_numbers=True)
 
 
 def test_github_port_rejects_duplicate_exact_titles():

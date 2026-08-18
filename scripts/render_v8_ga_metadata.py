@@ -18,6 +18,7 @@ from typing import Sequence
 from scripts.verify_v8_ga_release import (
     DYNAMIC_METADATA_FIELDS,
     ReleaseGateError,
+    _reject_local_hosted_fields,
     _strict_canonical_json_loads,
     canonical_json_bytes,
     write_ga_release_record,
@@ -448,6 +449,8 @@ def render_ga_documents(
                 "GA_METADATA_INPUT_INVALID", f"{name} is not an object"
             )
         _reject_dynamic_metadata(value, name)
+        if name != "tickets":
+            _reject_local_hosted_fields(value)
         _validate_metadata_json(value, name)
     static_tickets = tickets
     static_acceptance = acceptance
@@ -491,6 +494,7 @@ def render_ga_documents(
     common: dict[str, object] = {
         "repository": repository,
         "campaign_key": campaign_key,
+        "verification_mode": "local-only-v1",
         "evidence_base_sha": evidence_base_sha,
         "canary_target_sha": canary_target_sha,
         "ticket_manifest": static_tickets,
@@ -513,8 +517,11 @@ def render_ga_documents(
         f"- Accepted root Canary receipt `{common['canary_receipt_digest']}`.\n"
         f"- Evidence base `{evidence_base_sha}` and Canary target `"
         f"{canary_target_sha}` were read back.\n"
-        "- Final tag-candidate SHA and exact CI are verified by the pre-tag "
-        "receipt after this metadata commit is merged.\n"
+        "- Repository release verification is Local Verification Only "
+        "(`local-only-v1`); the pre-tag receipt binds the exact subject "
+        "SHA/tree and successful full pytest readback.\n"
+        "- Product Hosted-CI delivery remains separate and is not satisfied "
+        "by repository release verification.\n"
     )
     previous = changelog.read_text(encoding="utf-8") if changelog.exists() else ""
     if "## 8.0.0" in previous:
@@ -546,7 +553,8 @@ def render_ga_documents(
             | {
                 "release": {
                     "version": "8.0.0",
-                    "tag_and_ci_source": "pre-tag ReleaseGateReceipt",
+                    "verification_mode": "local-only-v1",
+                    "verification_source": "local verification manifest and Git readback",
                 }
             },
         )
@@ -571,6 +579,7 @@ def write_live_release_record(
         if not isinstance(value, Mapping):
             raise ReleaseGateError("GA_METADATA_INPUT_INVALID", f"{name} is not an object")
         _reject_dynamic_metadata(value, name)
+        _reject_local_hosted_fields(value)
         _validate_metadata_json(value, name)
     _renderer_identity_context(acceptance, named_admission, default_writer)
     fixture = SimpleNamespace(
