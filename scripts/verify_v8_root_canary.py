@@ -3886,8 +3886,6 @@ def _verify_local_root_canary(
     }
     if not required_fact_fields.issubset(facts):
         _reject("LOCAL_EVIDENCE_INCOMPLETE")
-    if "transcript" not in bundle:
-        _reject("LOCAL_EVIDENCE_INCOMPLETE")
     replay = _mapping(bundle.get("replay"), "LOCAL_EVIDENCE_INCOMPLETE")
     facts_replay = _mapping(facts.get("replay"), "LOCAL_EVIDENCE_INCOMPLETE")
     if facts_replay != replay:

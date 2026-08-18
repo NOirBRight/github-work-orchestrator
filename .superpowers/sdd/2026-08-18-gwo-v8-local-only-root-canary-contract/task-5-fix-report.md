@@ -324,3 +324,14 @@ receipt_digest=355ee542ff7f44368789f12e539279b12bb721c737240777dbc21c58e4b4433a
 Recursive scans of the local evidence projection and v2 receipt found zero
 forbidden Hosted-CI/PR/publication/remote/workflow/check/URL keys and zero null
 placeholders.
+
+## Full repository local verification
+
+```text
+GWO_CONVERGENCE_ARCHIVE_ROOT=D:\\gwo-convergence-archive\\20260804T185544Z
+py -3.13 -B -m pytest -q
+3161 passed, 52 skipped, 1 failed, 3 warnings in 1887.81s (0:31:27)
+```
+
+The sole failure is the unchanged environment-bound
+`tests/test_beta3_live_guard_runner.py::test_reviewed_provenance_hashes_match_current_observer_bytes` check: this isolated worktree is not the canonical production checkout, so the Beta3 runner rejects its origin before comparing hashes. The focused local-only suite is green; no changed file is implicated in this failure. Pytest also emitted the known Windows temporary-directory cleanup `PermissionError` after exit.
