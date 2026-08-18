@@ -1340,10 +1340,11 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
 
 def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
     bridge = {
-        "bridge_digest": "532fca4187a7da6cbfa5b36bf674a028e0eb8d851c9076608b562167442ee536",
+        "bridge_digest": "30962c93b38ae16eaaa5dd0fdb805fdd22fa4108fd6374e37abafad6cfb2dea7",
         "default_writer": {
             "activation_id": "activation:47895d07122a3d9827ecdf63",
             "legacy_writer_fence_stopped": True,
+            "previous_writer_generation": "v8-generation-1",
             "readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
             "record_id": "writer-transition:ce14291c00b0c5bfe7251729",
             "source_file": (
@@ -1424,7 +1425,7 @@ def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
         .split("\n```\n", 1)[0]
     )
 
-    assert payload["evidence_bridge_digest"] == bridge["bridge_digest"]
+    assert payload["evidence_bridge_digest"] == _stable_bridge_digest(bridge)
     assert (
         payload["evidence_bridge_activation_subject"]
         == bridge["activation_release_subject"]
@@ -1469,6 +1470,15 @@ def _rehash_metadata_bridge(bridge):
     return body | {"bridge_digest": digest_value(body)}
 
 
+def _stable_bridge_digest(bridge):
+    body = {
+        key: value
+        for key, value in bridge.items()
+        if key not in {"bridge_digest", "release_subject"}
+    }
+    return digest_value(body)
+
+
 def test_renderer_accepts_bridge_derived_inputs_when_explicitly_repeated(tmp_path):
     bridge = _load_renderer_bridge()
     context = renderer._renderer_evidence_bridge_context(bridge)
@@ -1492,6 +1502,13 @@ def _load_renderer_bridge():
         pytest.skip(f"real derived evidence is required: {path}")
     bridge = json.loads(path.read_text(encoding="utf-8"))
     bridge["activation_release_subject"] = dict(bridge["release_subject"])
+    default_writer = json.loads(
+        (path.parent / "default-writer-readback.json").read_text(encoding="utf-8")
+    )
+    bridge["default_writer"] = {
+        **bridge["default_writer"],
+        "previous_writer_generation": default_writer["previous_writer_generation"],
+    }
     return _rehash_metadata_bridge(bridge)
 
 
@@ -1552,6 +1569,7 @@ def test_renderer_rejects_activation_readback_source_digest_mismatch(tmp_path):
 def test_renderer_preserves_activation_subject_when_final_subject_moves(tmp_path):
     bridge = _load_renderer_bridge()
     activation_subject = dict(bridge["activation_release_subject"])
+    stable_bridge_digest = _stable_bridge_digest(bridge)
     bridge["release_subject"] = {
         "merged_main_sha": "a" * 40,
         "merged_main_tree": "b" * 40,
@@ -1573,7 +1591,12 @@ def test_renderer_preserves_activation_subject_when_final_subject_moves(tmp_path
     )
 
     assert payload["evidence_bridge_activation_subject"] == activation_subject
+    assert payload["evidence_bridge_digest"] == stable_bridge_digest
     assert "evidence_bridge" not in payload
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "a" * 40 not in serialized
+    assert "b" * 40 not in serialized
+    assert "c" * 64 not in serialized
 
 
 def test_renderer_labels_repository_verification_local_only(tmp_path):
