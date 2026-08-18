@@ -530,6 +530,14 @@ def _validate_identity(
         if config.canary_repository is not None
         else target
     )
+    if any(
+        location[1] != expected_canary
+        for location in config.canary_locations
+    ):
+        raise _error(
+            "FACTORY_IDENTITY_DISJOINT",
+            "Canary evidence locations are not bound to the named Canary repository",
+        )
     if expected_source != EXPECTED_SOURCE_WRITER_GENERATION:
         raise _error(
             "FACTORY_IDENTITY_DISJOINT",

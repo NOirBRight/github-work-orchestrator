@@ -324,6 +324,33 @@ def test_factory_requires_exact_named_canary_repository_identity(
         assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
 
 
+def test_factory_rejects_canary_location_repository_disjoint_from_named_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _install_test_live_guard(monkeypatch)
+    config = replace(
+        _config(tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+        canary_locations=(
+            (
+                "github://canary/evidence",
+                REPOSITORY,
+                "gwo-control",
+                ".gwo-v8/evidence.json",
+            ),
+        ),
+    )
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(config),
+            canary=replace(_canary(), repository=CANARY_REPOSITORY),
+        )
+
+    assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
 def test_factory_rejects_a_guard_receipt_bound_to_another_subject_before_store_access(
     tmp_path,
     monkeypatch,
