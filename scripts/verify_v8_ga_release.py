@@ -109,6 +109,25 @@ _LOCAL_HOSTED_FIELDS = frozenset(
         "workflow_url",
     }
 )
+_CANONICAL_FULL_COMMAND_NAMES = frozenset({"full", "full-suite", "full_pytest"})
+_CANONICAL_PYTEST_SUCCESS_STATUSES = frozenset(
+    {"go", "ok", "pass", "passed", "success", "successful"}
+)
+_LOCAL_FORBIDDEN_FIELD_PREFIXES = (
+    "check_",
+    "ci_",
+    "github_",
+    "hosted_",
+    "pr_",
+    "publication_",
+    "publish_",
+    "pull_request_",
+    "remote_",
+    "status_check",
+    "target_remote_",
+    "workflow_run",
+    "workflow_url",
+)
 
 
 class ReleaseGateError(RuntimeError):
@@ -447,14 +466,25 @@ def clean_install_and_smoke(source: Path, run_root: Path) -> CleanInstallResult:
 
 
 def _normalized_field_name(value: object) -> str:
-    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(value))
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
     return re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+
+
+def _is_local_hosted_field(value: object) -> bool:
+    normalized = _normalized_field_name(value)
+    return normalized in _LOCAL_HOSTED_FIELDS or normalized in {
+        "publication",
+        "remote",
+        "remote_target",
+        "target_remote",
+    } or normalized.startswith(_LOCAL_FORBIDDEN_FIELD_PREFIXES)
 
 
 def _reject_local_hosted_fields(value: object) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if _normalized_field_name(key) in _LOCAL_HOSTED_FIELDS:
+            if _is_local_hosted_field(key):
                 raise ReleaseGateError("GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE")
             _reject_local_hosted_fields(child)
     elif isinstance(value, (list, tuple)):
@@ -570,6 +600,97 @@ def _command_pytest_count(command: Mapping[str, object]) -> int | None:
     return log_count if log_count is not None else summary_count
 
 
+def _canonical_command_tokens(command: Mapping[str, object]) -> list[str]:
+    arguments = command.get("arguments", command.get("argv"))
+    if isinstance(arguments, (list, tuple)):
+        return [str(value).strip('"\'').casefold() for value in arguments]
+    command_text = command.get("command")
+    if isinstance(command_text, str):
+        return [value.strip('"\'').casefold() for value in command_text.split()]
+    return []
+
+
+def _require_canonical_full_command(
+    command: Mapping[str, object], *, require_name: bool
+) -> None:
+    command_name = str(command.get("name", "")).casefold()
+    if require_name and command_name not in _CANONICAL_FULL_COMMAND_NAMES:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    if command_name and command_name not in _CANONICAL_FULL_COMMAND_NAMES:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    tokens = _canonical_command_tokens(command)
+    pytest_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token in {"pytest", "py.test", "pytest.exe", "py.test.exe"}
+        ),
+        None,
+    )
+    if pytest_index is None:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    selected_flags = ("-k", "--keyword", "--deselect", "--ignore", "--pyargs")
+    for token in tokens[pytest_index + 1 :]:
+        if token == "-m" or token.startswith("-m="):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        if token in selected_flags or token.startswith(
+            tuple(f"{flag}=" for flag in selected_flags)
+        ):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+        if token == "--" or not token.startswith("-"):
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+
+def _canonical_pytest_result_count(
+    result: Mapping[str, object], *, require_command_name: bool
+) -> int:
+    if type(result.get("exit_code")) is not int:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+    if result["exit_code"] != 0:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
+
+    status = result.get("status")
+    if (
+        not isinstance(status, str)
+        or status.casefold() not in _CANONICAL_PYTEST_SUCCESS_STATUSES
+    ):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_STATUS_INVALID")
+
+    counts: list[int] = []
+    for name in ("count", "passed", "pytest_pass_count"):
+        if name not in result:
+            continue
+        count = result[name]
+        if type(count) is not int or count < 1:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_INVALID")
+        counts.append(count)
+    if not counts:
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
+    if any(count != counts[0] for count in counts[1:]):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    count = counts[0]
+
+    if any(
+        name in result for name in ("name", "command", "arguments", "argv")
+    ):
+        _require_canonical_full_command(
+            result, require_name=require_command_name
+        )
+    summary_count = _pytest_summary_count(
+        result.get("summary", result.get("output"))
+    )
+    log_count = _read_local_log_count(
+        result.get("log_path", result.get("log")),
+        result.get("log_digest", result.get("sha256")),
+    )
+    for observed in (summary_count, log_count):
+        if observed is not None and observed != count:
+            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    return count
+
+
 def _local_pytest_count(raw: Mapping[str, object]) -> int:
     for collection_name in ("focused_suites", "commands"):
         collection = raw.get(collection_name)
@@ -680,44 +801,28 @@ def _local_pytest_count(raw: Mapping[str, object]) -> int:
 def _canonical_full_pytest_count(raw: Mapping[str, object]) -> int:
     candidates: list[int] = []
     for name in ("full_suite", "full_pytest"):
-        suite = raw.get(name)
-        if suite is None:
+        if name not in raw:
             continue
-        if not isinstance(suite, Mapping) or suite.get("exit_code") != 0:
+        suite = raw[name]
+        if not isinstance(suite, Mapping):
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
-        count = _pytest_summary_count(suite.get("summary", suite.get("output")))
-        if count is None:
-            count = _read_local_log_count(
-                suite.get("log_path", suite.get("log")),
-                suite.get("log_digest", suite.get("sha256")),
-            )
-        if count is None:
-            declared = suite.get("pytest_pass_count", suite.get("passed"))
-            if type(declared) is int and declared > 0:
-                count = declared
-        if count is None:
-            raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
-        candidates.append(count)
+        candidates.append(
+            _canonical_pytest_result_count(suite, require_command_name=False)
+        )
 
-    for collection_name in ("focused_suites", "commands"):
-        collection = raw.get(collection_name)
-        if collection is None:
-            continue
+    collection = raw.get("commands")
+    if collection is not None:
         if not isinstance(collection, (list, tuple)):
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
         for command in collection:
             if not isinstance(command, Mapping):
                 raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_FAILED")
-            command_text = _command_text(command).casefold()
             command_name = str(command.get("name", "")).casefold()
-            if command_name not in {"full", "full-suite", "full_pytest", "pytest"} and (
-                "pytest" not in command_text
-            ):
+            if command_name not in _CANONICAL_FULL_COMMAND_NAMES:
                 continue
-            count = _command_pytest_count(command)
-            if count is None:
-                raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
-            candidates.append(count)
+            candidates.append(
+                _canonical_pytest_result_count(command, require_command_name=True)
+            )
 
     if not candidates:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
@@ -800,9 +905,10 @@ class LocalVerificationReadback:
         elif raw.get("final_outcome") not in {"pass", "passed"}:
             raise ReleaseGateError("GA_LOCAL_VERIFICATION_OUTCOME_INVALID")
         subject_sha, subject_tree_sha = _local_subject(raw)
-        pytest_pass_count = _local_pytest_count(raw)
         if mode == "local-only-v1":
             pytest_pass_count = _canonical_full_pytest_count(raw)
+        else:
+            pytest_pass_count = _local_pytest_count(raw)
         return cls(
             schema=str(schema),
             verification_mode=str(mode),

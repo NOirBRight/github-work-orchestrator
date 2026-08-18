@@ -717,6 +717,8 @@ def _canonical_local_verification_manifest(**overrides: object) -> dict[str, obj
                 "name": "full",
                 "arguments": ["-m", "pytest", "-q"],
                 "exit_code": 0,
+                "status": "passed",
+                "passed": 42,
                 "summary": "42 passed in 1.0s",
             }
         ],
@@ -790,6 +792,103 @@ def test_canonical_local_verification_requires_full_pytest_readback(tmp_path):
         verifier.load_local_verification(path)
 
     assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        {
+            "name": "full",
+            "arguments": ["-m", "pytest", "-k", "one", "-q"],
+        },
+        {
+            "name": "package",
+            "arguments": ["-m", "pytest", "-q", "tests/test_v8_release_metadata.py"],
+        },
+    ],
+    ids=["pytest-selector", "package-only"],
+)
+def test_canonical_local_verification_rejects_non_full_pytest_commands(
+    tmp_path, command
+):
+    command = {
+        **command,
+        "exit_code": 0,
+        "status": "passed",
+        "passed": 1,
+        "summary": "1 passed in 1.0s",
+    }
+    manifest = _canonical_local_verification_manifest(commands=[command])
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    expected_code = (
+        "GA_LOCAL_VERIFICATION_PYTEST_FAILED"
+        if command["name"] == "full"
+        else "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING"
+    )
+    assert error.value.code == expected_code
+
+
+@pytest.mark.parametrize("missing", ["status", "passed"])
+def test_canonical_local_verification_requires_full_pytest_result_fields(
+    tmp_path, missing
+):
+    command = {
+        "name": "full",
+        "arguments": ["-m", "pytest", "-q"],
+        "exit_code": 0,
+        "status": "passed",
+        "passed": 42,
+        "summary": "42 passed in 1.0s",
+    }
+    del command[missing]
+    manifest = _canonical_local_verification_manifest(commands=[command])
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    expected_code = (
+        "GA_LOCAL_VERIFICATION_PYTEST_STATUS_INVALID"
+        if missing == "status"
+        else "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING"
+    )
+    assert error.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "hosted_ci_suite",
+        "ci_run",
+        "pull_request_merge_mapping",
+        "publication_receipt_digest",
+        "remote_target_sha",
+        "HostedCISuite",
+        "CIRun",
+        "PullRequestMergeMapping",
+        "PublicationReceiptDigest",
+        "RemoteTargetSha",
+    ],
+)
+def test_canonical_local_verification_rejects_extended_forbidden_field_aliases(
+    tmp_path, forbidden
+):
+    manifest = _canonical_local_verification_manifest(
+        nested_evidence={"nested": [{forbidden: {"value": "blocked"}}]}
+    )
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_HOSTED_EVIDENCE"
 
 
 def test_canonical_local_verification_rejects_nested_pull_request_evidence(tmp_path):
