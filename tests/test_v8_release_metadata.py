@@ -589,8 +589,8 @@ def test_pre_tag_cli_accepts_local_verification_without_github_ci(
         path.write_bytes(verifier.canonical_json_bytes(vars(value)))
 
     local_verification_path = tmp_path / "local-verification.json"
-    local_verification_path.write_text(
-        json.dumps(
+    local_verification_path.write_bytes(
+        verifier.canonical_json_bytes(
             {
                 "schema": "gwo-c1-local-verification.v2",
                 "mode": "Local Verification Only",
@@ -606,12 +606,8 @@ def test_pre_tag_cli_accepts_local_verification_without_github_ci(
                         "summary": "42 passed in 1.0s",
                     }
                 ],
-            },
-            indent=2,
-            sort_keys=True,
+            }
         )
-        + "\n",
-        encoding="utf-8",
     )
 
     def fake_check_output(arguments, *, text=True, cwd=None):
