@@ -135,8 +135,9 @@ through `--evidence-bridge`. Its `bridge_digest` is recomputed over the
 canonical payload before projection. The bridge has a role-specific allow-list
 so unrecognized dynamic SHA/CI fields and unknown role fields are rejected;
 repository, package, activation, generation, and default-writer mismatches
-fail closed. The original bridge digest and the renderer's explicit
-`evidence_bridge_links` are both retained in the generated metadata.
+fail closed. Generated metadata retains a stable bridge-identity digest (the
+bridge digest projection excludes the moving final `release_subject`), the
+activation release subject, and the renderer's explicit `evidence_bridge_links`.
 
 ## Limitations
 

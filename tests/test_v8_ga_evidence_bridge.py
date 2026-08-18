@@ -83,7 +83,7 @@ def _case(tmp_path: Path):
     assert admission["previous_writer_generation"] == PREVIOUS_WRITER_GENERATION
     assert (
         bridge_payload["bridge_digest"]
-        == "97c173547a4bfd1444503cfb3ed76cc0ea03e1eba2d800a4d8fa2d854fb70ea4"
+        == "30962c93b38ae16eaaa5dd0fdb805fdd22fa4108fd6374e37abafad6cfb2dea7"
     )
     # Keep the immutable V8 transition lineage separate from the Guard's V6.1
     # source-writer proof.
