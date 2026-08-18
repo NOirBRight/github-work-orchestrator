@@ -14,6 +14,17 @@ import subprocess
 import sys
 from typing import Mapping, Protocol, Sequence
 
+try:
+    from provision_v8_root_canary import (
+        RootCanaryProvisionError,
+        load_ticket_manifest,
+    )
+except ModuleNotFoundError:  # imported as ``scripts.verify_v8_root_canary``
+    from scripts.provision_v8_root_canary import (  # type: ignore[no-redef]
+        RootCanaryProvisionError,
+        load_ticket_manifest,
+    )
+
 
 ROOT_REPOSITORY = "NOirBRight/github-work-orchestrator"
 ROOT_TICKET_KEYS = ("alpha", "beta", "gamma", "delta")
@@ -32,6 +43,65 @@ _LOCAL_RECEIPT_SCHEMA = "gwo-v8-root-canary-acceptance.v2"
 _LOCAL_TICKET_REFS = ("issue:195", "issue:196", "issue:197", "issue:198")
 _LOCAL_STANDARD_TICKET_REFS = _LOCAL_TICKET_REFS[:3]
 _LOCAL_STRICT_TICKET_REF = _LOCAL_TICKET_REFS[3]
+_LOCAL_READBACK_KEYS = frozenset(
+    {
+        "observations",
+        "candidate_receipts",
+        "candidate_diffs",
+        "accepted_candidate_receipts",
+        "delivery_proofs",
+        "result_integrities",
+        "git_readback",
+    }
+)
+_LOCAL_TRANSCRIPT_SEQUENCE = (
+    "start",
+    "inspect",
+    "advance",
+    "inspect",
+    "watchdog",
+    "inspect",
+    "advance",
+    "inspect",
+    "inspect",
+    "advance",
+    "inspect",
+    "advance",
+    "inspect",
+)
+_LOCAL_GATE_STATUS_HISTORY = {
+    "issue:195": ("review_accepted",),
+    "issue:196": ("repair_required", "repair_accepted"),
+    "issue:197": ("ordinary_rejected", "review_accepted"),
+    "issue:198": ("review_accepted",),
+}
+_LOCAL_REVIEW_SUBJECT_KEYS = frozenset(
+    {
+        "action_kind",
+        "assurance_requirement_digest",
+        "base_commit_oid",
+        "base_tree_oid",
+        "candidate_audit_digest",
+        "candidate_commit_oid",
+        "candidate_digest",
+        "candidate_receipt_digest",
+        "candidate_tree_oid",
+        "check_evidence_digests",
+        "diff_record_digest",
+        "diff_schema_version",
+        "kind",
+        "parent_digest",
+        "policy_witness_digest",
+        "prior_review_subject_digest",
+        "protocol_version",
+        "repair_delta_digest",
+        "repair_packet_digest",
+        "runtime_subject_digest",
+        "standards",
+        "subject_digest",
+        "ticket_contract_digest",
+    }
+)
 
 
 class RootCanaryVerificationError(RuntimeError):
@@ -98,6 +168,18 @@ def _canonical_digest(value: object) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _candidate_diff_record_digest(value: Mapping[str, object]) -> str:
+    body = {key: item for key, item in value.items() if key != "record_digest"}
+    encoded = json.dumps(
+        _json_value(body),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(b"gwo.candidate-diff-record.v1\x00" + encoded).hexdigest()
 
 
 def _mapping(value: object, code: str) -> dict[str, object]:
@@ -2314,7 +2396,10 @@ def _local_facts_and_readback(
         readback = _mapping(
             facts.get("readback"), "LOCAL_EVIDENCE_INCOMPLETE"
         )
+    if set(readback) != _LOCAL_READBACK_KEYS:
+        _reject("LOCAL_READBACK_INCOMPLETE")
     return facts, readback
+
 
 
 def _local_identity(
@@ -2382,12 +2467,8 @@ def _local_candidate_records(
     dict[str, dict[str, object]],
 ]:
     raw_candidates = readback.get("candidate_receipts")
-    if raw_candidates is None:
-        raw_candidates = bundle.get("candidates")
     candidate_values = _sequence(raw_candidates, "CANDIDATE_RECEIPT_INCOMPLETE")
     raw_accepted = readback.get("accepted_candidate_receipts")
-    if raw_accepted is None:
-        raw_accepted = bundle.get("accepted_candidate_receipts")
     accepted_values = _sequence(
         raw_accepted, "CANDIDATE_RECEIPT_INCOMPLETE"
     )
@@ -2470,6 +2551,7 @@ def _local_candidate_records(
 def _local_review_links(
     bundle: Mapping[str, object],
     facts: Mapping[str, object],
+    candidates: Mapping[str, dict[str, object]],
     accepted: Mapping[str, dict[str, object]],
     manifest: Sequence[dict[str, object]],
 ) -> dict[str, dict[str, object]]:
@@ -2481,49 +2563,69 @@ def _local_review_links(
     )
     raw_transitions = transitions_mapping.get("transitions")
     if raw_transitions is None:
-        raw_reviews = bundle.get("reviews")
-        review_values = _sequence(
-            raw_reviews, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
-        )
-        links: dict[str, dict[str, object]] = {}
-        for raw in review_values:
-            review = _mapping(raw, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-            key = _text(
-                review.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
-            )
-            if key not in accepted or key in links:
-                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-            finding = _digest(
-                review.get("finding_ledger_digest"),
-                "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
-            )
-            if finding != accepted[key]["review_finding_ledger_digest"]:
-                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-            links[key] = {
-                "ticket_key": key,
-                "candidate_receipt_digest": accepted[key][
-                    "candidate_receipt_digest"
-                ],
-                "finding_ledger_digest": finding,
-            }
-        if tuple(links) != _LOCAL_TICKET_REFS:
+        _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+
+    transitions = tuple(
+        _mapping(raw, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        for raw in _sequence(raw_transitions, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    )
+    expected_transition_keys = tuple(
+        ticket_key
+        for ticket_key, statuses in _LOCAL_GATE_STATUS_HISTORY.items()
+        for _status in statuses
+    )
+    if tuple(
+        _text(item.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        for item in transitions
+    ) != expected_transition_keys:
+        _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    histories: dict[str, list[str]] = {key: [] for key in _LOCAL_TICKET_REFS}
+    for transition in transitions:
+        key = _text(transition.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        status = _text(transition.get("status"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        if key not in histories or transition.get("persisted") is not True:
             _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-        return links
+        histories[key].append(status)
+    if any(
+        tuple(histories[key]) != _LOCAL_GATE_STATUS_HISTORY[key]
+        for key in _LOCAL_TICKET_REFS
+    ):
+        _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
 
     links = {}
     manifest_by_key = {ticket["key"]: ticket for ticket in manifest}
-    for raw in _sequence(raw_transitions, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"):
-        transition = _mapping(raw, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    for transition in transitions:
         key = _text(transition.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        status = _text(transition.get("status"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        candidate_receipt = _validate_candidate_receipt(
+            transition.get("candidate_receipt")
+        )
+        ticket = manifest_by_key.get(key)
+        if ticket is None or candidate_receipt.get("ticket_key") != key:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        if status in {"repair_required", "ordinary_rejected"}:
+            if transition.get("accepted_candidate_receipt") is not None:
+                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        else:
+            if transition.get("accepted_candidate_receipt") is None:
+                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
         accepted_receipt = transition.get("accepted_candidate_receipt")
         if accepted_receipt is None:
+            if transition.get("review_subject") is not None:
+                _validate_local_review_subject(
+                    transition.get("review_subject"),
+                    candidate_receipt=candidate_receipt,
+                    accepted_receipt=None,
+                    ticket=ticket,
+                )
             continue
         accepted_mapping = _validate_accepted_candidate_receipt(accepted_receipt)
         if key not in accepted or accepted_mapping["receipt_digest"] != accepted[key][
             "receipt_digest"
         ]:
             _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-        if transition.get("status") not in {"review_accepted", "repair_accepted"}:
+        expected_candidate = candidates[key]["candidate_receipt"]
+        if candidate_receipt.get("receipt_digest") != expected_candidate["receipt_digest"]:
             _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
         finding = _digest(
             transition.get("review_finding_ledger_digest"),
@@ -2535,9 +2637,22 @@ def _local_review_links(
             transition.get("review_subject"),
             "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
         )
-        ticket = manifest_by_key.get(key)
-        if ticket is None or subject.get("ticket_contract_digest") != _ticket_contract_digest(ticket):
+        if candidate_receipt.get("parent_digest") != expected_candidate.get("parent_digest"):
             _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        subject_parent_digest = _digest(
+            subject.get("parent_digest"), "LOCAL_REVIEW_SUBJECT_INVALID"
+        )
+        if subject_parent_digest != candidate_receipt["parent_digest"]:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        try:
+            _validate_local_review_subject(
+                subject,
+                candidate_receipt=candidate_receipt,
+                accepted_receipt=accepted_mapping,
+                ticket=ticket,
+            )
+        except RootCanaryVerificationError:
+            _reject("LOCAL_REVIEW_SUBJECT_INVALID")
         links[key] = {
             "ticket_key": key,
             "candidate_receipt_digest": accepted[key]["candidate_receipt_digest"],
@@ -2547,6 +2662,329 @@ def _local_review_links(
     if tuple(links) != _LOCAL_TICKET_REFS:
         _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
     return links
+
+
+def _validate_local_review_subject(
+    value: object,
+    *,
+    candidate_receipt: Mapping[str, object],
+    accepted_receipt: Mapping[str, object] | None,
+    ticket: Mapping[str, object],
+) -> dict[str, object]:
+    subject = _mapping(value, "LOCAL_REVIEW_SUBJECT_INVALID")
+    if set(subject) != _LOCAL_REVIEW_SUBJECT_KEYS:
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    for field in (
+        "parent_digest",
+        "candidate_receipt_digest",
+        "runtime_subject_digest",
+        "candidate_digest",
+        "candidate_audit_digest",
+        "ticket_contract_digest",
+        "policy_witness_digest",
+        "diff_record_digest",
+        "assurance_requirement_digest",
+        "subject_digest",
+    ):
+        _digest(subject.get(field), "LOCAL_REVIEW_SUBJECT_INVALID")
+    for field in (
+        "base_commit_oid",
+        "base_tree_oid",
+        "candidate_commit_oid",
+        "candidate_tree_oid",
+    ):
+        _object_id(subject.get(field), "LOCAL_REVIEW_SUBJECT_INVALID")
+    if (
+        subject.get("kind") != "review_subject.v1"
+        or subject.get("diff_schema_version") != "CandidateDiffRecordV1"
+        or subject.get("protocol_version") != "gwo.formal-review.v1"
+        or subject.get("action_kind") not in {"formal_review", "repair_verify"}
+    ):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    standards = tuple(
+        _text(item, "LOCAL_REVIEW_SUBJECT_INVALID")
+        for item in _sequence(subject.get("standards"), "LOCAL_REVIEW_SUBJECT_INVALID")
+    )
+    if standards != tuple(sorted(set(standards))):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    check_digests = tuple(
+        _digest(item, "LOCAL_REVIEW_SUBJECT_INVALID")
+        for item in _sequence(
+            subject.get("check_evidence_digests"), "LOCAL_REVIEW_SUBJECT_INVALID"
+        )
+    )
+    if check_digests != tuple(sorted(set(check_digests))):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    repair_fields = (
+        "prior_review_subject_digest",
+        "repair_packet_digest",
+        "repair_delta_digest",
+    )
+    if subject.get("action_kind") == "repair_verify":
+        for field in repair_fields:
+            _digest(subject.get(field), "LOCAL_REVIEW_SUBJECT_INVALID")
+    elif any(subject.get(field) is not None for field in repair_fields):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+
+    body = {key: item for key, item in subject.items() if key != "subject_digest"}
+    if subject["subject_digest"] != _canonical_digest(body):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    if (
+        subject["ticket_contract_digest"] != _ticket_contract_digest(ticket)
+        or subject["parent_digest"] != candidate_receipt["parent_digest"]
+        or subject["candidate_receipt_digest"] != candidate_receipt["receipt_digest"]
+        or subject["runtime_subject_digest"] != candidate_receipt["runtime_subject_digest"]
+        or subject["base_commit_oid"] != candidate_receipt["base_commit_oid"]
+        or subject["base_tree_oid"] != candidate_receipt["base_tree_oid"]
+        or subject["candidate_commit_oid"] != candidate_receipt["candidate_commit_oid"]
+        or subject["candidate_tree_oid"] != candidate_receipt["candidate_tree_oid"]
+        or subject["diff_record_digest"] != candidate_receipt["diff_record_digest"]
+    ):
+        _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    if accepted_receipt is not None:
+        if (
+            subject["subject_digest"] != accepted_receipt["review_subject_digest"]
+            or subject["policy_witness_digest"]
+            != accepted_receipt["policy_witness_digest"]
+            or subject["assurance_requirement_digest"]
+            != accepted_receipt["assurance_requirement_digest"]
+        ):
+            _reject("LOCAL_REVIEW_SUBJECT_INVALID")
+    return subject
+
+
+def _validate_local_candidate_diff(
+    value: object,
+    *,
+    candidate_receipt: Mapping[str, object],
+    code: str = "LOCAL_READBACK_INCOMPLETE",
+) -> dict[str, object]:
+    diff = _mapping(value, code)
+    if set(diff) != {
+        "schema_version",
+        "repository_object_format",
+        "base",
+        "candidate",
+        "entries",
+        "record_digest",
+    }:
+        _reject(code)
+    if diff.get("schema_version") != "CandidateDiffRecordV1":
+        _reject(code)
+    object_format = _text(diff.get("repository_object_format"), code)
+    if object_format not in {"sha1", "sha256"}:
+        _reject(code)
+    base = _mapping(diff.get("base"), code)
+    candidate = _mapping(diff.get("candidate"), code)
+    if set(base) != {"commit_oid", "tree_oid"} or set(candidate) != {
+        "commit_oid",
+        "tree_oid",
+    }:
+        _reject(code)
+    for side in (base, candidate):
+        for field in ("commit_oid", "tree_oid"):
+            oid = _object_id(side.get(field), code)
+            if len(oid) != (40 if object_format == "sha1" else 64):
+                _reject(code)
+    if (
+        base["commit_oid"] != candidate_receipt.get("base_commit_oid")
+        or base["tree_oid"] != candidate_receipt.get("base_tree_oid")
+        or candidate["commit_oid"] != candidate_receipt.get("candidate_commit_oid")
+        or candidate["tree_oid"] != candidate_receipt.get("candidate_tree_oid")
+    ):
+        _reject(code)
+
+    entries = _sequence(diff.get("entries"), code)
+    for raw_entry in entries:
+        entry = _mapping(raw_entry, code)
+        if set(entry) != {
+            "old_path",
+            "new_path",
+            "change_kind",
+            "old_mode",
+            "new_mode",
+            "old_object_type",
+            "new_object_type",
+            "old_oid",
+            "new_oid",
+        }:
+            _reject(code)
+        change_kind = _text(entry.get("change_kind"), code)
+        if change_kind not in {"add", "delete", "modify", "type-change"}:
+            _reject(code)
+        old_present = entry.get("old_path") is not None
+        new_present = entry.get("new_path") is not None
+        if (change_kind == "add" and (old_present or not new_present)) or (
+            change_kind == "delete" and (not old_present or new_present)
+        ) or (
+            change_kind in {"modify", "type-change"}
+            and (not old_present or not new_present)
+        ):
+            _reject(code)
+        for side in ("old", "new"):
+            path = entry[f"{side}_path"]
+            mode = entry[f"{side}_mode"]
+            object_type = entry[f"{side}_object_type"]
+            oid = entry[f"{side}_oid"]
+            if path is None:
+                if any(value is not None for value in (mode, object_type, oid)):
+                    _reject(code)
+                continue
+            _text(path, code)
+            if type(mode) is not str or re.fullmatch(r"[0-7]{6}", mode) is None:
+                _reject(code)
+            if object_type not in {"blob", "gitlink"}:
+                _reject(code)
+            checked_oid = _object_id(oid, code)
+            if len(checked_oid) != (40 if object_format == "sha1" else 64):
+                _reject(code)
+    record_digest = _digest(diff.get("record_digest"), code)
+    if record_digest != _candidate_diff_record_digest(diff):
+        _reject(code)
+    if record_digest != candidate_receipt.get("diff_record_digest"):
+        _reject(code)
+    return diff
+
+
+def _local_candidate_diffs(
+    readback: Mapping[str, object],
+    candidates: Mapping[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    values = _sequence(readback.get("candidate_diffs"), "LOCAL_READBACK_INCOMPLETE")
+    if len(values) != len(_LOCAL_TICKET_REFS):
+        _reject("LOCAL_READBACK_INCOMPLETE")
+    diffs: dict[str, dict[str, object]] = {}
+    for key, value in zip(_LOCAL_TICKET_REFS, values, strict=True):
+        diff = _validate_local_candidate_diff(
+            value,
+            candidate_receipt=candidates[key]["candidate_receipt"],
+        )
+        if diff["record_digest"] in {
+            item["record_digest"] for item in diffs.values()
+        }:
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        diffs[key] = diff
+    return diffs
+
+
+_LOCAL_DELIVERY_PROOF_KEYS = frozenset(
+    {
+        "delivery_stable_action_id",
+        "delivery_request_digest",
+        "batch_id",
+        "batch_sha",
+        "member_ticket_keys",
+        "local_check_receipt_digest",
+        "publication_receipt_digest",
+        "pull_request_number",
+        "pull_request_head_sha",
+        "hosted_result_receipt_digest",
+        "integration_lease_digest",
+        "target_branch",
+        "target_head_sha",
+        "target_readback_digest",
+        "target_contains_batch_sha",
+        "pull_request_merge_target_sha",
+        "merge_method",
+        "proof_digest",
+    }
+)
+
+
+def _local_delivery_proofs(
+    readback: Mapping[str, object],
+    *,
+    batches: Sequence[VerifiedBatch],
+    proofs_by_id: Mapping[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    values = _sequence(readback.get("delivery_proofs"), "LOCAL_READBACK_INCOMPLETE")
+    if len(values) != len(_LOCAL_TICKET_REFS):
+        _reject("LOCAL_READBACK_INCOMPLETE")
+    batch_by_id = {batch.batch_id: batch for batch in batches}
+    result: dict[str, dict[str, object]] = {}
+    for raw in values:
+        proof = _mapping(raw, "LOCAL_READBACK_INCOMPLETE")
+        if set(proof) != _LOCAL_DELIVERY_PROOF_KEYS:
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        for field in (
+            "delivery_request_digest",
+            "local_check_receipt_digest",
+            "publication_receipt_digest",
+            "hosted_result_receipt_digest",
+            "integration_lease_digest",
+            "target_readback_digest",
+            "proof_digest",
+        ):
+            _digest(proof.get(field), "LOCAL_READBACK_INCOMPLETE")
+        for field in (
+            "batch_sha",
+            "pull_request_head_sha",
+            "target_head_sha",
+            "pull_request_merge_target_sha",
+        ):
+            _object_id(proof.get(field), "LOCAL_READBACK_INCOMPLETE")
+        _text(proof.get("delivery_stable_action_id"), "LOCAL_READBACK_INCOMPLETE")
+        _text(proof.get("batch_id"), "LOCAL_READBACK_INCOMPLETE")
+        _text(proof.get("target_branch"), "LOCAL_READBACK_INCOMPLETE")
+        members = tuple(
+            _text(item, "LOCAL_READBACK_INCOMPLETE")
+            for item in _sequence(proof.get("member_ticket_keys"), "LOCAL_READBACK_INCOMPLETE")
+        )
+        if members not in {
+            _LOCAL_STANDARD_TICKET_REFS,
+            (_LOCAL_STRICT_TICKET_REF,),
+        }:
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        if (
+            type(proof.get("pull_request_number")) is not int
+            or proof["pull_request_number"] <= 0
+            or proof.get("target_branch") != "main"
+            or proof.get("pull_request_head_sha") != proof.get("batch_sha")
+            or proof.get("target_contains_batch_sha") is not True
+            or proof.get("pull_request_merge_target_sha") != proof.get("target_head_sha")
+            or proof.get("merge_method") != "merge"
+        ):
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        body = {key: item for key, item in proof.items() if key != "proof_digest"}
+        if proof["proof_digest"] != _canonical_digest(
+            {"kind": "batch-delivery-proof.v1", **body}
+        ):
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        batch = batch_by_id.get(proof["batch_id"])
+        local_proof = proofs_by_id.get(proof["batch_id"])
+        if batch is None or local_proof is None:
+            _reject("LOCAL_BATCH_CROSSLINK_INVALID")
+        if (
+            proof["batch_sha"] != batch.batch_sha
+            or members != tuple(local_proof["member_ticket_keys"])
+            or proof["local_check_receipt_digest"]
+            != local_proof["local_suite"]["receipt"]["receipt_digest"]
+            or proof["integration_lease_digest"]
+            != local_proof["integration_lease"]["digest"]
+            or local_proof["target_readback"]["batch_sha"] != proof["batch_sha"]
+            or local_proof["target_readback"]["target_ref_sha"]
+            != proof["target_head_sha"]
+            or local_proof["target_readback"]["target_after"]["commit_sha"]
+            != proof["target_head_sha"]
+        ):
+            _reject("LOCAL_BATCH_CROSSLINK_INVALID")
+        if proof["proof_digest"] in result:
+            _reject("LOCAL_READBACK_INCOMPLETE")
+        result[proof["proof_digest"]] = proof
+    member_counts = sorted(
+        sum(
+            1
+            for proof in result.values()
+            if tuple(proof["member_ticket_keys"]) == members
+        )
+        for members in (
+            _LOCAL_STANDARD_TICKET_REFS,
+            (_LOCAL_STRICT_TICKET_REF,),
+        )
+    )
+    if len(result) != len(_LOCAL_TICKET_REFS) or member_counts != [1, 3]:
+        _reject("LOCAL_READBACK_INCOMPLETE")
+    return result
 
 
 def _local_target_readback(
@@ -2767,17 +3205,91 @@ def _local_batch_proofs(
             _reject("LOCAL_BATCH_CROSSLINK_INVALID")
 
         local_suite = _mapping(proof.get("local_suite"), "LOCAL_BATCH_PROOF_INCOMPLETE")
-        if set(local_suite) != {"suite_id", "batch_sha", "status", "receipt_digest"}:
+        if set(local_suite) != {
+            "suite_id",
+            "batch_sha",
+            "status",
+            "receipt_digest",
+            "definition",
+            "receipt",
+        }:
             _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
-        _text(local_suite.get("suite_id"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        suite_id = _text(local_suite.get("suite_id"), "LOCAL_BATCH_PROOF_INCOMPLETE")
         if local_suite.get("batch_sha") != batch_sha or local_suite.get("status") != "passed":
             _reject("LOCAL_BATCH_SHA_MISMATCH")
-        _digest(local_suite.get("receipt_digest"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        receipt_digest = _digest(
+            local_suite.get("receipt_digest"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        definition = _mapping(
+            local_suite.get("definition"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        if set(definition) != {"suite_id", "definition_digest", "command"}:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        definition_digest = _digest(
+            definition.get("definition_digest"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        command = _sequence(definition.get("command"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if (
+            definition.get("suite_id") != suite_id
+            or not command
+            or any(type(item) is not str or not item for item in command)
+        ):
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        receipt = _mapping(
+            local_suite.get("receipt"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        if set(receipt) != {
+            "batch_sha",
+            "suite_id",
+            "definition_digest",
+            "outcome",
+            "observation_digest",
+            "source_ref",
+            "receipt_digest",
+        }:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        for field in ("observation_digest", "receipt_digest"):
+            _digest(receipt.get(field), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if (
+            receipt.get("batch_sha") != batch_sha
+            or receipt.get("suite_id") != suite_id
+            or receipt.get("definition_digest") != definition_digest
+            or receipt.get("outcome") != "passed"
+            or receipt.get("source_ref")
+            != f"refs/gwo-v8/integration-batches/{batch_sha}"
+            or receipt.get("receipt_digest")
+            != _canonical_digest(
+                {
+                    "kind": "local-check-receipt.v1",
+                    **{
+                        key: receipt[key]
+                        for key in (
+                            "batch_sha",
+                            "suite_id",
+                            "definition_digest",
+                            "outcome",
+                            "observation_digest",
+                            "source_ref",
+                        )
+                    },
+                }
+            )
+            or receipt.get("receipt_digest") != receipt_digest
+        ):
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
 
         lease = _mapping(
             proof.get("integration_lease"), "LOCAL_INTEGRATION_LEASE_INVALID"
         )
-        if set(lease) != {"serialized", "stable_action_id", "writer", "activation", "digest"}:
+        if set(lease) != {
+            "serialized",
+            "stable_action_id",
+            "writer",
+            "activation",
+            "digest",
+            "acquisition",
+            "release",
+        }:
             _reject("LOCAL_INTEGRATION_LEASE_INVALID")
         serialized = _mapping(
             lease.get("serialized"), "LOCAL_INTEGRATION_LEASE_INVALID"
@@ -2807,6 +3319,23 @@ def _local_batch_proofs(
             lease.get("stable_action_id") != serialized.get("holder")
             or lease.get("writer") != serialized.get("writer_generation")
             or lease.get("activation") != serialized.get("activation_id")
+        ):
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        acquisition = _mapping(
+            lease.get("acquisition"), "LOCAL_INTEGRATION_LEASE_INVALID"
+        )
+        release = _mapping(lease.get("release"), "LOCAL_INTEGRATION_LEASE_INVALID")
+        if (
+            set(acquisition)
+            != {"status", "lease_digest", "inactive_after_release"}
+            or acquisition.get("status") != "acquired"
+            or acquisition.get("lease_digest") != lease_digest
+            or acquisition.get("inactive_after_release") is not False
+            or set(release)
+            != {"status", "lease_digest", "inactive_after_release"}
+            or release.get("status") != "released"
+            or release.get("lease_digest") != lease_digest
+            or release.get("inactive_after_release") is not True
         ):
             _reject("LOCAL_INTEGRATION_LEASE_INVALID")
         current_lease_identity = (str(lease["activation"]), str(lease["writer"]))
@@ -2877,16 +3406,89 @@ def _local_result_crosslinks(
     accepted: Mapping[str, dict[str, object]],
     batches: tuple[VerifiedBatch, VerifiedBatch],
     proofs_by_id: Mapping[str, dict[str, object]],
+    delivery_proofs: Mapping[str, dict[str, object]],
 ) -> list[dict[str, object]]:
     batch_by_id = {batch.batch_id: batch for batch in batches}
-    result_values = readback.get("result_integrities", bundle.get("result_integrities"))
+    result_values = readback.get("result_integrities")
     results = _sequence(result_values, "LOCAL_RESULT_CROSSLINK_INVALID")
     if len(results) != 4:
         _reject("LOCAL_RESULT_CROSSLINK_INVALID")
     seen: set[str] = set()
+    delivery_receipts_by_ticket: dict[str, str] = {}
+    evidence_by_ticket: dict[str, tuple[str, ...]] = {}
     projected: list[dict[str, object]] = []
     for raw in results:
         result = _mapping(raw, "LOCAL_RESULT_CROSSLINK_INVALID")
+        if set(result) != {
+            "accepted_candidate_receipt_digest",
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+            "candidate_diff_record_digest",
+            "batch_delivery_receipt_digest",
+            "batch_delivery_stable_action_id",
+            "batch_delivery_request_digest",
+            "batch_delivery_batch_id",
+            "batch_delivery_batch_sha",
+            "batch_delivery_proof_digest",
+            "delivery_stable_action_id",
+            "delivery_request_digest",
+            "batch_id",
+            "batch_sha",
+            "delivery_member_ticket_keys",
+            "local_check_receipt_digest",
+            "publication_receipt_digest",
+            "pull_request_number",
+            "pull_request_head_sha",
+            "hosted_result_receipt_digest",
+            "integration_lease_digest",
+            "target_branch",
+            "target_head_sha",
+            "target_readback_digest",
+            "target_contains_batch_sha",
+            "pull_request_merge_target_sha",
+            "merge_method",
+            "result_digest",
+            "evidence_digests",
+        }:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        for field in (
+            "accepted_candidate_receipt_digest",
+            "candidate_diff_record_digest",
+            "batch_delivery_receipt_digest",
+            "batch_delivery_request_digest",
+            "batch_delivery_proof_digest",
+            "delivery_request_digest",
+            "local_check_receipt_digest",
+            "publication_receipt_digest",
+            "hosted_result_receipt_digest",
+            "integration_lease_digest",
+            "target_readback_digest",
+            "result_digest",
+        ):
+            _digest(result.get(field), "LOCAL_RESULT_CROSSLINK_INVALID")
+        for field in (
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+            "batch_delivery_batch_sha",
+            "batch_sha",
+            "pull_request_head_sha",
+            "target_head_sha",
+            "pull_request_merge_target_sha",
+        ):
+            _object_id(result.get(field), "LOCAL_RESULT_CROSSLINK_INVALID")
+        if type(result.get("pull_request_number")) is not int or result["pull_request_number"] <= 0:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        _text(result.get("batch_delivery_stable_action_id"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        _text(result.get("delivery_stable_action_id"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        _text(result.get("target_branch"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        if result.get("merge_method") != "merge" or type(result.get("target_contains_batch_sha")) is not bool:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        evidence = tuple(
+            _digest(value, "LOCAL_RESULT_CROSSLINK_INVALID")
+            for value in _sequence(result.get("evidence_digests"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        )
+        if not evidence or evidence != tuple(sorted(evidence)):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
         accepted_digest = _digest(
             result.get("accepted_candidate_receipt_digest"),
             "LOCAL_RESULT_CROSSLINK_INVALID",
@@ -2908,6 +3510,105 @@ def _local_result_crosslinks(
         batch = batch_by_id.get(batch_id)
         if batch is None or result.get("batch_sha") != batch.batch_sha:
             _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        accepted_receipt = accepted[key]
+        if (
+            result.get("candidate_commit_oid") != accepted_receipt.get("candidate_sha")
+            or result.get("candidate_tree_oid")
+            != accepted_receipt.get("candidate_tree_oid")
+            or result.get("candidate_diff_record_digest")
+            != accepted_receipt.get("diff_record_digest")
+            or result.get("batch_delivery_batch_id") != batch_id
+            or result.get("batch_delivery_batch_sha") != batch.batch_sha
+            or result.get("batch_id") != batch_id
+            or result.get("target_branch") != "main"
+            or tuple(evidence) != tuple(sorted(accepted_receipt.get("evidence_digests", ())))
+            or result.get("batch_delivery_request_digest")
+            != result.get("delivery_request_digest")
+            or result.get("batch_delivery_stable_action_id")
+            != result.get("delivery_stable_action_id")
+            or result.get("accepted_candidate_receipt_digest")
+            != accepted_receipt.get("receipt_digest")
+        ):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        delivery_proof = delivery_proofs.get(result["batch_delivery_proof_digest"])
+        if delivery_proof is None:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        expected_delivery_fields = {
+            "batch_delivery_stable_action_id": "delivery_stable_action_id",
+            "batch_delivery_request_digest": "delivery_request_digest",
+            "batch_delivery_batch_id": "batch_id",
+            "batch_delivery_batch_sha": "batch_sha",
+            "delivery_stable_action_id": "delivery_stable_action_id",
+            "delivery_request_digest": "delivery_request_digest",
+            "batch_id": "batch_id",
+            "batch_sha": "batch_sha",
+            "delivery_member_ticket_keys": "member_ticket_keys",
+            "local_check_receipt_digest": "local_check_receipt_digest",
+            "publication_receipt_digest": "publication_receipt_digest",
+            "pull_request_number": "pull_request_number",
+            "pull_request_head_sha": "pull_request_head_sha",
+            "hosted_result_receipt_digest": "hosted_result_receipt_digest",
+            "integration_lease_digest": "integration_lease_digest",
+            "target_branch": "target_branch",
+            "target_head_sha": "target_head_sha",
+            "target_readback_digest": "target_readback_digest",
+            "target_contains_batch_sha": "target_contains_batch_sha",
+            "pull_request_merge_target_sha": "pull_request_merge_target_sha",
+            "merge_method": "merge_method",
+        }
+        for result_field, proof_field in expected_delivery_fields.items():
+            result_value = result[result_field]
+            proof_value = delivery_proof[proof_field]
+            if result_field == "delivery_member_ticket_keys":
+                if tuple(result_value) != tuple(proof_value):
+                    _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            elif result_value != proof_value:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if result["batch_delivery_proof_digest"] != delivery_proof["proof_digest"]:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if result["batch_delivery_receipt_digest"] != _canonical_digest(
+            {
+                "kind": "root-batch-observation.v1",
+                "action": result["batch_delivery_stable_action_id"],
+                "proof": delivery_proof["proof_digest"],
+            }
+        ):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        delivery_body = {
+            key: result[key]
+            for key in (
+                "delivery_stable_action_id",
+                "delivery_request_digest",
+                "batch_id",
+                "batch_sha",
+                "local_check_receipt_digest",
+                "publication_receipt_digest",
+                "pull_request_number",
+                "pull_request_head_sha",
+                "hosted_result_receipt_digest",
+                "integration_lease_digest",
+                "target_branch",
+                "target_head_sha",
+                "target_readback_digest",
+                "target_contains_batch_sha",
+                "pull_request_merge_target_sha",
+                "merge_method",
+            )
+        }
+        delivery_body["member_ticket_keys"] = result["delivery_member_ticket_keys"]
+        if result.get("batch_delivery_proof_digest") != _canonical_digest(
+            {"kind": "batch-delivery-proof.v1", **delivery_body}
+        ):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        expected_result = {
+            key: result[key]
+            for key in result
+            if key != "result_digest"
+        }
+        if result.get("result_digest") != _canonical_digest(
+            {"kind": "gwo.result.v1", **expected_result}
+        ):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
         members = tuple(
             _text(value, "LOCAL_RESULT_CROSSLINK_INVALID")
             for value in _sequence(
@@ -2926,6 +3627,8 @@ def _local_result_crosslinks(
         proof_members = tuple(proof["member_ticket_keys"])
         if members != proof_members:
             _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        delivery_receipts_by_ticket[key] = result["batch_delivery_receipt_digest"]
+        evidence_by_ticket[key] = evidence
         projected.append(
             {
                 "ticket_key": key,
@@ -2934,34 +3637,46 @@ def _local_result_crosslinks(
                 "batch_sha": batch.batch_sha,
                 "delivery_member_ticket_keys": list(members),
                 "target_contains_batch_sha": True,
-                "result_digest": result.get("result_digest"),
+                "result_digest": result["result_digest"],
             }
         )
     if seen != {value["receipt_digest"] for value in accepted.values()}:
         _reject("LOCAL_RESULT_CROSSLINK_INVALID")
 
-    raw_work_runs = facts.get("work_runs", bundle.get("work_runs"))
-    if raw_work_runs is not None:
-        work_runs = _sequence(raw_work_runs, "LOCAL_RESULT_CROSSLINK_INVALID")
-        if len(work_runs) != 4:
+    raw_work_runs = facts.get("work_runs")
+    work_runs = _sequence(raw_work_runs, "LOCAL_RESULT_CROSSLINK_INVALID")
+    if len(work_runs) != 4:
+        _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+    work_by_key: dict[str, Mapping[str, object]] = {}
+    for raw in work_runs:
+        run = _mapping(raw, "LOCAL_RESULT_CROSSLINK_INVALID")
+        key = _text(run.get("ticket_key"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        if key not in accepted or key in work_by_key:
             _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-        work_by_key: dict[str, Mapping[str, object]] = {}
-        for raw in work_runs:
-            run = _mapping(raw, "LOCAL_RESULT_CROSSLINK_INVALID")
-            key = _text(run.get("ticket_key"), "LOCAL_RESULT_CROSSLINK_INVALID")
-            if key not in accepted or key in work_by_key:
-                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-            if run.get("phase") != "completed" or run.get("claim_state") != "released" or run.get("slot_held") is not False:
-                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-            if run.get("candidate_receipt_digest") != candidates[key]["candidate_receipt_digest"]:
-                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-            if run.get("accepted_candidate_receipt_digest") != accepted[key]["receipt_digest"]:
-                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-            if run.get("batch_id") not in batch_by_id or run.get("batch_sha") != batch_by_id[run["batch_id"]].batch_sha:
-                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
-            work_by_key[key] = run
-        if set(work_by_key) != set(_LOCAL_TICKET_REFS):
+        if run.get("phase") != "completed" or run.get("claim_state") != "released" or run.get("slot_held") is not False:
             _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if run.get("candidate_receipt_digest") != candidates[key]["candidate_receipt_digest"]:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if run.get("accepted_candidate_receipt_digest") != accepted[key]["receipt_digest"]:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if run.get("candidate_diff_record_digest") != candidates[key]["candidate_receipt"][
+            "diff_record_digest"
+        ]:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if run.get("batch_id") not in batch_by_id or run.get("batch_sha") != batch_by_id[run["batch_id"]].batch_sha:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if run.get("result_digest") not in {
+            item["result_digest"] for item in projected if item["ticket_key"] == key
+        }:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        if (
+            run.get("delivery_receipt_digest") != delivery_receipts_by_ticket[key]
+            or tuple(run.get("evidence_digests", ())) != evidence_by_ticket[key]
+        ):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        work_by_key[key] = run
+    if set(work_by_key) != set(_LOCAL_TICKET_REFS):
+        _reject("LOCAL_RESULT_CROSSLINK_INVALID")
     return sorted(projected, key=lambda item: _LOCAL_TICKET_REFS.index(item["ticket_key"]))
 
 
@@ -3029,6 +3744,122 @@ def _local_authoritative_evidence(
     }
 
 
+def _validate_local_transcript(
+    bundle: Mapping[str, object],
+) -> None:
+    if "transcript" not in bundle:
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    raw_values = _sequence(bundle.get("transcript"), "LOCAL_TRANSCRIPT_INVALID")
+    if tuple(
+        _text(
+            _mapping(value, "LOCAL_TRANSCRIPT_INVALID").get("operation"),
+            "LOCAL_TRANSCRIPT_INVALID",
+        )
+        for value in raw_values
+    ) != _LOCAL_TRANSCRIPT_SEQUENCE:
+        _reject("LOCAL_TRANSCRIPT_INVALID")
+
+    campaign = _mapping(bundle.get("campaign"), "LOCAL_TRANSCRIPT_INVALID")
+    campaign_key = _text(campaign.get("campaign_key"), "LOCAL_TRANSCRIPT_INVALID")
+    inspect_statuses: list[str] = []
+    advance_wakes: list[str] = []
+    advance_statuses: list[str] = []
+    for raw in raw_values:
+        entry = _mapping(raw, "LOCAL_TRANSCRIPT_INVALID")
+        operation = entry["operation"]
+        if operation == "start":
+            if set(entry) != {"operation", "campaign_key"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            if entry.get("campaign_key") != campaign_key:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+        elif operation == "inspect":
+            if set(entry) != {"operation", "readback"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            readback = _mapping(entry.get("readback"), "LOCAL_TRANSCRIPT_INVALID")
+            if set(readback) != {
+                "status",
+                "reason",
+                "plan_revision_digest",
+                "worker_slots",
+                "work_runs",
+                "outstanding_effect_ids",
+            }:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            status = _text(readback.get("status"), "LOCAL_TRANSCRIPT_INVALID")
+            if status not in {"Blocked", "Running", "Complete"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            inspect_statuses.append(status)
+            _digest(readback.get("plan_revision_digest"), "LOCAL_TRANSCRIPT_INVALID")
+            worker_slots = _mapping(
+                readback.get("worker_slots"), "LOCAL_TRANSCRIPT_INVALID"
+            )
+            if set(worker_slots) != {"available", "held", "limit"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            if any(
+                type(worker_slots.get(field)) is not int
+                for field in ("available", "held", "limit")
+            ):
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            work_runs = _sequence(
+                readback.get("work_runs"), "LOCAL_TRANSCRIPT_INVALID"
+            )
+            for raw_run in work_runs:
+                run = _mapping(raw_run, "LOCAL_TRANSCRIPT_INVALID")
+                if set(run) != {
+                    "ticket_key",
+                    "work_run_key",
+                    "phase",
+                    "claim_state",
+                    "slot_held",
+                    "candidate_identity",
+                    "accepted_candidate_receipt_digest",
+                    "candidate_diff_record_digest",
+                    "delivery_receipt_digest",
+                    "result_digest",
+                    "evidence_digests",
+                    "reason",
+                    "next_check_at",
+                    "exclusive_resources",
+                }:
+                    _reject("LOCAL_TRANSCRIPT_INVALID")
+        elif operation == "advance":
+            if set(entry) != {"operation", "wake_ref", "outcome"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            wake_ref = _text(entry.get("wake_ref"), "LOCAL_TRANSCRIPT_INVALID")
+            outcome = _mapping(entry.get("outcome"), "LOCAL_TRANSCRIPT_INVALID")
+            if set(outcome) != {"status", "reason"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            status = _text(outcome.get("status"), "LOCAL_TRANSCRIPT_INVALID")
+            if status not in {"Running", "Complete"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            advance_wakes.append(wake_ref)
+            advance_statuses.append(status)
+        elif operation == "watchdog":
+            if set(entry) != {"kind", "operation", "outcomes"}:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            if entry.get("kind") != "lost_wake":
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            outcomes = _sequence(entry.get("outcomes"), "LOCAL_TRANSCRIPT_INVALID")
+            if len(outcomes) != 1:
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+            outcome = _mapping(outcomes[0], "LOCAL_TRANSCRIPT_INVALID")
+            if set(outcome) != {"status", "reason"} or outcome.get("status") != "Complete":
+                _reject("LOCAL_TRANSCRIPT_INVALID")
+        else:  # pragma: no cover - operation sequence rejects unknown values.
+            _reject("LOCAL_TRANSCRIPT_INVALID")
+
+    if inspect_statuses != ["Blocked", "Running", "Complete", "Complete", "Complete", "Complete", "Complete"]:
+        _reject("LOCAL_TRANSCRIPT_INVALID")
+    if advance_statuses != ["Running", "Complete", "Complete", "Complete"]:
+        _reject("LOCAL_TRANSCRIPT_INVALID")
+    if (
+        advance_wakes[0] != "root:initial"
+        or not advance_wakes[1].startswith("watchdog:runtime:")
+        or advance_wakes[2:] != ["root:restart", "root:restart"]
+    ):
+        _reject("LOCAL_TRANSCRIPT_INVALID")
+
+
 def _verify_local_root_canary(
     bundle: Mapping[str, object],
     *,
@@ -3041,8 +3872,27 @@ def _verify_local_root_canary(
     if bundle.get("schema_version") != _LOCAL_ROOT_SCHEMA:
         _reject("ROOT_ACCEPTANCE_SCHEMA_INVALID")
     _validate_status(bundle)
+    if "record_digest" not in bundle:
+        _reject("LOCAL_RECORD_DIGEST_INVALID")
     manifest = _local_manifest_entries(bundle)
     facts, readback = _local_facts_and_readback(bundle)
+    required_fact_fields = {
+        "tickets",
+        "work_runs",
+        "concurrency",
+        "candidate_gate",
+        "readback",
+        "replay",
+    }
+    if not required_fact_fields.issubset(facts):
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    if "transcript" not in bundle:
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    replay = _mapping(bundle.get("replay"), "LOCAL_EVIDENCE_INCOMPLETE")
+    facts_replay = _mapping(facts.get("replay"), "LOCAL_EVIDENCE_INCOMPLETE")
+    if facts_replay != replay:
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    _validate_local_transcript(bundle)
     local_evidence = _mapping(
         bundle.get("local_evidence"), "LOCAL_EVIDENCE_INCOMPLETE"
     )
@@ -3069,7 +3919,8 @@ def _verify_local_root_canary(
         bundle, readback, repository, campaign_key, plan_revision_digest
     )
     del candidates_tuple
-    reviews = _local_review_links(bundle, facts, accepted, manifest)
+    _local_candidate_diffs(readback, candidates)
+    reviews = _local_review_links(bundle, facts, candidates, accepted, manifest)
     expected_target = expected_target_sha
     batches, proofs_by_id = _local_batch_proofs(
         local_evidence,
@@ -3081,6 +3932,11 @@ def _verify_local_root_canary(
         reviews=reviews,
         expected_target_sha=expected_target,
     )
+    delivery_proofs = _local_delivery_proofs(
+        readback,
+        batches=batches,
+        proofs_by_id=proofs_by_id,
+    )
     results = _local_result_crosslinks(
         bundle,
         facts,
@@ -3089,27 +3945,30 @@ def _verify_local_root_canary(
         accepted,
         batches,
         proofs_by_id,
+        delivery_proofs,
     )
 
     facts_tickets = facts.get("tickets")
-    if facts_tickets is not None:
-        fact_values = _sequence(facts_tickets, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-        if tuple(
-            _text(_mapping(value, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID").get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-            for value in fact_values
-        ) != _LOCAL_TICKET_REFS:
-            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
-    concurrency = facts.get("concurrency")
-    if concurrency is not None:
-        concurrency_mapping = _mapping(concurrency, "LOCAL_EVIDENCE_INCOMPLETE")
-        if (
-            concurrency_mapping.get("worker_slot_limit") != 4
-            or concurrency_mapping.get("max_held") != 4
-            or concurrency_mapping.get("final_held") != 0
-            or concurrency_mapping.get("final_available") != 4
-            or concurrency_mapping.get("work_run_count") != 4
-        ):
-            _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    fact_values = _sequence(facts_tickets, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    if tuple(
+        _text(
+            _mapping(value, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID").get("ticket_key"),
+            "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
+        )
+        for value in fact_values
+    ) != _LOCAL_TICKET_REFS:
+        _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    concurrency = _mapping(facts.get("concurrency"), "LOCAL_EVIDENCE_INCOMPLETE")
+    if (
+        concurrency.get("worker_slot_limit") != 4
+        or concurrency.get("max_held") != 4
+        or concurrency.get("final_held") != 0
+        or concurrency.get("final_available") != 4
+        or concurrency.get("work_run_count") != 4
+    ):
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    if any(replay.get(field) is not True for field in ("readback_unchanged", "idempotent_delivery", "idempotent_effects")):
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
 
     accepted_values = [accepted[key] for key in _LOCAL_TICKET_REFS]
     policy_digests = {_digest(value["policy_witness_digest"], "POLICY_EVIDENCE_INCOMPLETE") for value in accepted_values}
@@ -3154,6 +4013,10 @@ def _verify_local_root_canary(
         manifest,
         facts,
     )
+    record_digest = _digest(bundle.get("record_digest"), "LOCAL_RECORD_DIGEST_INVALID")
+    record_body = {key: value for key, value in bundle.items() if key != "record_digest"}
+    if record_digest != _canonical_digest(record_body):
+        _reject("LOCAL_RECORD_DIGEST_INVALID")
     receipt = RootCanaryAcceptanceReceiptV1(
         repository=repository,
         campaign_key=campaign_key,
@@ -3488,6 +4351,24 @@ def _load_json(path: Path, code: str) -> dict[str, object]:
     return _mapping(value, code)
 
 
+def _load_ticket_manifest_for_bundle(
+    path: Path, bundle: Mapping[str, object]
+) -> dict[str, object]:
+    local_mode = (
+        bundle.get("acceptance_mode") == _LOCAL_ROOT_MODE
+        or bundle.get("schema_version") == _LOCAL_ROOT_SCHEMA
+        or "local_evidence" in bundle
+    )
+    if not local_mode:
+        return _load_json(path, "ROOT_TICKET_MANIFEST_INVALID")
+    try:
+        return load_ticket_manifest(path, require_real_root_numbers=True)
+    except RootCanaryProvisionError as error:
+        raise RootCanaryVerificationError(error.code) from error
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        raise RootCanaryVerificationError("ROOT_TICKET_MANIFEST_INVALID") from error
+
+
 def _assert_live_repository(repository: str) -> None:
     try:
         raw = json.loads(
@@ -3523,9 +4404,9 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
     if args.github_live:
         _assert_live_repository(args.repository)
 
-    manifest = _load_json(args.tickets, "ROOT_TICKET_MANIFEST_INVALID")
     diagnostics = _load_json(args.diagnostics, "DIAGNOSTICS_JSON_INVALID")
     bundle = _bundle_from_diagnostics(diagnostics)
+    manifest = _load_ticket_manifest_for_bundle(args.tickets, bundle)
     bundle = _merge_ticket_manifest(bundle, manifest, args.repository)
 
     if args.batch_receipt is not None:

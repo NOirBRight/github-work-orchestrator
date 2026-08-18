@@ -856,6 +856,105 @@ def test_local_only_root_uses_real_manifest_and_projects_local_batch_proofs(
     _assert_local_evidence_has_no_hosted_or_remote_keys(record["local_evidence"])
 
 
+def test_local_only_root_emits_exact_suite_receipt_and_lease_release_readbacks(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+
+    record = _run_root(runner, tmp_path, "task5-local-batch-readbacks")
+
+    for batch in record["local_evidence"]["batches"]:
+        suite = batch["local_suite"]
+        assert set(suite) == {
+            "suite_id",
+            "batch_sha",
+            "status",
+            "receipt_digest",
+            "definition",
+            "receipt",
+        }
+        assert set(suite["definition"]) == {
+            "suite_id",
+            "definition_digest",
+            "command",
+        }
+        assert suite["definition"]["suite_id"] == suite["suite_id"]
+        assert suite["definition"]["command"]
+        assert set(suite["receipt"]) == {
+            "batch_sha",
+            "suite_id",
+            "definition_digest",
+            "outcome",
+            "observation_digest",
+            "source_ref",
+            "receipt_digest",
+        }
+        assert suite["receipt"]["batch_sha"] == batch["batch_sha"]
+        assert suite["receipt"]["suite_id"] == suite["suite_id"]
+        assert suite["receipt"]["definition_digest"] == suite["definition"][
+            "definition_digest"
+        ]
+        assert suite["receipt"]["receipt_digest"] == suite["receipt_digest"]
+
+        lease = batch["integration_lease"]
+        assert set(lease["acquisition"]) == {
+            "status",
+            "lease_digest",
+            "inactive_after_release",
+        }
+        assert set(lease["release"]) == {
+            "status",
+            "lease_digest",
+            "inactive_after_release",
+        }
+        assert lease["acquisition"]["status"] == "acquired"
+        assert lease["release"]["status"] == "released"
+        assert lease["acquisition"]["lease_digest"] == lease["digest"]
+        assert lease["release"]["lease_digest"] == lease["digest"]
+        assert lease["release"]["inactive_after_release"] is True
+
+
+def test_root_run_isolates_global_git_hooks_and_restores_git_config_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_runner()
+    for name in tuple(os.environ):
+        if name.startswith("GIT_CONFIG_"):
+            monkeypatch.delenv(name, raising=False)
+    hook_directory = tmp_path / "global-hooks"
+    hook_directory.mkdir()
+    sentinel = tmp_path / "hook-sentinel"
+    hook = hook_directory / "pre-commit"
+    hook.write_text(
+        '#!/bin/sh\nprintf hooked > "$GWO_HOOK_SENTINEL"\n',
+        encoding="utf-8",
+    )
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        "[core]\n"
+        f"\thooksPath = {hook_directory.as_posix()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GWO_HOOK_SENTINEL", str(sentinel))
+    before = {
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith("GIT_CONFIG_")
+    }
+
+    record = _run_root(runner, tmp_path, "task5-git-isolation")
+
+    assert record["status"] == "Complete"
+    assert not sentinel.exists()
+    after = {
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith("GIT_CONFIG_")
+    }
+    assert after == before
+
+
 def test_local_only_root_binds_candidate_parents_to_manifest_source_digests(
     tmp_path: Path,
 ):
@@ -889,6 +988,39 @@ def test_local_only_root_binds_candidate_parents_to_manifest_source_digests(
             transition["candidate_receipt"]["parent_digest"]
             == transition["review_subject"]["parent_digest"]
         )
+
+
+def test_root_acceptance_isolated_from_ambient_git_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_runner()
+    hook_dir = tmp_path / "ambient-hooks"
+    hook_dir.mkdir()
+    sentinel = tmp_path / "hook-ran.txt"
+    hook = hook_dir / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"echo ambient-hook-ran > '{sentinel.as_posix()}'\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        "[core]\n"
+        f"\thooksPath = {hook_dir.as_posix()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    record = runner.run_local_acceptance(
+        root=tmp_path / "isolated-root",
+        run_id="task5-git-hook-isolation",
+        scenario="root",
+        tickets=ROOT_TICKETS,
+    )
+
+    assert record["gate"] == "LOCAL_ROOT_CANARY_GO"
+    assert not sentinel.exists()
 
 
 def test_real_root_ticket_manifest_is_required_before_creating_an_isolated_root(

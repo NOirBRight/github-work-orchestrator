@@ -67,6 +67,75 @@ PASS
 - No root verifier/runner changes, production mutation, activation, tag,
   merge, push, or agent dispatch was performed.
 
+## Root producer/verifier fix-wave evidence
+
+The root-side fix wave closed the remaining local-only contract gaps in the
+producer and read-only verifier. The producer now emits the authoritative
+manifest fields in the record digest, isolates system/global Git configuration
+and hooks for the complete root run, binds the exact local suite definition and
+receipt, and records lease acquisition/release state. The verifier now checks
+the accepted-Candidate digest (not the nested Candidate digest), recomputes the
+canonical Batch delivery proof using its `member_ticket_keys` contract, and
+rejects incomplete or inconsistent recovery, result, suite, lease, and
+manifest-backed evidence.
+
+TDD RED was observed before these corrections:
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py tests/test_v8_local_acceptance.py -q
+7 failed, 90 passed in 400.13s
+```
+
+The intended failures were the result cross-link, producer record-digest,
+recovery/readback, and lease-readback regressions. After the minimum fixes:
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k "local_only_verifier_accepts_the_manifest_backed_local_projection or requires_and_recomputes_the_producer_record_digest or requires_complete_public_root_facts or receipt_digest_binds_mode_and_complete_local_evidence or cli_round_trip_uses_the_real_ticket_fixture or v2_receipt_has_no_hosted_or_pr_batch_placeholders" -q
+10 passed, 58 deselected
+
+py -3.13 -B -m pytest tests/test_v8_local_acceptance.py -k "exact_suite_receipt_and_lease_release_readbacks" -q
+1 passed, 96 deselected
+
+py -3.13 -B -m pytest tests/test_v8_root_canary_tickets.py tests/test_v8_local_acceptance.py tests/test_v8_root_canary_acceptance.py tests/test_v8_release_metadata.py -q
+311 passed in 429.30s
+```
+
+The changed-file checks are green:
+
+```text
+py -3.13 -m ruff check --isolated --no-cache <seven changed Python files>
+All checks passed
+py -3.13 -B -m compileall -q scripts skills tests
+PASS
+git diff --check
+PASS
+```
+
+Two independent root runs used the fixed run id
+`task5-root-fixed-20260818` and the real #195–#198 manifest. Both producer
+records were byte-identical (canonical SHA-256
+`ad8c480819e3e78ec8292f42d291eea2d4b1786343c3cccfc0b76ff8a4d8fac7`; producer
+`record_digest`
+`3857cb1f85fa2e341eb2894027f88e34cf29e8d1c2a6f82302cc1c9b0e0550d5`). Both
+read-only verifier outputs were byte-identical (canonical SHA-256
+`22f8b96fc6e89b7916e898e7e4b77e75d6831040c5f6fd30141d3ad2c9753337`; receipt
+digest `81ddafa50bacb6cdf9f42be9420d1142e1065afe14216ef9a09378035d3467df`).
+
+The full local suite was also executed with
+`GWO_CONVERGENCE_ARCHIVE_ROOT=D:\\gwo-convergence-archive\\20260804T185544Z`:
+
+```text
+py -3.13 -B -m pytest -q
+3144 passed, 52 skipped, 1 failed, 3 warnings in 1867.29s
+```
+
+The single failure is the pre-existing environment-bound
+`tests/test_beta3_live_guard_runner.py::test_reviewed_provenance_hashes_match_current_observer_bytes` check: the current isolated
+worktree is not the canonical production checkout path, so the unchanged
+Beta3 runner rejects its origin before comparing hashes. No file in that
+write set was changed by this fix wave. Pytest also emits the known Windows
+temporary-directory cleanup `PermissionError` after completion.
+
 ## Bounded GA parser conflict fix
 
 The reviewed release-parser P1 was that canonical local verification collected
@@ -108,3 +177,125 @@ PASS
 Only the release parser, release metadata test, and this report are in the
 bounded fix scope. No root verifier/runner files, production state, merge,
 push, or tag were changed.
+
+## Task 5 local-only contract classification fix
+
+- **Status:** GREEN.
+- **Root causes:** A missing top-level `transcript` was passed directly to the
+  transcript shape validator, so absence was classified as
+  `LOCAL_TRANSCRIPT_INVALID` instead of incomplete evidence. An accepted
+  Review Subject's valid-but-mismatched `parent_digest` was only detected by
+  the subject validator, whose broad caller mapping converted the link error
+  to `LOCAL_REVIEW_SUBJECT_INVALID`.
+- **Fix:** Missing `transcript` now fails as `LOCAL_EVIDENCE_INCOMPLETE` while
+  malformed present transcripts remain `LOCAL_TRANSCRIPT_INVALID`. The local
+  candidate/review linker now validates the subject parent digest and checks
+  its binding before subject-schema validation, returning
+  `LOCAL_CANDIDATE_REVIEW_LINK_INVALID` for a valid mismatched parent while
+  preserving subject-schema rejection and digest validation.
+
+### TDD evidence
+
+**RED**
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k "requires_complete_public_root_facts or binds_candidate_parent_and_review_subject_identity_to_manifest" -q
+2 failed, 3 passed, 77 deselected in 22.80s
+```
+
+**GREEN**
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k "requires_complete_public_root_facts or binds_candidate_parent_and_review_subject_identity_to_manifest" -q
+5 passed, 77 deselected in 21.92s
+
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -q
+82 passed in 22.16s
+
+py -3.13 -m ruff check --isolated --no-cache scripts/verify_v8_root_canary.py
+All checks passed!
+
+git diff --check -- scripts/verify_v8_root_canary.py .superpowers/sdd/2026-08-18-gwo-v8-local-only-root-canary-contract/task-5-fix-report.md
+PASS
+```
+
+### Changed files
+
+- `scripts/verify_v8_root_canary.py`
+- `.superpowers/sdd/2026-08-18-gwo-v8-local-only-root-canary-contract/task-5-fix-report.md`
+
+### Concerns
+
+- Pytest still emits the known Windows `PermissionError` from its atexit
+  temporary-directory cleanup after successful runs; all listed pytest
+  commands returned exit 0.
+- No production mutation, activation, merge, push, or tag was performed.
+
+## Post-fix focused verification
+
+The scoped Luna Max implementer was unavailable after the initial dispatch and
+was closed; the already-observed RED results were then completed with the
+minimum inline changes. The verifier's candidate-diff validation call was
+also made explicitly side-effect-only so the changed-file lint gate is clean.
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k "requires_complete_public_root_facts or binds_candidate_parent_and_review_subject_identity_to_manifest" -q
+5 passed, 77 deselected in 21.71s
+
+py -3.13 -m ruff check --isolated --no-cache scripts/run_v8_local_acceptance.py scripts/verify_v8_root_canary.py tests/test_v8_local_acceptance.py tests/test_v8_root_canary_acceptance.py scripts/verify_v8_ga_release.py scripts/render_v8_ga_metadata.py tests/test_v8_release_metadata.py
+All checks passed!
+
+py -3.13 -B -m compileall -q scripts skills tests
+PASS
+
+py -3.13 -B -m pytest tests/test_v8_root_canary_tickets.py tests/test_v8_local_acceptance.py tests/test_v8_root_canary_acceptance.py tests/test_v8_release_metadata.py -q
+326 passed in 402.27s (0:06:42)
+
+git diff --check
+PASS
+```
+
+The known Windows pytest temporary-directory cleanup `PermissionError` was
+emitted after successful runs; pytest returned exit 0. No production mutation,
+activation, merge, push, or tag was performed.
+
+## Authoritative readback fallback closure
+
+An additional TDD regression checked that an explicit local root cannot replace
+`facts.readback.candidate_receipts` or
+`facts.readback.accepted_candidate_receipts` with `null` and recover through a
+top-level compatibility field. The result-integrity reader was also made
+readback-only for the same boundary.
+
+**RED**
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k does_not_fallback_from_null_authoritative_candidate_readback -q
+2 failed, 82 deselected in 21.60s
+```
+
+**GREEN**
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_acceptance.py -k does_not_fallback_from_null_authoritative_candidate_readback -q
+2 passed, 82 deselected in 22.44s
+```
+
+The focused regression and the existing verifier suite continue to emit only
+the known Windows temporary-directory cleanup warning after successful exit.
+
+Final post-fallback focused gate:
+
+```text
+py -3.13 -B -m pytest tests/test_v8_root_canary_tickets.py tests/test_v8_local_acceptance.py tests/test_v8_root_canary_acceptance.py tests/test_v8_release_metadata.py -q
+328 passed in 398.08s (0:06:38)
+
+py -3.13 -m ruff check --isolated --no-cache scripts/run_v8_local_acceptance.py scripts/verify_v8_root_canary.py tests/test_v8_local_acceptance.py tests/test_v8_root_canary_acceptance.py scripts/verify_v8_ga_release.py scripts/render_v8_ga_metadata.py tests/test_v8_release_metadata.py
+All checks passed!
+
+py -3.13 -B -m compileall -q scripts skills tests
+PASS
+
+git diff --check
+PASS
+```

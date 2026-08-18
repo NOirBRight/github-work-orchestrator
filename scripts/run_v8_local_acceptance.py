@@ -11,7 +11,8 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import copy
 from dataclasses import dataclass, replace
 import gc
 import os
@@ -572,6 +573,36 @@ def _git(repository: Path, *arguments: str, env: dict[str, str] | None = None) -
     return completed.stdout.strip()
 
 
+@contextmanager
+def _isolated_git_configuration(root: Path):
+    """Fence the temporary acceptance repository from ambient Git behavior."""
+
+    config_root = Path(root) / "git-config"
+    hooks_root = Path(root) / "git-hooks-disabled"
+    config_root.mkdir(parents=True, exist_ok=True)
+    hooks_root.mkdir(parents=True, exist_ok=True)
+    empty_config = config_root / "empty"
+    empty_config.write_text("", encoding="utf-8")
+    updates = {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": str(empty_config),
+        "GIT_CONFIG_GLOBAL": str(empty_config),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": str(hooks_root),
+    }
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _git_is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
     completed = subprocess.run(
         ("git", "merge-base", "--is-ancestor", ancestor, descendant),
@@ -1025,15 +1056,29 @@ class _RootCandidateGateRunner:
             receipt_digest=None,
         )
         accepted = result.accepted_candidate_receipt
+        review_subject = result.review_subject
+        if review_subject is not None:
+            review_subject = replace(
+                review_subject,
+                candidate_receipt_digest=candidate.digest,
+                runtime_subject_digest=candidate.runtime_subject_digest,
+                subject_digest=None,
+            )
         if accepted is not None:
             accepted = replace(
                 accepted,
                 candidate_receipt_digest=candidate.digest,
+                review_subject_digest=(
+                    review_subject.digest
+                    if review_subject is not None
+                    else accepted.review_subject_digest
+                ),
             )
         return replace(
             result,
             candidate_receipt=candidate,
             accepted_candidate_receipt=accepted,
+            review_subject=review_subject,
         )
 
     def run(self, action: WorkRunAction) -> object:
@@ -2896,7 +2941,13 @@ def _local_batch_evidence(
             "batch_sha": local_receipt["batch_sha"],
             "status": local_receipt["outcome"],
             "receipt_digest": local_receipt["receipt_digest"],
+            "definition": dict(request["local_suite"]),
+            "receipt": dict(local_receipt),
         }
+        lease_active_after_release = (
+            harness.delivery.journal.read_integration_lease(layout.repository)
+            is not None
+        )
         proof_body = {
             "schema_version": "local_batch_proof.v1",
             "repository": layout.repository,
@@ -2923,7 +2974,19 @@ def _local_batch_evidence(
                 item["review_finding_ledger_digest"] for item in member_accepted
             ],
             "local_suite": local_suite,
-            "integration_lease": lease_body,
+            "integration_lease": {
+                **lease_body,
+                "acquisition": {
+                    "status": "acquired",
+                    "lease_digest": lease["lease_digest"],
+                    "inactive_after_release": False,
+                },
+                "release": {
+                    "status": "released",
+                    "lease_digest": lease["lease_digest"],
+                    "inactive_after_release": not lease_active_after_release,
+                },
+            },
             "target_readback": target_readback,
         }
         proofs.append(
@@ -3159,10 +3222,11 @@ def _run_root_acceptance_in_root(
             "transitions": candidate_transitions,
             "formal_reviewer_calls": formal_reviewer_calls,
         },
-        "batches": _root_batch_facts(readback, work_runs, layout),
-        "git_readback": readback["git_readback"],
-        "readback": readback,
-    }
+            "batches": _root_batch_facts(readback, work_runs, layout),
+            "git_readback": readback["git_readback"],
+            "readback": readback,
+            "replay": copy.deepcopy(replay),
+        }
     local_evidence = _local_batch_evidence(
         readback=readback,
         work_runs=work_runs,
@@ -3181,6 +3245,7 @@ def _run_root_acceptance_in_root(
         "public_status": final.status.value,
         "reason": final.reason,
         "public_reason": final.reason,
+        "repository": handle.repository,
         "campaign": {
             "repository": handle.repository,
             "campaign_key": handle.campaign_key,
@@ -3190,6 +3255,8 @@ def _run_root_acceptance_in_root(
         "transcript": transcript,
         "replay": replay,
         "failure": None,
+        "tickets": copy.deepcopy(layout.manifest["tickets"]),
+        "ready_refs": list(layout.manifest["ready_refs"]),
     }
     return _record_digest(record)
 
@@ -3389,12 +3456,18 @@ def run_local_acceptance(
         dir=str(caller_root),
     ) as isolated_root:
         try:
-            return _run_local_acceptance_in_root(
-                root=Path(isolated_root),
-                run_id=run_id,
-                scenario=scenario,
-                root_layout=root_layout,
+            git_context = (
+                _isolated_git_configuration(Path(isolated_root))
+                if scenario == "root"
+                else nullcontext()
             )
+            with git_context:
+                return _run_local_acceptance_in_root(
+                    root=Path(isolated_root),
+                    run_id=run_id,
+                    scenario=scenario,
+                    root_layout=root_layout,
+                )
         finally:
             gc.collect()
 
