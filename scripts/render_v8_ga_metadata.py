@@ -12,9 +12,15 @@ from pathlib import Path
 import re
 import shutil
 import stat
-from types import SimpleNamespace
+import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Sequence
+
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 from scripts.verify_v8_ga_release import (
     DYNAMIC_METADATA_FIELDS,
@@ -368,6 +374,13 @@ def _source_sha256(payload: Mapping[str, object], field: str) -> str:
     return value
 
 
+def _source_list(payload: Mapping[str, object], field: str) -> list[object]:
+    value = payload.get(field)
+    if type(value) is not list:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    return value
+
+
 def _source_control_ref(payload: Mapping[str, object]) -> dict[str, object]:
     control_ref = _source_mapping(payload, "control_ref")
     if set(control_ref) != {"branch", "commit_sha", "tree_sha"}:
@@ -647,6 +660,19 @@ def _renderer_evidence_bridge_context(
     source_activation_release_subject = _source_mapping(
         activation_payload, "release_subject"
     )
+    transition_canary_repository = _source_text(
+        transition_record, "canary_repository"
+    )
+    transition_canary_digest = _source_sha256(
+        transition_record, "canary_evidence_digest"
+    )
+    transition_canary_manifest_ref = _source_text(
+        transition_record, "canary_manifest_ref"
+    )
+    transition_canary_refs = _source_list(
+        transition_record, "canary_evidence_refs"
+    )
+    package_evidence_refs = _source_list(canary_payload, "evidence_refs")
     _assert_source_equal(
         _source_text(activation_payload, "schema")
         == "gwo-v8-production-activation-readback.v1"
@@ -692,6 +718,10 @@ def _renderer_evidence_bridge_context(
         == _V6_1_WRITER_GENERATION
         and _source_text(guard_receipt, "target_writer_generation")
         == production_writer_generation
+        and transition_canary_repository == package_repository
+        and transition_canary_digest == package_digest
+        and transition_canary_manifest_ref == production_canary["manifest_ref"]
+        and transition_canary_refs == package_evidence_refs
         and legacy_writer_fence.get("stopped") is True
         and authorization_release_subject
         == {
@@ -735,6 +765,22 @@ def _renderer_evidence_bridge_context(
         and default_payload.get("legacy_writer_fence_stopped") is True
         and default_control_ref == activation_control_ref,
     )
+    default_canary_fields = (
+        "canary_repository",
+        "canary_evidence_digest",
+        "canary_manifest_ref",
+    )
+    if any(field in default_payload for field in default_canary_fields):
+        if not all(field in default_payload for field in default_canary_fields):
+            raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+        _assert_source_equal(
+            _source_text(default_payload, "canary_repository")
+            == package_repository
+            and _source_sha256(default_payload, "canary_evidence_digest")
+            == package_digest
+            and _source_text(default_payload, "canary_manifest_ref")
+            == production_canary["manifest_ref"]
+        )
 
     links = {
         "activation_id": production_activation_id,
@@ -997,42 +1043,76 @@ def _read_publication_journal(path: Path) -> dict[str, object]:
 
 def _journal_entries(
     journal: Mapping[str, object], output_root: Path
-) -> tuple[tuple[Path, Path | None], ...]:
+) -> tuple[tuple[Path, Path | None, Path], ...]:
     if journal.get("schema") != "gwo-v8-ga-publication.v1":
         raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
     entries = journal.get("entries")
     if not isinstance(entries, list):
         raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
     root = _absolute_without_resolving(output_root)
-    result: list[tuple[Path, Path | None]] = []
+    result: list[tuple[Path, Path | None, Path]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
         target_value = entry.get("target")
         backup_value = entry.get("backup")
-        if not isinstance(target_value, str) or (
-            backup_value is not None and not isinstance(backup_value, str)
+        staged_value = entry.get("staged")
+        if (
+            not isinstance(target_value, str)
+            or not isinstance(staged_value, str)
+            or (
+                backup_value is not None and not isinstance(backup_value, str)
+            )
         ):
             raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
         target = _absolute_without_resolving(Path(target_value))
+        staged = _absolute_without_resolving(Path(staged_value))
         backup = (
             _absolute_without_resolving(Path(backup_value))
             if backup_value is not None
             else None
         )
         _reject_reparse_path(target)
+        _reject_reparse_path(staged)
         if backup is not None:
             _reject_reparse_path(backup)
         if not target.is_relative_to(root) or (
             backup is not None and not backup.is_relative_to(root)
-        ):
+        ) or not staged.is_relative_to(root):
             raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
-        result.append((target, backup))
-    if tuple(target for target, _backup in result) != tuple(
-        sorted((target for target, _backup in result), key=str)
+        result.append((target, backup, staged))
+    if tuple(target for target, _backup, _staged in result) != tuple(
+        sorted((target for target, _backup, _staged in result), key=str)
     ):
         raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
     return tuple(result)
+
+
+def _journal_staging_root(
+    entries: tuple[tuple[Path, Path | None, Path], ...], output_root: Path
+) -> Path:
+    root = _absolute_without_resolving(output_root)
+    staged_paths = tuple(staged for _target, _backup, staged in entries)
+    if not staged_paths:
+        raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
+    try:
+        staging_root = _absolute_without_resolving(
+            Path(os.path.commonpath(tuple(str(path.parent) for path in staged_paths)))
+        )
+    except (OSError, ValueError) as error:
+        raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED") from error
+    if (
+        staging_root == root
+        or staging_root.parent != root
+        or not staging_root.name.startswith(".ga-metadata-")
+        or len(staging_root.name) <= len(".ga-metadata-")
+    ):
+        raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
+    _reject_reparse_path(staging_root)
+    for staged in staged_paths:
+        if staged == staging_root or not staged.is_relative_to(staging_root):
+            raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
+    return staging_root
 
 
 def _remove_publication_journal(output_root: Path) -> None:
@@ -1042,7 +1122,8 @@ def _remove_publication_journal(output_root: Path) -> None:
 
 def _rollback_publication(output_root: Path, journal: Mapping[str, object]) -> None:
     entries = _journal_entries(journal, output_root)
-    for target, backup in reversed(entries):
+    staging_root = _journal_staging_root(entries, output_root)
+    for target, backup, _staged in reversed(entries):
         if backup is None:
             target.unlink(missing_ok=True)
         else:
@@ -1051,15 +1132,9 @@ def _rollback_publication(output_root: Path, journal: Mapping[str, object]) -> N
             os.replace(backup, target)
         _fsync_directory(target.parent)
     _remove_publication_journal(output_root)
-    staged_paths = [
-        _absolute_without_resolving(Path(entry["staged"]))
-        for entry in journal.get("entries", [])
-        if isinstance(entry, Mapping) and isinstance(entry.get("staged"), str)
-    ]
-    if staged_paths:
-        staging_root = Path(os.path.commonpath(tuple(map(str, staged_paths))))
-        if staging_root.is_relative_to(_absolute_without_resolving(output_root)):
-            shutil.rmtree(staging_root, ignore_errors=True)
+    if staging_root.exists():
+        _reject_reparse_path(staging_root)
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _recover_metadata_publication(output_root: Path) -> None:
