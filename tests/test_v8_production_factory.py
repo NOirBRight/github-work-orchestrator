@@ -294,15 +294,45 @@ def test_factory_rejects_a_guard_receipt_bound_to_another_subject_before_store_a
         ),
     )
     subject = _subject()
+    receipt = replace(_guard_receipt(subject=subject), subject_digest="f" * 64)
+    receipt = replace(
+        receipt,
+        receipt_digest=digest_value(receipt.canonical_without_digest()),
+    )
 
     with pytest.raises(ProductionCompositionError) as raised:
         _compose(
             ProductionActivationCompositionFactory(_config(tmp_path)),
             subject=subject,
-            receipt=replace(_guard_receipt(), subject_digest="f" * 64),
+            receipt=receipt,
         )
 
     assert raised.value.code == "FACTORY_GUARD_RECEIPT_INVALID"
+
+
+def test_factory_rejects_guard_subject_for_another_target_branch_before_store_access(
+    tmp_path,
+    monkeypatch,
+):
+    import gwo_v8_production_factory as module
+
+    monkeypatch.setattr(
+        module,
+        "_validate_store",
+        lambda *args, **kwargs: pytest.fail(
+            "store must not be opened for a subject on another target branch"
+        ),
+    )
+    subject = replace(_subject(), target_branch="release")
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(_config(tmp_path)),
+            subject=subject,
+            receipt=_guard_receipt(subject=subject),
+        )
+
+    assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
 
 
 @pytest.mark.parametrize("identity", ("plan", "canary"))
