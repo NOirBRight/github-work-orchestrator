@@ -501,3 +501,105 @@ def test_live_attestation_cycle_asserts_lease_stability_before_each_read():
 
     assert lease.assertions == 2
     assert lease.close_count == 1
+
+
+def test_live_attestation_cycle_closes_lease_rejected_for_missing_stability_contract():
+    import gwo_v8_live_guard_host as module
+
+    class Lease:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    lease = Lease()
+    cycle = module._LiveAttestationCycle(
+        lambda: SimpleNamespace(lease=lease),
+    )
+
+    with pytest.raises(LiveGuardHostError, match="lease contract is unavailable"):
+        cycle.read("legacy", "owner/repo")
+
+    assert lease.close_count == 1
+
+
+def test_live_attestation_cycle_fails_closed_after_timer_close_failure(monkeypatch):
+    import gwo_v8_live_guard_host as module
+
+    monkeypatch.setattr(module._LiveAttestationCycle, "_MAX_HOLD_SECONDS", 0.05, raising=False)
+
+    class Lease:
+        def __init__(self):
+            self.close_count = 0
+            self.close_attempted = threading.Event()
+
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            self.close_count += 1
+            self.close_attempted.set()
+            raise RuntimeError("close failed")
+
+    lease = Lease()
+    snapshots: list[SimpleNamespace] = []
+
+    def capture():
+        snapshots.append(
+            SimpleNamespace(
+                subject=SimpleNamespace(repository="owner/repo"),
+                legacy="legacy",
+                durable_state="durable",
+                writer_fence="writer",
+                ownership="ownership",
+                lease=lease,
+            )
+        )
+        return snapshots[-1]
+
+    cycle = module._LiveAttestationCycle(capture)
+
+    assert cycle.read("legacy", "owner/repo") == "legacy"
+    assert lease.close_attempted.wait(1)
+
+    with pytest.raises(LiveGuardHostError, match="lease cleanup failed"):
+        cycle.read("legacy", "owner/repo")
+
+    assert len(snapshots) == 1
+    assert lease.close_count == 1
+
+
+def test_live_attestation_cycle_asserts_stability_after_a_successful_snapshot():
+    import gwo_v8_live_guard_host as module
+
+    class Lease:
+        def __init__(self):
+            self.assertions = 0
+            self.close_count = 0
+
+        def assert_stable(self):
+            self.assertions += 1
+
+        def close(self):
+            self.close_count += 1
+
+    lease = Lease()
+    snapshot = SimpleNamespace(
+        subject=SimpleNamespace(repository="owner/repo"),
+        legacy="legacy",
+        durable_state="durable",
+        writer_fence="writer",
+        ownership="ownership",
+        lease=lease,
+    )
+    cycle = module._LiveAttestationCycle(lambda: snapshot)
+
+    values = tuple(
+        cycle.read(field, "owner/repo")
+        for field in ("legacy", "durable_state", "writer_fence", "ownership")
+    )
+
+    assert values == ("legacy", "durable", "writer", "ownership")
+    assert lease.assertions == 5
+    assert lease.close_count == 1

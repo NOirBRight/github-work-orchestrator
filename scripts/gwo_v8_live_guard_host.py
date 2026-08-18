@@ -273,17 +273,26 @@ class _LiveAttestationCycle:
     _FIELDS = ("legacy", "durable_state", "writer_fence", "ownership")
     _MAX_HOLD_SECONDS = 30.0
 
-    __slots__ = ("_capture", "_lock", "_states")
+    __slots__ = ("_capture", "_lock", "_states", "_cleanup_error")
 
     def __init__(self, capture: Callable[[], object]) -> None:
         self._capture = capture
         self._lock = RLock()
         self._states: dict[object, _LiveAttestationState] = {}
+        self._cleanup_error: Exception | None = None
+
+    def _remember_cleanup_failure(self, error: Exception) -> None:
+        if self._cleanup_error is None:
+            self._cleanup_error = error
 
     def _close_state(self, owner: object, state: _LiveAttestationState) -> None:
         if self._states.get(owner) is state:
             self._states.pop(owner, None)
-        state.close()
+        try:
+            state.close()
+        except Exception as error:
+            self._remember_cleanup_failure(error)
+            raise
 
     def _expire(self, owner: object, state: _LiveAttestationState) -> None:
         with self._lock:
@@ -292,15 +301,24 @@ class _LiveAttestationCycle:
             self._states.pop(owner, None)
             try:
                 state.close()
-            except Exception:
-                pass
+            except Exception as error:
+                self._remember_cleanup_failure(error)
 
     def _start_state(self, owner: object) -> _LiveAttestationState:
         snapshot = self._capture()
         lease = getattr(snapshot, "lease", None)
-        if not callable(getattr(lease, "assert_stable", None)) or not callable(
-            getattr(lease, "close", None)
-        ):
+        assert_stable = getattr(lease, "assert_stable", None)
+        close = getattr(lease, "close", None)
+        if not callable(assert_stable) or not callable(close):
+            if callable(close):
+                try:
+                    close()
+                except Exception as error:
+                    self._remember_cleanup_failure(error)
+                    raise LiveGuardHostError(
+                        "LIVE_GUARD_READ_UNAVAILABLE",
+                        "live attestation lease contract is unavailable and cleanup failed",
+                    ) from error
             _fail(
                 "LIVE_GUARD_READ_UNAVAILABLE",
                 "live attestation lease contract is unavailable",
@@ -324,6 +342,11 @@ class _LiveAttestationCycle:
     def read(self, field: str, repository: str) -> object:
         owner = current_thread()
         with self._lock:
+            if self._cleanup_error is not None:
+                _fail(
+                    "LIVE_GUARD_READ_UNAVAILABLE",
+                    "previous live attestation lease cleanup failed",
+                )
             state = self._states.get(owner)
             if field == "legacy":
                 if state is not None:
