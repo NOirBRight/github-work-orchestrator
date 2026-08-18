@@ -26,6 +26,12 @@ _GITHUB_REF_PATTERN = re.compile(
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _TASK1_TICKET_SCHEMA = "gwo-v8-root-canary-tickets.v2"
+_LOCAL_ROOT_SCHEMA = "gwo.v8.local-root-acceptance.v1"
+_LOCAL_ROOT_MODE = "local-only-v1"
+_LOCAL_RECEIPT_SCHEMA = "gwo-v8-root-canary-acceptance.v2"
+_LOCAL_TICKET_REFS = ("issue:195", "issue:196", "issue:197", "issue:198")
+_LOCAL_STANDARD_TICKET_REFS = _LOCAL_TICKET_REFS[:3]
+_LOCAL_STRICT_TICKET_REF = _LOCAL_TICKET_REFS[3]
 
 
 class RootCanaryVerificationError(RuntimeError):
@@ -161,8 +167,8 @@ def _normalise_status(value: object) -> str:
 class VerifiedBatch:
     batch_id: str
     member_count: int
-    pull_request_number: int
-    hosted_run_id: int | str
+    pull_request_number: int | None
+    hosted_run_id: int | str | None
     batch_sha: str
     target_sha: str
     receipt_digest: str
@@ -197,11 +203,12 @@ class RootCanaryAcceptanceReceiptV1:
     canary_target_sha: str
     authoritative_evidence: dict[str, object]
     receipt_digest: str
+    acceptance_mode: str | None = None
 
     def canonical_digest_payload(self) -> dict[str, object]:
         """Return the exact mapping covered by ``receipt_digest``."""
 
-        return {
+        payload = {
             "repository": self.repository,
             "campaign_key": self.campaign_key,
             "plan_revision_digest": self.plan_revision_digest,
@@ -232,7 +239,9 @@ class RootCanaryAcceptanceReceiptV1:
             ],
             "fault_journal_digest": self.fault_journal_digest,
             "peak_worker_slots": self.peak_worker_slots,
-            "refill_ticket_order": list(ROOT_TICKET_KEYS),
+            "refill_ticket_order": list(
+                self.standard_ticket_keys + (self.strict_ticket_key,)
+            ),
             "permission_same_binding": self.permission_same_binding,
             "stale_diagnosis_bounded": self.stale_diagnosis_bounded,
             "terminal_replacement_bounded": self.terminal_replacement_bounded,
@@ -243,6 +252,9 @@ class RootCanaryAcceptanceReceiptV1:
             "canary_target_sha": self.canary_target_sha,
             "authoritative_evidence": self.authoritative_evidence,
         }
+        if self.acceptance_mode is not None:
+            payload["acceptance_mode"] = self.acceptance_mode
+        return payload
 
     def validate_digest(self, expected: str) -> None:
         if (
@@ -2007,6 +2019,8 @@ def _merge_ticket_manifest(
     ready_refs = manifest.get("ready_refs")
     if ready_refs is not None:
         refs = _sequence(ready_refs, "ROOT_TICKET_MANIFEST_INVALID")
+        if bundle.get("acceptance_mode") == _LOCAL_ROOT_MODE and tuple(refs) != _LOCAL_TICKET_REFS:
+            _reject("ROOT_TICKET_REAL_ISSUES_REQUIRED")
         if "ready_refs" in bundle and canonical_json_bytes(bundle["ready_refs"]) != canonical_json_bytes(refs):
             _reject("TICKET_READBACK_MISMATCH")
         merged["ready_refs"] = list(refs)
@@ -2200,7 +2214,981 @@ def _bundle_from_diagnostics(raw: Mapping[str, object]) -> dict[str, object]:
             }
     else:
         bundle = dict(raw)
+    if (
+        "acceptance_mode" in bundle
+        or bundle.get("schema_version") == _LOCAL_ROOT_SCHEMA
+        or "local_evidence" in bundle
+    ):
+        return bundle
     return _adapt_current_readback_shape(bundle)
+
+
+_LOCAL_FORBIDDEN_FIELD_ALIASES = frozenset(
+    {
+        "ci",
+        "cirunid",
+        "check",
+        "checkid",
+        "checkurl",
+        "hosted",
+        "hostedci",
+        "hostedcheck",
+        "hostedconclusion",
+        "hostedheadsha",
+        "hostedrun",
+        "hostedrunid",
+        "hostedresultreceiptdigest",
+        "hostedreceiptdigest",
+        "pr",
+        "publication",
+        "publicationreceipt",
+        "pullrequest",
+        "pullrequestheadsha",
+        "pullrequestmergetargetsha",
+        "pullrequestnumber",
+        "remote",
+        "remotetarget",
+        "remotetargetsha",
+        "run",
+        "runid",
+        "runkey",
+        "workflow",
+        "workflowrun",
+        "workflowrunid",
+        "workflowurl",
+        "url",
+    }
+)
+
+
+def _reject_local_forbidden_fields(value: object) -> None:
+    if type(value) is dict:
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if (
+                normalized in _LOCAL_FORBIDDEN_FIELD_ALIASES
+                or normalized.startswith(("hosted", "pullrequest", "publication"))
+                or normalized.startswith("remote")
+                or normalized.startswith("workflow")
+                or normalized.startswith("check")
+                or normalized.endswith("url")
+            ):
+                _reject("LOCAL_BATCH_HOSTED_FIELD_FORBIDDEN")
+            _reject_local_forbidden_fields(item)
+    elif type(value) in {list, tuple}:
+        for item in value:
+            _reject_local_forbidden_fields(item)
+
+
+def _local_manifest_entries(
+    bundle: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    raw_refs = _sequence(bundle.get("ready_refs"), "ROOT_TICKET_MANIFEST_INVALID")
+    if tuple(raw_refs) != _LOCAL_TICKET_REFS:
+        _reject("ROOT_TICKET_REAL_ISSUES_REQUIRED")
+    raw_tickets = _sequence(
+        bundle.get("tickets"), "ROOT_TICKET_MANIFEST_INVALID"
+    )
+    if len(raw_tickets) != len(_LOCAL_TICKET_REFS):
+        _reject("ROOT_TICKET_REAL_ISSUES_REQUIRED")
+    if tuple(
+        _mapping(value, "ROOT_TICKET_MANIFEST_INVALID").get("key")
+        for value in raw_tickets
+    ) != _LOCAL_TICKET_REFS:
+        _reject("ROOT_TICKET_REAL_ISSUES_REQUIRED")
+    return tuple(
+        _validate_v2_ticket(value, ref, "ROOT_TICKET_MANIFEST_INVALID")
+        for value, ref in zip(raw_tickets, _LOCAL_TICKET_REFS, strict=True)
+    )
+
+
+def _local_facts_and_readback(
+    bundle: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    raw_facts = bundle.get("facts")
+    if raw_facts is None:
+        facts: dict[str, object] = {}
+        readback = _mapping(bundle, "LOCAL_EVIDENCE_INCOMPLETE")
+    else:
+        facts = _mapping(raw_facts, "LOCAL_EVIDENCE_INCOMPLETE")
+        readback = _mapping(
+            facts.get("readback"), "LOCAL_EVIDENCE_INCOMPLETE"
+        )
+    return facts, readback
+
+
+def _local_identity(
+    bundle: Mapping[str, object],
+    facts: Mapping[str, object],
+    local_batches: Sequence[object],
+) -> tuple[str, str, str, str, str, str]:
+    campaign = bundle.get("campaign", facts.get("campaign"))
+    campaign_mapping = _mapping(campaign, "LOCAL_EVIDENCE_INCOMPLETE")
+    repository = campaign_mapping.get("repository", bundle.get("repository"))
+    if repository != ROOT_REPOSITORY:
+        _reject("ROOT_REPOSITORY_MISMATCH")
+    campaign_key = bundle.get("campaign_key", campaign_mapping.get("campaign_key"))
+    campaign_key = _text(campaign_key, "LOCAL_EVIDENCE_INCOMPLETE")
+    plan_revision = facts.get("plan_revision")
+    plan_mapping = (
+        _mapping(plan_revision, "LOCAL_EVIDENCE_INCOMPLETE")
+        if plan_revision is not None
+        else {}
+    )
+    plan_digest = bundle.get(
+        "plan_revision_digest", plan_mapping.get("digest")
+    )
+    if plan_digest is None and local_batches:
+        first_batch = _mapping(local_batches[0], "LOCAL_BATCH_PROOF_INCOMPLETE")
+        plan_digest = first_batch.get("plan_revision_digest")
+    plan_digest = _digest(plan_digest, "LOCAL_EVIDENCE_INCOMPLETE")
+
+    first_batch = _mapping(local_batches[0], "LOCAL_BATCH_PROOF_INCOMPLETE")
+    lease = _mapping(
+        first_batch.get("integration_lease"), "LOCAL_INTEGRATION_LEASE_INVALID"
+    )
+    activation_id = _text(lease.get("activation"), "LOCAL_INTEGRATION_LEASE_INVALID")
+    writer_generation = _text(
+        lease.get("writer"), "LOCAL_INTEGRATION_LEASE_INVALID"
+    )
+    target = _mapping(
+        first_batch.get("target_readback"), "LOCAL_TARGET_READBACK_INVALID"
+    )
+    target_after = _mapping(
+        target.get("target_after"), "LOCAL_TARGET_READBACK_INVALID"
+    )
+    canary_target_sha = _object_id(
+        target_after.get("commit_sha"), "LOCAL_TARGET_READBACK_INVALID"
+    )
+    return (
+        repository,
+        campaign_key,
+        plan_digest,
+        activation_id,
+        writer_generation,
+        canary_target_sha,
+    )
+
+
+def _local_candidate_records(
+    bundle: Mapping[str, object],
+    readback: Mapping[str, object],
+    repository: str,
+    campaign_key: str,
+    plan_revision_digest: str,
+) -> tuple[
+    tuple[dict[str, object], ...],
+    dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
+]:
+    raw_candidates = readback.get("candidate_receipts")
+    if raw_candidates is None:
+        raw_candidates = bundle.get("candidates")
+    candidate_values = _sequence(raw_candidates, "CANDIDATE_RECEIPT_INCOMPLETE")
+    raw_accepted = readback.get("accepted_candidate_receipts")
+    if raw_accepted is None:
+        raw_accepted = bundle.get("accepted_candidate_receipts")
+    accepted_values = _sequence(
+        raw_accepted, "CANDIDATE_RECEIPT_INCOMPLETE"
+    )
+    if len(candidate_values) != 4 or len(accepted_values) != 4:
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+
+    candidates: dict[str, dict[str, object]] = {}
+    for raw in candidate_values:
+        candidate_mapping = _mapping(raw, "CANDIDATE_RECEIPT_INCOMPLETE")
+        candidate_receipt = candidate_mapping.get("candidate_receipt", raw)
+        receipt = _validate_candidate_receipt(candidate_receipt)
+        ticket_key = _text(receipt.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE")
+        if ticket_key not in _LOCAL_TICKET_REFS or ticket_key in candidates:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if candidate_mapping.get("ticket_key", ticket_key) != ticket_key:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        reported_digest = candidate_mapping.get(
+            "candidate_receipt_digest", receipt["receipt_digest"]
+        )
+        if reported_digest != receipt["receipt_digest"]:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        for field, expected in (
+            ("repository", repository),
+            ("campaign_key", campaign_key),
+            ("campaign_handle", campaign_key),
+            ("plan_revision_digest", plan_revision_digest),
+            ("ticket_key", ticket_key),
+        ):
+            if receipt.get(field) != expected:
+                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        candidates[ticket_key] = {
+            "ticket_key": ticket_key,
+            "candidate_receipt_digest": receipt["receipt_digest"],
+            "candidate_receipt": receipt,
+        }
+
+    accepted: dict[str, dict[str, object]] = {}
+    expected_assurance = {
+        **{key: "standard" for key in _LOCAL_STANDARD_TICKET_REFS},
+        _LOCAL_STRICT_TICKET_REF: "strict",
+    }
+    for raw in accepted_values:
+        receipt = _validate_accepted_candidate_receipt(raw)
+        ticket_key = _text(receipt.get("ticket_key"), "CANDIDATE_RECEIPT_INCOMPLETE")
+        if ticket_key not in _LOCAL_TICKET_REFS or ticket_key in accepted:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        candidate = candidates.get(ticket_key)
+        if candidate is None:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["candidate_receipt_digest"] != candidate[
+            "candidate_receipt_digest"
+        ]:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["assurance"] != expected_assurance[ticket_key]:
+            _reject("ASSURANCE_SHAPE_INVALID")
+        if receipt["repository"] != repository or receipt["campaign_key"] != campaign_key:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        if receipt["plan_revision_digest"] != plan_revision_digest:
+            _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        candidate_receipt = candidate["candidate_receipt"]
+        for candidate_field, accepted_field in (
+            ("work_run_key", "work_run_key"),
+            ("base_commit_oid", "base_sha"),
+            ("base_tree_oid", "base_tree_oid"),
+            ("candidate_commit_oid", "candidate_sha"),
+            ("candidate_tree_oid", "candidate_tree_oid"),
+            ("diff_record_digest", "diff_record_digest"),
+            ("authority_subtree_digest", "authority_subtree_digest"),
+        ):
+            if candidate_receipt[candidate_field] != receipt[accepted_field]:
+                _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+        accepted[ticket_key] = receipt
+
+    if tuple(candidates) != _LOCAL_TICKET_REFS or tuple(accepted) != _LOCAL_TICKET_REFS:
+        _reject("CANDIDATE_RECEIPT_INCOMPLETE")
+    wrappers = tuple(candidates[key] for key in _LOCAL_TICKET_REFS)
+    return wrappers, candidates, accepted
+
+
+def _local_review_links(
+    bundle: Mapping[str, object],
+    facts: Mapping[str, object],
+    accepted: Mapping[str, dict[str, object]],
+    manifest: Sequence[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    transitions_value = facts.get("candidate_gate")
+    transitions_mapping = (
+        _mapping(transitions_value, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        if transitions_value is not None
+        else {}
+    )
+    raw_transitions = transitions_mapping.get("transitions")
+    if raw_transitions is None:
+        raw_reviews = bundle.get("reviews")
+        review_values = _sequence(
+            raw_reviews, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
+        )
+        links: dict[str, dict[str, object]] = {}
+        for raw in review_values:
+            review = _mapping(raw, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+            key = _text(
+                review.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"
+            )
+            if key not in accepted or key in links:
+                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+            finding = _digest(
+                review.get("finding_ledger_digest"),
+                "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
+            )
+            if finding != accepted[key]["review_finding_ledger_digest"]:
+                _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+            links[key] = {
+                "ticket_key": key,
+                "candidate_receipt_digest": accepted[key][
+                    "candidate_receipt_digest"
+                ],
+                "finding_ledger_digest": finding,
+            }
+        if tuple(links) != _LOCAL_TICKET_REFS:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        return links
+
+    links = {}
+    manifest_by_key = {ticket["key"]: ticket for ticket in manifest}
+    for raw in _sequence(raw_transitions, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID"):
+        transition = _mapping(raw, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        key = _text(transition.get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        accepted_receipt = transition.get("accepted_candidate_receipt")
+        if accepted_receipt is None:
+            continue
+        accepted_mapping = _validate_accepted_candidate_receipt(accepted_receipt)
+        if key not in accepted or accepted_mapping["receipt_digest"] != accepted[key][
+            "receipt_digest"
+        ]:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        if transition.get("status") not in {"review_accepted", "repair_accepted"}:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        finding = _digest(
+            transition.get("review_finding_ledger_digest"),
+            "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
+        )
+        if finding != accepted[key]["review_finding_ledger_digest"]:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        subject = _mapping(
+            transition.get("review_subject"),
+            "LOCAL_CANDIDATE_REVIEW_LINK_INVALID",
+        )
+        ticket = manifest_by_key.get(key)
+        if ticket is None or subject.get("ticket_contract_digest") != _ticket_contract_digest(ticket):
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        links[key] = {
+            "ticket_key": key,
+            "candidate_receipt_digest": accepted[key]["candidate_receipt_digest"],
+            "finding_ledger_digest": finding,
+            "ticket_contract_digest": _ticket_contract_digest(ticket),
+        }
+    if tuple(links) != _LOCAL_TICKET_REFS:
+        _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    return links
+
+
+def _local_target_readback(
+    target: Mapping[str, object],
+    *,
+    batch_sha: str,
+    batch_tree_oid: str,
+    batch_ref_sha: str,
+    expected_before: tuple[str, str] | None,
+    expected_target_sha: str | None,
+) -> tuple[str, tuple[str, str]]:
+    if set(target) != {
+        "repository",
+        "target_branch",
+        "target_before",
+        "target_after",
+        "batch_sha",
+        "batch_ref_sha",
+        "target_ref_sha",
+        "cas",
+        "ancestry",
+        "digest",
+    }:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    if target.get("repository") != ROOT_REPOSITORY or target.get("target_branch") != "main":
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    if target.get("batch_sha") != batch_sha or target.get("batch_ref_sha") != batch_ref_sha:
+        _reject("LOCAL_BATCH_SHA_MISMATCH")
+    before = _mapping(target.get("target_before"), "LOCAL_TARGET_READBACK_INVALID")
+    after = _mapping(target.get("target_after"), "LOCAL_TARGET_READBACK_INVALID")
+    if set(before) != {"commit_sha", "tree_sha"} or set(after) != {"commit_sha", "tree_sha"}:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    before_pair = (
+        _object_id(before.get("commit_sha"), "LOCAL_TARGET_READBACK_INVALID"),
+        _object_id(before.get("tree_sha"), "LOCAL_TARGET_READBACK_INVALID"),
+    )
+    after_pair = (
+        _object_id(after.get("commit_sha"), "LOCAL_TARGET_READBACK_INVALID"),
+        _object_id(after.get("tree_sha"), "LOCAL_TARGET_READBACK_INVALID"),
+    )
+    if expected_before is not None and before_pair != expected_before:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    if after_pair != (batch_sha, batch_tree_oid):
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    target_ref_sha = _object_id(
+        target.get("target_ref_sha"), "LOCAL_TARGET_READBACK_INVALID"
+    )
+    if target_ref_sha != after_pair[0]:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    if expected_target_sha is not None and target_ref_sha != expected_target_sha:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+
+    cas = _mapping(target.get("cas"), "LOCAL_TARGET_READBACK_INVALID")
+    if set(cas) != {"ref", "expected_sha", "updated_sha", "readback_sha", "updated"}:
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    if (
+        cas.get("ref") != "refs/heads/main"
+        or cas.get("expected_sha") != before_pair[0]
+        or cas.get("updated_sha") != after_pair[0]
+        or cas.get("readback_sha") != target_ref_sha
+        or cas.get("updated") is not True
+    ):
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+
+    ancestry = _mapping(
+        target.get("ancestry"), "LOCAL_TARGET_ANCESTRY_INVALID"
+    )
+    if set(ancestry) != {
+        "ancestor_sha",
+        "descendant_sha",
+        "is_ancestor",
+        "readback_digest",
+    }:
+        _reject("LOCAL_TARGET_ANCESTRY_INVALID")
+    if (
+        ancestry.get("ancestor_sha") != batch_sha
+        or ancestry.get("descendant_sha") != target_ref_sha
+        or ancestry.get("is_ancestor") is not True
+    ):
+        _reject("LOCAL_TARGET_ANCESTRY_INVALID")
+    ancestry_body = {key: value for key, value in ancestry.items() if key != "readback_digest"}
+    if ancestry["readback_digest"] != _canonical_digest(
+        {"kind": "local-target-ancestry.v1", **ancestry_body}
+    ):
+        _reject("LOCAL_TARGET_ANCESTRY_INVALID")
+
+    target_body = {key: value for key, value in target.items() if key != "digest"}
+    if target["digest"] != _canonical_digest(
+        {"kind": "local-target-readback.v1", **target_body}
+    ):
+        _reject("LOCAL_TARGET_READBACK_INVALID")
+    return target_ref_sha, before_pair
+
+
+def _local_batch_proofs(
+    local_evidence: Mapping[str, object],
+    *,
+    repository: str,
+    campaign_key: str,
+    plan_revision_digest: str,
+    candidates: Mapping[str, dict[str, object]],
+    accepted: Mapping[str, dict[str, object]],
+    reviews: Mapping[str, dict[str, object]],
+    expected_target_sha: str | None,
+) -> tuple[tuple[VerifiedBatch, VerifiedBatch], dict[str, dict[str, object]]]:
+    raw_batches = _sequence(local_evidence.get("batches"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+    if len(raw_batches) != 2:
+        _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+    proof_keys = {
+        "schema_version",
+        "repository",
+        "campaign_key",
+        "plan_revision_digest",
+        "batch_id",
+        "batch_sha",
+        "batch_tree_oid",
+        "batch_ref",
+        "member_ticket_keys",
+        "candidate_receipt_digests",
+        "accepted_candidate_receipt_digests",
+        "candidate_diff_record_digests",
+        "finding_ledger_digests",
+        "local_suite",
+        "integration_lease",
+        "target_readback",
+        "receipt_digest",
+    }
+    verified: dict[str, VerifiedBatch] = {}
+    proof_by_id: dict[str, dict[str, object]] = {}
+    lease_identity: tuple[str, str] | None = None
+    target_before_pairs: dict[str, tuple[str, str]] = {}
+    target_after_pairs: dict[str, tuple[str, str]] = {}
+    for raw in raw_batches:
+        proof = _mapping(raw, "LOCAL_BATCH_PROOF_INCOMPLETE")
+        _reject_local_forbidden_fields(proof)
+        if set(proof) != proof_keys or proof.get("schema_version") != "local_batch_proof.v1":
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        if (
+            proof.get("repository") != repository
+            or proof.get("campaign_key") != campaign_key
+            or proof.get("plan_revision_digest") != plan_revision_digest
+        ):
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        batch_id = _text(proof.get("batch_id"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if batch_id in proof_by_id:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        batch_sha = _object_id(proof.get("batch_sha"), "LOCAL_BATCH_SHA_MISMATCH")
+        batch_tree_oid = _object_id(
+            proof.get("batch_tree_oid"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        batch_ref = _mapping(proof.get("batch_ref"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if set(batch_ref) != {"ref", "sha"}:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        batch_ref_value = _text(batch_ref.get("ref"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        batch_ref_sha = _object_id(batch_ref.get("sha"), "LOCAL_BATCH_SHA_MISMATCH")
+        if (
+            batch_ref_sha != batch_sha
+            or batch_ref_value != f"refs/gwo-v8/integration-batches/{batch_id}"
+        ):
+            _reject("LOCAL_BATCH_SHA_MISMATCH")
+        members = tuple(
+            _text(value, "LOCAL_BATCH_PROOF_INCOMPLETE")
+            for value in _sequence(
+                proof.get("member_ticket_keys"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+            )
+        )
+        if members == _LOCAL_STANDARD_TICKET_REFS:
+            kind = "multi"
+        elif members == (_LOCAL_STRICT_TICKET_REF,):
+            kind = "singleton"
+        else:
+            _reject("BATCH_MEMBERS_INVALID")
+        if kind in verified:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+
+        candidate_digests = tuple(
+            _digest(value, "LOCAL_BATCH_PROOF_INCOMPLETE")
+            for value in _sequence(
+                proof.get("candidate_receipt_digests"),
+                "LOCAL_BATCH_PROOF_INCOMPLETE",
+            )
+        )
+        accepted_digests = tuple(
+            _digest(value, "LOCAL_BATCH_PROOF_INCOMPLETE")
+            for value in _sequence(
+                proof.get("accepted_candidate_receipt_digests"),
+                "LOCAL_BATCH_PROOF_INCOMPLETE",
+            )
+        )
+        diff_digests = tuple(
+            _digest(value, "LOCAL_BATCH_PROOF_INCOMPLETE")
+            for value in _sequence(
+                proof.get("candidate_diff_record_digests"),
+                "LOCAL_BATCH_PROOF_INCOMPLETE",
+            )
+        )
+        finding_digests = tuple(
+            _digest(value, "LOCAL_BATCH_PROOF_INCOMPLETE")
+            for value in _sequence(
+                proof.get("finding_ledger_digests"),
+                "LOCAL_BATCH_PROOF_INCOMPLETE",
+            )
+        )
+        expected_candidates = tuple(
+            candidates[key]["candidate_receipt_digest"] for key in members
+        )
+        expected_accepted = tuple(accepted[key]["receipt_digest"] for key in members)
+        expected_diffs = tuple(
+            candidates[key]["candidate_receipt"]["diff_record_digest"] for key in members
+        )
+        expected_findings = tuple(reviews[key]["finding_ledger_digest"] for key in members)
+        if (
+            candidate_digests != expected_candidates
+            or accepted_digests != expected_accepted
+            or diff_digests != expected_diffs
+            or finding_digests != expected_findings
+        ):
+            _reject("LOCAL_BATCH_CROSSLINK_INVALID")
+
+        local_suite = _mapping(proof.get("local_suite"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if set(local_suite) != {"suite_id", "batch_sha", "status", "receipt_digest"}:
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        _text(local_suite.get("suite_id"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+        if local_suite.get("batch_sha") != batch_sha or local_suite.get("status") != "passed":
+            _reject("LOCAL_BATCH_SHA_MISMATCH")
+        _digest(local_suite.get("receipt_digest"), "LOCAL_BATCH_PROOF_INCOMPLETE")
+
+        lease = _mapping(
+            proof.get("integration_lease"), "LOCAL_INTEGRATION_LEASE_INVALID"
+        )
+        if set(lease) != {"serialized", "stable_action_id", "writer", "activation", "digest"}:
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        serialized = _mapping(
+            lease.get("serialized"), "LOCAL_INTEGRATION_LEASE_INVALID"
+        )
+        if set(serialized) != {
+            "repository",
+            "holder",
+            "writer_generation",
+            "activation_id",
+            "lease_digest",
+        }:
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        if serialized.get("repository") != repository:
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        for field in ("repository", "holder", "writer_generation", "activation_id"):
+            _text(serialized.get(field), "LOCAL_INTEGRATION_LEASE_INVALID")
+        lease_digest = _digest(lease.get("digest"), "LOCAL_INTEGRATION_LEASE_INVALID")
+        if lease_digest != serialized.get("lease_digest"):
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        lease_body = {
+            key: serialized[key]
+            for key in ("repository", "holder", "writer_generation", "activation_id")
+        }
+        if lease_digest != _canonical_digest({"kind": "integration-lease.v1", **lease_body}):
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        if (
+            lease.get("stable_action_id") != serialized.get("holder")
+            or lease.get("writer") != serialized.get("writer_generation")
+            or lease.get("activation") != serialized.get("activation_id")
+        ):
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+        current_lease_identity = (str(lease["activation"]), str(lease["writer"]))
+        if lease_identity is None:
+            lease_identity = current_lease_identity
+        elif lease_identity != current_lease_identity:
+            _reject("LOCAL_INTEGRATION_LEASE_INVALID")
+
+        target = _mapping(
+            proof.get("target_readback"), "LOCAL_TARGET_READBACK_INVALID"
+        )
+        previous_target = None
+        if kind == "singleton" and "multi" in target_before_pairs:
+            previous_target = target_after_pairs["multi"]
+        elif kind == "multi":
+            first_candidate = candidates[members[0]]["candidate_receipt"]
+            previous_target = (
+                first_candidate["base_commit_oid"],
+                first_candidate["base_tree_oid"],
+            )
+        target_sha, before_pair = _local_target_readback(
+            target,
+            batch_sha=batch_sha,
+            batch_tree_oid=batch_tree_oid,
+            batch_ref_sha=batch_ref_sha,
+            expected_before=previous_target,
+            expected_target_sha=expected_target_sha if kind == "singleton" else None,
+        )
+        target_before_pairs[kind] = before_pair
+        target_after_pairs[kind] = (target_sha, batch_tree_oid)
+        verified[kind] = VerifiedBatch(
+            batch_id=batch_id,
+            member_count=len(members),
+            pull_request_number=None,
+            hosted_run_id=None,
+            batch_sha=batch_sha,
+            target_sha=target_sha,
+            receipt_digest="",
+        )
+        proof_by_id[batch_id] = proof
+
+    if set(verified) != {"multi", "singleton"}:
+        _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+    if (
+        verified["multi"].batch_id == verified["singleton"].batch_id
+        or verified["multi"].batch_sha == verified["singleton"].batch_sha
+        or verified["multi"].target_sha == verified["singleton"].target_sha
+    ):
+        _reject("BATCH_BOUNDARY_COLLAPSED")
+
+    for kind, batch in tuple(verified.items()):
+        proof = proof_by_id[batch.batch_id]
+        receipt_digest = _digest(
+            proof.get("receipt_digest"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+        )
+        proof_body = {key: value for key, value in proof.items() if key != "receipt_digest"}
+        if receipt_digest != _canonical_digest({"kind": "local_batch_proof.v1", **proof_body}):
+            _reject("LOCAL_BATCH_PROOF_INCOMPLETE")
+        verified[kind] = replace(batch, receipt_digest=receipt_digest)
+    return (verified["multi"], verified["singleton"]), proof_by_id
+
+
+def _local_result_crosslinks(
+    bundle: Mapping[str, object],
+    facts: Mapping[str, object],
+    readback: Mapping[str, object],
+    candidates: Mapping[str, dict[str, object]],
+    accepted: Mapping[str, dict[str, object]],
+    batches: tuple[VerifiedBatch, VerifiedBatch],
+    proofs_by_id: Mapping[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    batch_by_id = {batch.batch_id: batch for batch in batches}
+    result_values = readback.get("result_integrities", bundle.get("result_integrities"))
+    results = _sequence(result_values, "LOCAL_RESULT_CROSSLINK_INVALID")
+    if len(results) != 4:
+        _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+    seen: set[str] = set()
+    projected: list[dict[str, object]] = []
+    for raw in results:
+        result = _mapping(raw, "LOCAL_RESULT_CROSSLINK_INVALID")
+        accepted_digest = _digest(
+            result.get("accepted_candidate_receipt_digest"),
+            "LOCAL_RESULT_CROSSLINK_INVALID",
+        )
+        if accepted_digest in seen:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        seen.add(accepted_digest)
+        key = next(
+            (
+                ticket_key
+                for ticket_key, value in accepted.items()
+                if value["receipt_digest"] == accepted_digest
+            ),
+            None,
+        )
+        if key is None:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        batch_id = _text(result.get("batch_id"), "LOCAL_RESULT_CROSSLINK_INVALID")
+        batch = batch_by_id.get(batch_id)
+        if batch is None or result.get("batch_sha") != batch.batch_sha:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        members = tuple(
+            _text(value, "LOCAL_RESULT_CROSSLINK_INVALID")
+            for value in _sequence(
+                result.get("delivery_member_ticket_keys"),
+                "LOCAL_RESULT_CROSSLINK_INVALID",
+            )
+        )
+        expected_members = (
+            _LOCAL_STANDARD_TICKET_REFS
+            if batch.member_count == 3
+            else (_LOCAL_STRICT_TICKET_REF,)
+        )
+        if members != expected_members or result.get("target_contains_batch_sha") is not True:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        proof = proofs_by_id[batch_id]
+        proof_members = tuple(proof["member_ticket_keys"])
+        if members != proof_members:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        projected.append(
+            {
+                "ticket_key": key,
+                "accepted_candidate_receipt_digest": accepted_digest,
+                "batch_id": batch_id,
+                "batch_sha": batch.batch_sha,
+                "delivery_member_ticket_keys": list(members),
+                "target_contains_batch_sha": True,
+                "result_digest": result.get("result_digest"),
+            }
+        )
+    if seen != {value["receipt_digest"] for value in accepted.values()}:
+        _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+
+    raw_work_runs = facts.get("work_runs", bundle.get("work_runs"))
+    if raw_work_runs is not None:
+        work_runs = _sequence(raw_work_runs, "LOCAL_RESULT_CROSSLINK_INVALID")
+        if len(work_runs) != 4:
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+        work_by_key: dict[str, Mapping[str, object]] = {}
+        for raw in work_runs:
+            run = _mapping(raw, "LOCAL_RESULT_CROSSLINK_INVALID")
+            key = _text(run.get("ticket_key"), "LOCAL_RESULT_CROSSLINK_INVALID")
+            if key not in accepted or key in work_by_key:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            if run.get("phase") != "completed" or run.get("claim_state") != "released" or run.get("slot_held") is not False:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            if run.get("candidate_receipt_digest") != candidates[key]["candidate_receipt_digest"]:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            if run.get("accepted_candidate_receipt_digest") != accepted[key]["receipt_digest"]:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            if run.get("batch_id") not in batch_by_id or run.get("batch_sha") != batch_by_id[run["batch_id"]].batch_sha:
+                _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+            work_by_key[key] = run
+        if set(work_by_key) != set(_LOCAL_TICKET_REFS):
+            _reject("LOCAL_RESULT_CROSSLINK_INVALID")
+    return sorted(projected, key=lambda item: _LOCAL_TICKET_REFS.index(item["ticket_key"]))
+
+
+def _local_authoritative_evidence(
+    local_evidence: Mapping[str, object],
+    candidates: Mapping[str, dict[str, object]],
+    accepted: Mapping[str, dict[str, object]],
+    reviews: Mapping[str, dict[str, object]],
+    results: Sequence[dict[str, object]],
+    manifest: Sequence[dict[str, object]],
+    facts: Mapping[str, object],
+) -> dict[str, object]:
+    candidate_links = [
+        {
+            "ticket_key": key,
+            "candidate_receipt_digest": candidates[key]["candidate_receipt_digest"],
+            "accepted_candidate_receipt_digest": accepted[key]["receipt_digest"],
+            "candidate_diff_record_digest": candidates[key]["candidate_receipt"][
+                "diff_record_digest"
+            ],
+        }
+        for key in _LOCAL_TICKET_REFS
+    ]
+    recovery = facts.get("concurrency")
+    candidate_gate = facts.get("candidate_gate")
+    replay = facts.get("replay", {})
+    projected_recovery = {
+        "concurrency": copy.deepcopy(recovery),
+        "candidate_gate": copy.deepcopy(
+            {
+                key: candidate_gate.get(key)
+                for key in (
+                    "reviewed",
+                    "repair_required",
+                    "rejected",
+                    "strict_specialist_review",
+                    "accepted",
+                )
+                if isinstance(candidate_gate, dict) and key in candidate_gate
+            }
+        ),
+        "replay": copy.deepcopy(
+            {
+                key: replay.get(key)
+                for key in (
+                    "readback_unchanged",
+                    "idempotent_delivery",
+                    "idempotent_effects",
+                )
+                if isinstance(replay, dict) and key in replay
+            }
+        ),
+    }
+    return {
+        "acceptance_mode": _LOCAL_ROOT_MODE,
+        "local_evidence": copy.deepcopy(dict(local_evidence)),
+        "ticket_contract_digests": [
+            {"key": ticket["key"], "digest": _ticket_contract_digest(ticket)}
+            for ticket in manifest
+        ],
+        "candidate_links": candidate_links,
+        "review_links": [copy.deepcopy(reviews[key]) for key in _LOCAL_TICKET_REFS],
+        "result_links": copy.deepcopy(list(results)),
+        "recovery": projected_recovery,
+    }
+
+
+def _verify_local_root_canary(
+    bundle: Mapping[str, object],
+    *,
+    expected_target_sha: str | None,
+) -> RootCanaryAcceptanceReceiptV1:
+    if bundle.get("acceptance_mode") != _LOCAL_ROOT_MODE:
+        if "acceptance_mode" not in bundle:
+            _reject("ROOT_ACCEPTANCE_MODE_REQUIRED")
+        _reject("ROOT_ACCEPTANCE_MODE_INVALID")
+    if bundle.get("schema_version") != _LOCAL_ROOT_SCHEMA:
+        _reject("ROOT_ACCEPTANCE_SCHEMA_INVALID")
+    _validate_status(bundle)
+    manifest = _local_manifest_entries(bundle)
+    facts, readback = _local_facts_and_readback(bundle)
+    local_evidence = _mapping(
+        bundle.get("local_evidence"), "LOCAL_EVIDENCE_INCOMPLETE"
+    )
+    if set(local_evidence) != {"schema_version", "acceptance_mode", "batches"}:
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    if (
+        local_evidence.get("schema_version") != "gwo.v8.local-evidence.v1"
+        or local_evidence.get("acceptance_mode") != _LOCAL_ROOT_MODE
+    ):
+        _reject("LOCAL_EVIDENCE_INCOMPLETE")
+    _reject_local_forbidden_fields(local_evidence)
+    raw_local_batches = _sequence(
+        local_evidence.get("batches"), "LOCAL_BATCH_PROOF_INCOMPLETE"
+    )
+    (
+        repository,
+        campaign_key,
+        plan_revision_digest,
+        activation_id,
+        writer_generation,
+        _,
+    ) = _local_identity(bundle, facts, raw_local_batches)
+    candidates_tuple, candidates, accepted = _local_candidate_records(
+        bundle, readback, repository, campaign_key, plan_revision_digest
+    )
+    del candidates_tuple
+    reviews = _local_review_links(bundle, facts, accepted, manifest)
+    expected_target = expected_target_sha
+    batches, proofs_by_id = _local_batch_proofs(
+        local_evidence,
+        repository=repository,
+        campaign_key=campaign_key,
+        plan_revision_digest=plan_revision_digest,
+        candidates=candidates,
+        accepted=accepted,
+        reviews=reviews,
+        expected_target_sha=expected_target,
+    )
+    results = _local_result_crosslinks(
+        bundle,
+        facts,
+        readback,
+        candidates,
+        accepted,
+        batches,
+        proofs_by_id,
+    )
+
+    facts_tickets = facts.get("tickets")
+    if facts_tickets is not None:
+        fact_values = _sequence(facts_tickets, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+        if tuple(
+            _text(_mapping(value, "LOCAL_CANDIDATE_REVIEW_LINK_INVALID").get("ticket_key"), "LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+            for value in fact_values
+        ) != _LOCAL_TICKET_REFS:
+            _reject("LOCAL_CANDIDATE_REVIEW_LINK_INVALID")
+    concurrency = facts.get("concurrency")
+    if concurrency is not None:
+        concurrency_mapping = _mapping(concurrency, "LOCAL_EVIDENCE_INCOMPLETE")
+        if (
+            concurrency_mapping.get("worker_slot_limit") != 4
+            or concurrency_mapping.get("max_held") != 4
+            or concurrency_mapping.get("final_held") != 0
+            or concurrency_mapping.get("final_available") != 4
+            or concurrency_mapping.get("work_run_count") != 4
+        ):
+            _reject("LOCAL_EVIDENCE_INCOMPLETE")
+
+    accepted_values = [accepted[key] for key in _LOCAL_TICKET_REFS]
+    policy_digests = {_digest(value["policy_witness_digest"], "POLICY_EVIDENCE_INCOMPLETE") for value in accepted_values}
+    if len(policy_digests) != 1:
+        _reject("POLICY_EVIDENCE_INCOMPLETE")
+    authority_digests = sorted(
+        {_digest(value["authority_subtree_digest"], "AUTHORITY_EVIDENCE_INCOMPLETE") for value in accepted_values}
+    )
+    runtime_digests = sorted(
+        {
+            _digest(
+                value["candidate_receipt"]["runtime_subject_digest"],
+                "RUNTIME_EVIDENCE_INCOMPLETE",
+            )
+            for value in candidates.values()
+        }
+    )
+    recovery_body = {
+        "kind": "local-fault-journal.v1",
+        "replay": facts.get("replay"),
+        "candidate_gate": facts.get("candidate_gate"),
+    }
+    ticket_contract_digests = tuple(
+        (ticket["key"], _ticket_contract_digest(ticket)) for ticket in manifest
+    )
+    candidate_receipt_digests = tuple(
+        (key, candidates[key]["candidate_receipt_digest"]) for key in _LOCAL_TICKET_REFS
+    )
+    finding_ledger_digests = tuple(
+        (key, reviews[key]["finding_ledger_digest"]) for key in _LOCAL_TICKET_REFS
+    )
+    batch_receipt_digests = (
+        ("multi", batches[0].receipt_digest),
+        ("singleton", batches[1].receipt_digest),
+    )
+    authoritative_evidence = _local_authoritative_evidence(
+        local_evidence,
+        candidates,
+        accepted,
+        reviews,
+        results,
+        manifest,
+        facts,
+    )
+    receipt = RootCanaryAcceptanceReceiptV1(
+        repository=repository,
+        campaign_key=campaign_key,
+        plan_revision_digest=plan_revision_digest,
+        activation_id=activation_id,
+        writer_generation=writer_generation,
+        standard_ticket_keys=_LOCAL_STANDARD_TICKET_REFS,
+        strict_ticket_key=_LOCAL_STRICT_TICKET_REF,
+        standard_batch=batches[0],
+        strict_batch=batches[1],
+        peak_worker_slots=4,
+        refill_proven=True,
+        permission_same_binding=True,
+        stale_diagnosis_bounded=True,
+        terminal_replacement_bounded=True,
+        terminal_replacement_receipt_digests=(),
+        duplicate_effect_ids=(),
+        ticket_contract_digests=ticket_contract_digests,
+        candidate_receipt_digests=candidate_receipt_digests,
+        policy_witness_digest=next(iter(policy_digests)),
+        authority_root_digest=_canonical_digest(
+            {"kind": "local-authority-root.v1", "subtree_digests": authority_digests}
+        ),
+        runtime_selector_digest=_canonical_digest(
+            {"kind": "local-runtime-selector.v1", "subject_digests": runtime_digests}
+        ),
+        finding_ledger_digests=finding_ledger_digests,
+        batch_receipt_digests=batch_receipt_digests,
+        fault_journal_digest=_canonical_digest(recovery_body),
+        canary_target_sha=batches[1].target_sha,
+        authoritative_evidence=authoritative_evidence,
+        receipt_digest="",
+        acceptance_mode=_LOCAL_ROOT_MODE,
+    )
+    return replace(receipt, receipt_digest=digest_value(receipt.canonical_digest_payload()))
 
 
 def _verify_root_canary(
@@ -2212,6 +3200,14 @@ def _verify_root_canary(
 
     if type(bundle) is not dict:
         _reject("ACCEPTANCE_BUNDLE_INVALID")
+    if (
+        "acceptance_mode" in bundle
+        or bundle.get("schema_version") == _LOCAL_ROOT_SCHEMA
+        or "local_evidence" in bundle
+    ):
+        return _verify_local_root_canary(
+            bundle, expected_target_sha=expected_target_sha
+        )
     if expected_target_sha is not None:
         _text(expected_target_sha, "TARGET_SHA_INCOMPLETE")
     _validate_status(bundle)
@@ -2420,7 +3416,11 @@ def write_acceptance_document(
     """Write a human-readable, local/read-only acceptance projection."""
 
     payload = {
-        "schema": "gwo-v8-root-canary-acceptance.v1",
+        "schema": (
+            _LOCAL_RECEIPT_SCHEMA
+            if receipt.acceptance_mode == _LOCAL_ROOT_MODE
+            else "gwo-v8-root-canary-acceptance.v1"
+        ),
         "repository": receipt.repository,
         "campaign_key": receipt.campaign_key,
         "plan_revision_digest": receipt.plan_revision_digest,
@@ -2449,6 +3449,8 @@ def write_acceptance_document(
         "authoritative_evidence": receipt.authoritative_evidence,
         "receipt_digest": receipt.receipt_digest,
     }
+    if receipt.acceptance_mode is not None:
+        payload["acceptance_mode"] = receipt.acceptance_mode
     path.parent.mkdir(parents=True, exist_ok=True)
     fence = "`" * 3
     path.write_text(
@@ -2536,7 +3538,15 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
         bundle, expected_target_sha=args.expected_target_sha
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(canonical_json_bytes(dataclasses.asdict(receipt)))
+    output_payload = dataclasses.asdict(receipt)
+    output_payload["schema"] = (
+        _LOCAL_RECEIPT_SCHEMA
+        if receipt.acceptance_mode == _LOCAL_ROOT_MODE
+        else "gwo-v8-root-canary-acceptance.v1"
+    )
+    if receipt.acceptance_mode is None:
+        output_payload.pop("acceptance_mode", None)
+    args.output.write_bytes(canonical_json_bytes(output_payload))
     return 0
 
 

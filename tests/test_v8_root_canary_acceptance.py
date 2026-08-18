@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,10 +14,15 @@ from scripts.verify_v8_root_canary import (
     ROOT_REPOSITORY,
     RootCanaryAcceptanceReceiptV1,
     RootCanaryVerificationError,
+    digest_value,
     verify_main,
     verify_root_canary,
     write_acceptance_document,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ROOT_TICKETS = ROOT / "tests" / "fixtures" / "gwo-v8-root-canary-tickets-195-198.json"
 
 
 def _batch(
@@ -452,6 +458,21 @@ def valid_bundle() -> AcceptanceFixture:
             "diagnostics": {"status": "Complete", "proof": proof},
         }
     )
+
+
+@pytest.fixture(scope="module")
+def local_only_bundle(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    runner = importlib.import_module("scripts.run_v8_local_acceptance")
+    record = runner.run_local_acceptance(
+        root=tmp_path_factory.mktemp("local-root-producer"),
+        run_id="task3-local-verifier",
+        scenario="root",
+        tickets=ROOT_TICKETS,
+    )
+    manifest = json.loads(ROOT_TICKETS.read_text(encoding="utf-8"))
+    record["tickets"] = copy.deepcopy(manifest["tickets"])
+    record["ready_refs"] = list(manifest["ready_refs"])
+    return record
 
 
 def test_acceptance_requires_three_standard_in_one_batch_and_strict_singleton(
@@ -1092,3 +1113,175 @@ def test_assurance_is_not_defaulted_when_candidate_readback_omits_it(
 
     with pytest.raises(RootCanaryVerificationError, match="ASSURANCE_SHAPE_INVALID"):
         verify_root_canary(data)
+
+
+def test_local_only_verifier_accepts_the_manifest_backed_local_projection(
+    local_only_bundle: dict[str, object],
+    tmp_path: Path,
+):
+    receipt = verify_root_canary(copy.deepcopy(local_only_bundle))
+
+    assert receipt.acceptance_mode == "local-only-v1"
+    assert receipt.standard_ticket_keys == (
+        "issue:195",
+        "issue:196",
+        "issue:197",
+    )
+    assert receipt.strict_ticket_key == "issue:198"
+    assert receipt.standard_batch.member_count == 3
+    assert receipt.strict_batch.member_count == 1
+    assert receipt.standard_batch.pull_request_number is None
+    assert receipt.standard_batch.hosted_run_id is None
+    assert receipt.strict_batch.pull_request_number is None
+    assert receipt.strict_batch.hosted_run_id is None
+    assert (
+        receipt.authoritative_evidence["local_evidence"]
+        == local_only_bundle["local_evidence"]
+    )
+
+    document = tmp_path / "local-receipt.md"
+    write_acceptance_document(document, receipt)
+    assert "gwo-v8-root-canary-acceptance.v2" in document.read_text("utf-8")
+
+
+def test_local_only_mode_is_required_and_invalid_modes_do_not_use_legacy_hosted_path(
+    local_only_bundle: dict[str, object],
+):
+    missing = copy.deepcopy(local_only_bundle)
+    missing.pop("acceptance_mode")
+    with pytest.raises(
+        RootCanaryVerificationError, match="ROOT_ACCEPTANCE_MODE_REQUIRED"
+    ):
+        verify_root_canary(missing)
+
+    invalid = copy.deepcopy(local_only_bundle)
+    invalid["acceptance_mode"] = "hosted-v1"
+    with pytest.raises(
+        RootCanaryVerificationError, match="ROOT_ACCEPTANCE_MODE_INVALID"
+    ):
+        verify_root_canary(invalid)
+
+    explicit_local_without_local_evidence = copy.deepcopy(local_only_bundle)
+    explicit_local_without_local_evidence.pop("local_evidence")
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_EVIDENCE_INCOMPLETE"
+    ):
+        verify_root_canary(explicit_local_without_local_evidence)
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    (
+        "hosted_ci",
+        "pull_request",
+        "publication_receipt",
+        "remote_target_sha",
+        "url",
+        "workflow_url",
+        "run_id",
+        "check_id",
+    ),
+)
+def test_local_only_rejects_forbidden_fields_recursively(
+    local_only_bundle: dict[str, object],
+    forbidden_key: str,
+):
+    data = copy.deepcopy(local_only_bundle)
+    data["local_evidence"]["batches"][0]["target_readback"][forbidden_key] = "forbidden"  # type: ignore[index]
+
+    with pytest.raises(
+        RootCanaryVerificationError, match="LOCAL_BATCH_HOSTED_FIELD_FORBIDDEN"
+    ):
+        verify_root_canary(data)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    (
+        ("batch_ref_sha", "LOCAL_BATCH_SHA_MISMATCH"),
+        ("suite_sha", "LOCAL_BATCH_SHA_MISMATCH"),
+        ("lease", "LOCAL_INTEGRATION_LEASE_INVALID"),
+        ("target_after", "LOCAL_TARGET_READBACK_INVALID"),
+        ("target_cas", "LOCAL_TARGET_READBACK_INVALID"),
+        ("target_ancestry", "LOCAL_TARGET_ANCESTRY_INVALID"),
+    ),
+)
+def test_local_only_rejects_batch_lease_and_target_tampering(
+    local_only_bundle: dict[str, object],
+    mutation: str,
+    code: str,
+):
+    data = copy.deepcopy(local_only_bundle)
+    batch = data["local_evidence"]["batches"][0]  # type: ignore[index]
+    if mutation == "batch_ref_sha":
+        batch["batch_ref"]["sha"] = "0" * 40
+    elif mutation == "suite_sha":
+        batch["local_suite"]["batch_sha"] = "0" * 40
+    elif mutation == "lease":
+        batch["integration_lease"]["serialized"]["holder"] = "0" * 64
+    elif mutation == "target_after":
+        batch["target_readback"]["target_after"]["commit_sha"] = "0" * 40
+    elif mutation == "target_cas":
+        batch["target_readback"]["cas"]["readback_sha"] = "0" * 40
+    elif mutation == "target_ancestry":
+        batch["target_readback"]["ancestry"]["is_ancestor"] = False
+
+    with pytest.raises(RootCanaryVerificationError, match=code):
+        verify_root_canary(data)
+
+
+def test_local_only_receipt_digest_binds_mode_and_complete_local_evidence(
+    local_only_bundle: dict[str, object],
+):
+    receipt = verify_root_canary(copy.deepcopy(local_only_bundle))
+    payload = receipt.canonical_digest_payload()
+
+    assert payload["acceptance_mode"] == "local-only-v1"
+    assert payload["authoritative_evidence"] == receipt.authoritative_evidence
+
+    mode_changed = copy.deepcopy(payload)
+    mode_changed["acceptance_mode"] = "different-mode"
+    assert digest_value(mode_changed) != receipt.receipt_digest
+
+    evidence_changed = copy.deepcopy(payload)
+    evidence_changed["authoritative_evidence"]["local_evidence"]["batches"][0][
+        "batch_sha"
+    ] = "0" * 40
+    assert digest_value(evidence_changed) != receipt.receipt_digest
+
+
+def test_local_only_cli_round_trip_uses_the_real_ticket_fixture(
+    tmp_path: Path,
+    local_only_bundle: dict[str, object],
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    output_path = tmp_path / "local-receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+
+    assert (
+        verify_main(
+            [
+                "--tickets",
+                str(ROOT_TICKETS),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(output_path.read_text("utf-8"))
+    assert output["acceptance_mode"] == "local-only-v1"
+    assert output["schema"] == "gwo-v8-root-canary-acceptance.v2"
+    assert [
+        batch["member_ticket_keys"]
+        for batch in output["authoritative_evidence"]["local_evidence"]["batches"]
+    ] == [
+        ["issue:195", "issue:196", "issue:197"],
+        ["issue:198"],
+    ]
+    assert output["receipt_digest"] == verify_root_canary(
+        copy.deepcopy(local_only_bundle)
+    ).receipt_digest
