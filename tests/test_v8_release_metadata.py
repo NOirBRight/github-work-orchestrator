@@ -1338,6 +1338,677 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
     assert "pytest_pass_count" not in combined
 
 
+def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
+    bridge = {
+        "bridge_digest": "30962c93b38ae16eaaa5dd0fdb805fdd22fa4108fd6374e37abafad6cfb2dea7",
+        "default_writer": {
+            "activation_id": "activation:47895d07122a3d9827ecdf63",
+            "legacy_writer_fence_stopped": True,
+            "previous_writer_generation": "v8-generation-1",
+            "readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
+            "record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\default-writer-readback.json"
+            ),
+            "source_file_sha256": "4c9f165b7e1df535cfcd3fe86cc43b2fb57dc21872cb65980b3d9abdec3d4ffc",
+            "writer_generation": "v8-generation-1",
+        },
+        "local_root_canary": {
+            "acceptance_mode": "local-only-v1",
+            "activation_id": "campaign:fd16e735a23425ee5071e881",
+            "campaign_key": "campaign:fd16e735a23425ee5071e881",
+            "canary_target_sha": "d31d5787df8ff53f081ed45df42389ef2e505ffb",
+            "producer_receipt_digest": "ea642b5606efc10adaf3671174b10e3df2f1a5f2dfc8b60a86b251db5845c938",
+            "repository": "NOirBRight/github-work-orchestrator",
+            "schema": "gwo-v8-root-canary-acceptance.v2",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\root-canary-acceptance.json"
+            ),
+            "source_file_sha256": "2e1d740729c22f60718097ab5bf3c6e3e404d54948154707a46a2dc38fb51c5f",
+            "writer_generation": "writer:local",
+        },
+        "production_activation": {
+            "activation_id": "activation:47895d07122a3d9827ecdf63",
+            "previous_writer_generation": "v8-generation-1",
+            "readback_receipt_digest": "98eb2d5f6a75f0e12b290836c72939c44bd03052f1d28257cae410ed30d25c06",
+            "run_id": "phase5-production-activation-2df47f9",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\production-activation-readback.json"
+            ),
+            "source_file_sha256": "848536847b2fa47f3b10bb38d419234d94d81139d119528d4ff7575a78733319",
+            "transition_record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+            "writer_generation": "v8-generation-1",
+        },
+        "production_canary": {
+            "evidence_ref_count": 19,
+            "manifest_ref": (
+                "github://canary-manifest/"
+                "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30"
+            ),
+            "package_digest": "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30",
+            "package_repository": "NOirBRight/gwo-v8-canary",
+            "readback_receipt_digest": "84e4b4e904679d2f841f843ca58da9dda0e5a81a47d251bc18cdd396c64c710e",
+            "source_file": (
+                "D:\\gwo-release-evidence\\2026-08-19-gwo-v8-ga-production-cutover"
+                "\\production-canary-readback.json"
+            ),
+            "source_file_sha256": "354092b2e186096e7f7693683f1ad7d449b4ffe13ff56eca6254b4f83e77baca",
+        },
+        "activation_release_subject": {
+            "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
+            "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
+            "release_subject_digest": "f4a260c1bfb39d6541c33f8f8f4449edc5453bd94cedbc1f1a244c9daf28a969",
+        },
+        "release_subject": {
+            "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
+            "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
+            "release_subject_digest": "f4a260c1bfb39d6541c33f8f8f4449edc5453bd94cedbc1f1a244c9daf28a969",
+        },
+        "repository": "NOirBRight/github-work-orchestrator",
+        "schema": "gwo-v8-ga-evidence-bridge.v1",
+    }
+
+    paths = render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        evidence_bridge=bridge,
+    )
+
+    payload = json.loads(
+        paths[1]
+        .read_text(encoding="utf-8")
+        .split("```json\n", 1)[1]
+        .split("\n```\n", 1)[0]
+    )
+
+    assert payload["evidence_bridge_digest"] == _stable_bridge_digest(bridge)
+    assert (
+        payload["evidence_bridge_activation_subject"]
+        == bridge["activation_release_subject"]
+    )
+    assert "evidence_bridge" not in payload
+    assert payload["evidence_bridge_links"] == {
+        "activation_id": "activation:47895d07122a3d9827ecdf63",
+        "default_writer_readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
+        "local_root_canary_receipt_digest": "ea642b5606efc10adaf3671174b10e3df2f1a5f2dfc8b60a86b251db5845c938",
+        "production_activation_readback_receipt_digest": "98eb2d5f6a75f0e12b290836c72939c44bd03052f1d28257cae410ed30d25c06",
+        "production_canary_package_digest": "2533a3e5f22cc0c5e8bf2e7cd7114f33f2895d394da3f0ab69a9742205069f30",
+        "production_canary_repository": "NOirBRight/gwo-v8-canary",
+        "transition_record_id": "writer-transition:ce14291c00b0c5bfe7251729",
+        "writer_generation": "v8-generation-1",
+    }
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path / "conflicting-inputs",
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:foreign",
+                "canary_target_sha": "6" * 40,
+                "receipt_digest": "foreign-canary",
+            },
+            named_admission={"receipt_digest": "foreign-activation"},
+            default_writer={
+                "receipt_digest": "foreign-default",
+                "activation_id": "activation:foreign",
+                "writer_generation": "v8-generation-1",
+            },
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_IDENTITY_MISMATCH"
+
+
+def _rehash_metadata_bridge(bridge):
+    body = {key: value for key, value in bridge.items() if key != "bridge_digest"}
+    return body | {"bridge_digest": digest_value(body)}
+
+
+def _stable_bridge_digest(bridge):
+    body = {
+        key: value
+        for key, value in bridge.items()
+        if key not in {"bridge_digest", "release_subject"}
+    }
+    return digest_value(body)
+
+
+def _write_renderer_bridge_source(tmp_path, filename, payload):
+    path = tmp_path / filename
+    raw = verifier.canonical_json_bytes(payload)
+    path.write_bytes(raw)
+    return path, hashlib.sha256(raw).hexdigest()
+
+
+def _renderer_bridge_fixture(tmp_path):
+    repository = "NOirBRight/github-work-orchestrator"
+    activation_id = "activation:test"
+    writer_generation = "v8-generation-1"
+    previous_writer_generation = "v8-generation-1"
+    record_id = "writer-transition:test"
+    run_id = "phase5-production-activation-test"
+    plan_digest = "a" * 64
+    merged_main_sha = "b" * 40
+    merged_main_tree = "c" * 40
+    release_subject_digest = "d" * 64
+    activation_receipt_digest = "e" * 64
+    default_receipt_digest = "f" * 64
+    local_receipt_digest = "1" * 64
+    canary_package_digest = "2" * 64
+    canary_receipt_digest = "3" * 64
+    subject = {
+        "merged_main_sha": merged_main_sha,
+        "merged_main_tree": merged_main_tree,
+        "release_subject_digest": release_subject_digest,
+    }
+    control_ref = {
+        "branch": "gwo-control",
+        "commit_sha": "4" * 40,
+        "tree_sha": "5" * 40,
+    }
+    local_payload = {
+        "acceptance_mode": "local-only-v1",
+        "activation_id": "campaign:test",
+        "campaign_key": "campaign:test",
+        "canary_target_sha": "6" * 40,
+        "receipt_digest": local_receipt_digest,
+        "repository": repository,
+        "schema": "gwo-v8-root-canary-acceptance.v2",
+        "writer_generation": "writer:local",
+    }
+    canary_payload = {
+        "accepted": True,
+        "all_evidence_exact": True,
+        "blockers": [],
+        "coverage": [],
+        "evidence_readback_count": 19,
+        "evidence_ref_count": 19,
+        "evidence_refs": [],
+        "manifest_branch": "gwo-control",
+        "manifest_ref": f"github://canary-manifest/{canary_package_digest}",
+        "manifest_repository": "NOirBRight/gwo-v8-canary",
+        "manifest_sha256": canary_package_digest,
+        "node_keys": [],
+        "package_digest": canary_package_digest,
+        "package_repository": "NOirBRight/gwo-v8-canary",
+        "readback_verification_file_sha256": "7" * 64,
+        "readback_verification_schema": "gwo-v8-canary-readback-verification.v1",
+        "receipt_digest": canary_receipt_digest,
+        "repository": "NOirBRight/gwo-v8-canary",
+        "schema": "gwo-v8-production-canary-readback.v1",
+    }
+    activation_payload = {
+        "active_plan": {
+            "active_plan_digest": plan_digest,
+            "latest_activation_id": activation_id,
+            "latest_plan_digest": plan_digest,
+            "latest_plan_record_ref": "github://plan/test",
+        },
+        "authorization": {
+            "canary_repository": "NOirBRight/gwo-v8-canary",
+            "evidence_root": "D:\\evidence",
+            "merged_main_git_tree": merged_main_tree,
+            "merged_main_sha": merged_main_sha,
+            "release_subject_digest": release_subject_digest,
+            "repository": repository,
+            "run_id": run_id,
+            "target_repository": repository,
+            "target_writer_generation": writer_generation,
+            "writer_transition": "v6.1 -> v8",
+        },
+        "control_ref": control_ref,
+        "execute_outcome": {
+            "activation_id": activation_id,
+            "record_id": record_id,
+            "repository": repository,
+            "status": "cut_over",
+            "writer_generation": writer_generation,
+        },
+        "guard_receipt": {
+            "source_writer_generation": "v6.1",
+            "target_writer_generation": writer_generation,
+        },
+        "legacy_writer_fence": {"stopped": True},
+        "receipt_digest": activation_receipt_digest,
+        "release_subject": subject,
+        "repository": repository,
+        "schema": "gwo-v8-production-activation-readback.v1",
+        "transition_current": {
+            "record_id": record_id,
+            "repository": repository,
+            "writer_generation": writer_generation,
+        },
+        "transition_record": {
+            "activation_id": activation_id,
+            "canary_evidence_digest": canary_package_digest,
+            "canary_evidence_refs": [],
+            "canary_manifest_ref": canary_payload["manifest_ref"],
+            "canary_repository": canary_payload["package_repository"],
+            "plan_digest": plan_digest,
+            "previous_writer_generation": previous_writer_generation,
+            "record_id": record_id,
+            "repository": repository,
+            "status": "cut_over",
+            "writer_generation": writer_generation,
+        },
+    }
+    default_payload = {
+        "activation_id": activation_id,
+        "activation_readback_digest": activation_receipt_digest,
+        "campaign_key": None,
+        "control_ref": control_ref,
+        "legacy_writer_fence_stopped": True,
+        "mode": "default_v8",
+        "plan_digest": plan_digest,
+        "previous_writer_generation": previous_writer_generation,
+        "receipt_digest": default_receipt_digest,
+        "record_id": record_id,
+        "repository": repository,
+        "schema": "gwo-v8-default-writer-readback.v1",
+        "status": "cut_over",
+        "writer_generation": writer_generation,
+    }
+
+    sources = {}
+    source_payloads = {
+        "local_root_canary": ("root-canary-acceptance.json", local_payload),
+        "production_canary": ("production-canary-readback.json", canary_payload),
+        "production_activation": (
+            "production-activation-readback.json",
+            activation_payload,
+        ),
+        "default_writer": ("default-writer-readback.json", default_payload),
+    }
+    for section, (filename, payload) in source_payloads.items():
+        sources[section] = _write_renderer_bridge_source(tmp_path, filename, payload)
+
+    bridge = {
+        "default_writer": {
+            "activation_id": activation_id,
+            "legacy_writer_fence_stopped": True,
+            "previous_writer_generation": previous_writer_generation,
+            "readback_receipt_digest": default_receipt_digest,
+            "record_id": record_id,
+            "source_file": str(sources["default_writer"][0]),
+            "source_file_sha256": sources["default_writer"][1],
+            "writer_generation": writer_generation,
+        },
+        "activation_release_subject": subject,
+        "local_root_canary": {
+            "acceptance_mode": local_payload["acceptance_mode"],
+            "activation_id": local_payload["activation_id"],
+            "campaign_key": local_payload["campaign_key"],
+            "canary_target_sha": local_payload["canary_target_sha"],
+            "producer_receipt_digest": local_receipt_digest,
+            "repository": repository,
+            "schema": local_payload["schema"],
+            "source_file": str(sources["local_root_canary"][0]),
+            "source_file_sha256": sources["local_root_canary"][1],
+            "writer_generation": local_payload["writer_generation"],
+        },
+        "production_activation": {
+            "activation_id": activation_id,
+            "previous_writer_generation": previous_writer_generation,
+            "readback_receipt_digest": activation_receipt_digest,
+            "run_id": run_id,
+            "source_file": str(sources["production_activation"][0]),
+            "source_file_sha256": sources["production_activation"][1],
+            "transition_record_id": record_id,
+            "writer_generation": writer_generation,
+        },
+        "production_canary": {
+            "evidence_ref_count": canary_payload["evidence_ref_count"],
+            "manifest_ref": canary_payload["manifest_ref"],
+            "package_digest": canary_package_digest,
+            "package_repository": canary_payload["package_repository"],
+            "readback_receipt_digest": canary_receipt_digest,
+            "source_file": str(sources["production_canary"][0]),
+            "source_file_sha256": sources["production_canary"][1],
+        },
+        "release_subject": subject,
+        "repository": repository,
+        "schema": "gwo-v8-ga-evidence-bridge.v1",
+    }
+    return _rehash_metadata_bridge(bridge), source_payloads
+
+
+def _renderer_bridge_with_source_payload(
+    tmp_path, bridge, section, payload, *, filename=None, raw=None
+):
+    if filename is None:
+        filename = {
+            "local_root_canary": "root-canary-acceptance.json",
+            "production_canary": "production-canary-readback.json",
+            "production_activation": "production-activation-readback.json",
+            "default_writer": "default-writer-readback.json",
+        }[section]
+    path = tmp_path / filename
+    if raw is None:
+        raw = verifier.canonical_json_bytes(payload)
+    path.write_bytes(raw)
+    updated = json.loads(json.dumps(bridge))
+    updated[section]["source_file"] = str(path)
+    updated[section]["source_file_sha256"] = hashlib.sha256(raw).hexdigest()
+    return _rehash_metadata_bridge(updated)
+
+
+def _render_with_bridge(tmp_path, bridge):
+    return render_ga_documents(
+        tmp_path / "rendered",
+        evidence_base_sha="8" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        evidence_bridge=bridge,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "transition_previous_writer_generation",
+        "guard_source_writer_generation",
+        "schema",
+        "repository",
+        "receipt_digest",
+        "activation_id",
+        "record_id",
+    ],
+)
+def test_renderer_rejects_activation_source_binding_drift(tmp_path, change):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    payload = json.loads(json.dumps(source_payloads["production_activation"][1]))
+    if change == "transition_previous_writer_generation":
+        payload["transition_record"]["previous_writer_generation"] = "v6.1"
+    elif change == "guard_source_writer_generation":
+        payload["guard_receipt"]["source_writer_generation"] = "v8-generation-1"
+    elif change == "schema":
+        payload["schema"] = "foreign.activation.v1"
+    elif change == "repository":
+        payload["repository"] = "foreign/repository"
+    elif change == "receipt_digest":
+        payload["receipt_digest"] = "9" * 64
+    elif change == "activation_id":
+        payload["execute_outcome"]["activation_id"] = "activation:foreign"
+    else:
+        payload["transition_record"]["record_id"] = "writer-transition:foreign"
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path,
+        bridge,
+        "production_activation",
+        payload,
+    )
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema",
+        "repository",
+        "status",
+        "mode",
+        "writer_generation",
+        "activation_id",
+        "record_id",
+        "plan_digest",
+        "previous_writer_generation",
+        "receipt_digest",
+    ],
+)
+def test_renderer_rejects_default_writer_source_binding_drift(tmp_path, field):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    payload = json.loads(json.dumps(source_payloads["default_writer"][1]))
+    payload[field] = {
+        "schema": "foreign.default.v1",
+        "repository": "foreign/repository",
+        "status": "pending",
+        "mode": "legacy",
+        "writer_generation": "v6.1",
+        "activation_id": "activation:foreign",
+        "record_id": "writer-transition:foreign",
+        "plan_digest": "9" * 64,
+        "previous_writer_generation": "v6.1",
+        "receipt_digest": "9" * 64,
+    }[field]
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path,
+        bridge,
+        "default_writer",
+        payload,
+    )
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize(
+    ("section", "filename"),
+    [
+        ("production_activation", "not-the-activation-file.txt"),
+        ("default_writer", "not-the-default-writer-file.txt"),
+        ("local_root_canary", "not-the-root-canary-file.txt"),
+        ("production_canary", "not-the-production-canary-file.txt"),
+    ],
+)
+def test_renderer_rejects_role_mismatched_bridge_source_basename(
+    tmp_path, section, filename
+):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path,
+        bridge,
+        section,
+        source_payloads[section][1],
+        filename=filename,
+    )
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize(
+    "section", ("default_writer", "local_root_canary", "production_canary")
+)
+def test_renderer_rejects_noncanonical_bridge_source(tmp_path, section):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    payload = source_payloads[section][1]
+    raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path,
+        bridge,
+        section,
+        payload,
+        raw=raw,
+    )
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize(
+    "section", ("default_writer", "local_root_canary", "production_canary")
+)
+def test_renderer_rejects_bridge_source_hash_mismatch(tmp_path, section):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    bridge = json.loads(json.dumps(bridge))
+    path, _digest = _write_renderer_bridge_source(
+        tmp_path,
+        {
+            "local_root_canary": "root-canary-acceptance.json",
+            "production_canary": "production-canary-readback.json",
+            "default_writer": "default-writer-readback.json",
+        }[section],
+        source_payloads[section][1],
+    )
+    bridge[section]["source_file"] = str(path)
+    bridge[section]["source_file_sha256"] = "0" * 64
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+@pytest.mark.parametrize("section", ("local_root_canary", "production_canary"))
+def test_renderer_binds_non_activation_bridge_source_projection(tmp_path, section):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    payload = json.loads(json.dumps(source_payloads[section][1]))
+    if section == "local_root_canary":
+        payload["campaign_key"] = "campaign:foreign"
+    else:
+        payload["package_digest"] = "0" * 64
+    bridge = _renderer_bridge_with_source_payload(tmp_path, bridge, section, payload)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+def test_renderer_rejects_reparse_bridge_source(tmp_path):
+    bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
+    target = tmp_path / "real-production-activation.json"
+    raw = verifier.canonical_json_bytes(source_payloads["production_activation"][1])
+    target.write_bytes(raw)
+    link_dir = tmp_path / "linked-source"
+    link_dir.mkdir()
+    link = link_dir / "production-activation-readback.json"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"source symlinks are unavailable: {error}")
+    bridge = json.loads(json.dumps(bridge))
+    bridge["production_activation"]["source_file"] = str(link)
+    bridge["production_activation"]["source_file_sha256"] = hashlib.sha256(
+        raw
+    ).hexdigest()
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path, bridge)
+
+
+def test_renderer_accepts_bridge_derived_inputs_when_explicitly_repeated(tmp_path):
+    bridge = _load_renderer_bridge()
+    context = renderer._renderer_evidence_bridge_context(bridge)
+
+    render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        acceptance=context["acceptance"],
+        named_admission=context["named_admission"],
+        default_writer=context["default_writer"],
+        evidence_bridge=bridge,
+    )
+
+
+def _load_renderer_bridge():
+    path = Path(
+        r"D:\gwo-release-evidence\2026-08-19-gwo-v8-ga-production-cutover\ga-evidence-bridge.json"
+    )
+    if not path.exists():
+        pytest.skip(f"real derived evidence is required: {path}")
+    bridge = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        "activation_release_subject" not in bridge
+        or "previous_writer_generation" not in bridge.get("default_writer", {})
+    ):
+        pytest.skip("real bridge predates the renderer bridge contract")
+    return bridge
+
+
+def test_renderer_rejects_bridge_activation_lineage_drift(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["production_activation"] = {
+        **bridge["production_activation"],
+        "previous_writer_generation": "v6.1",
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID"
+
+
+def test_renderer_rejects_activation_subject_not_authorized_by_readback(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["activation_release_subject"]["merged_main_sha"] = "0" * 40
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_IDENTITY_MISMATCH"
+
+
+def test_renderer_rejects_activation_readback_source_digest_mismatch(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["production_activation"] = {
+        **bridge["production_activation"],
+        "source_file_sha256": "0" * 64,
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_DIGEST_MISMATCH"
+
+
+def test_renderer_preserves_activation_subject_when_final_subject_moves(tmp_path):
+    bridge = _load_renderer_bridge()
+    activation_subject = dict(bridge["activation_release_subject"])
+    stable_bridge_digest = _stable_bridge_digest(bridge)
+    bridge["release_subject"] = {
+        "merged_main_sha": "a" * 40,
+        "merged_main_tree": "b" * 40,
+        "release_subject_digest": "c" * 64,
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    paths = render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        evidence_bridge=bridge,
+    )
+    payload = json.loads(
+        paths[1]
+        .read_text(encoding="utf-8")
+        .split("```json\n", 1)[1]
+        .split("\n```\n", 1)[0]
+    )
+
+    assert payload["evidence_bridge_activation_subject"] == activation_subject
+    assert payload["evidence_bridge_digest"] == stable_bridge_digest
+    assert "evidence_bridge" not in payload
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "a" * 40 not in serialized
+    assert "b" * 40 not in serialized
+    assert "c" * 64 not in serialized
+
+
 def test_renderer_labels_repository_verification_local_only(tmp_path):
     paths = render_ga_documents(
         tmp_path,
@@ -1500,7 +2171,9 @@ def test_renderer_cross_binds_named_admission_identity(tmp_path):
 
 def test_renderer_syncs_staged_documents_before_publication(tmp_path, monkeypatch):
     fsync_calls = []
-    monkeypatch.setattr(renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+    monkeypatch.setattr(
+        renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor)
+    )
 
     render_ga_documents(
         tmp_path,
@@ -1590,9 +2263,7 @@ def test_post_release_rechecks_pre_tag_commit_tree_invariants_before_archive(
         tmp_path / "record.json", CompleteReleaseFixture()
     )
     pre_tag = tmp_path / "pre-tag.json"
-    pre_tag.write_bytes(
-        verifier.canonical_json_bytes(_post_release_receipt_payload())
-    )
+    pre_tag.write_bytes(verifier.canonical_json_bytes(_post_release_receipt_payload()))
 
     class FakeGit:
         repository = "NOirBRight/github-work-orchestrator"
@@ -1642,9 +2313,7 @@ def test_post_release_archives_tag_subject_by_immutable_commit_sha(
         tmp_path / "record.json", CompleteReleaseFixture()
     )
     pre_tag = tmp_path / "pre-tag.json"
-    pre_tag.write_bytes(
-        verifier.canonical_json_bytes(_post_release_receipt_payload())
-    )
+    pre_tag.write_bytes(verifier.canonical_json_bytes(_post_release_receipt_payload()))
     archived_subjects: list[str] = []
 
     class FakeGit:
