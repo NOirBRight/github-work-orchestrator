@@ -120,6 +120,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "repository",
                 "writer_generation",
                 "plan_digest",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -145,6 +146,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "repository",
                 "activation_id",
                 "plan_digest",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -172,6 +174,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "writer_generation",
                 "activation_id",
                 "plan_digest",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -201,6 +204,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "status",
                 "previous_writer_generation",
                 "writer_generation",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -230,6 +234,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "status",
                 "previous_writer_generation",
                 "writer_generation",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -253,6 +258,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
                 "repository",
                 "activation_id",
                 "plan_digest",
+                "canary_repository",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
                 "worker_capacity",
@@ -291,6 +297,7 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
             {
                 "writer_generation",
                 "plan_digest",
+                "canary_repository",
                 "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
@@ -2374,6 +2381,7 @@ class GitHubPlanRepository:
                 list(record.canary_evidence_refs)
             ),
             "canary_manifest_ref": record.canary_manifest_ref or "",
+            "canary_repository": record.canary_repository or "",
         }
 
     def _decode_writer_records(
@@ -2389,7 +2397,20 @@ class GitHubPlanRepository:
         decoded: list[WriterTransitionRecord] = []
         try:
             for item in records:
-                raw = _exact(item, fields, "Writer Transition Record")
+                if type(item) is not dict:
+                    raise PlanControlError(
+                        "DURABLE_STATE_INVALID",
+                        "Durable Writer Transition Record has an unknown schema",
+                    )
+                record_fields = (
+                    fields
+                    if "canary_repository" in item
+                    else fields - {"canary_repository"}
+                )
+                raw = {
+                    **_exact(item, record_fields, "Writer Transition Record"),
+                    "canary_repository": item.get("canary_repository"),
+                }
                 refs = raw["canary_evidence_refs"]
                 if type(refs) is not list:
                     raise TypeError("Writer Transition Record references")
@@ -2753,6 +2774,10 @@ class GitHubPlanRepository:
             or (record.plan_digest is not None and not _is_digest(record.plan_digest))
             or (record.canary_evidence_digest is not None and not _is_digest(record.canary_evidence_digest))
             or (record.canary_manifest_ref is not None and not _nonempty_text(record.canary_manifest_ref))
+            or (
+                record.canary_repository is not None
+                and not _nonempty_text(record.canary_repository)
+            )
             or (record.reason is not None and not _nonempty_text(record.reason))
         ):
             raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer Transition Record has invalid closed fields")
@@ -2771,6 +2796,8 @@ class GitHubPlanRepository:
             "coordinator_capacity": record.coordinator_capacity,
             "reason": record.reason,
         }
+        if record.canary_repository is not None:
+            identity["canary_repository"] = record.canary_repository
         if record.record_id != f"writer-transition:{digest_value(identity)[:24]}":
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",

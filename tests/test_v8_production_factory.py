@@ -55,6 +55,7 @@ from tests.cutover_guard_test_support import GuardHarness  # noqa: E402
 
 
 REPOSITORY = "NOirBRight/github-work-orchestrator"
+CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 
 
 def _create_store(path: Path) -> None:
@@ -145,7 +146,11 @@ def _config(
     )
 
 
-def _authorization(*, target_repository: str = REPOSITORY):
+def _authorization(
+    *,
+    target_repository: str = REPOSITORY,
+    canary_repository: str | None = None,
+):
     return ProductionActivationAuthorization(
         run_id="phase5-factory-test",
         repository=REPOSITORY,
@@ -154,6 +159,7 @@ def _authorization(*, target_repository: str = REPOSITORY):
         release_subject_digest="c" * 64,
         evidence_root="D:/evidence",
         target_repository=target_repository,
+        canary_repository=canary_repository,
         writer_transition="v6.1 -> v8",
         target_writer_generation="v8",
     )
@@ -278,6 +284,115 @@ def test_factory_rejects_disjoint_activation_identity_before_store_access(
         _compose(factory, authorization=_authorization(target_repository="other/repo"))
 
     assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+@pytest.mark.parametrize(
+    ("configured_canary_repository", "canary_repository"),
+    (
+        (CANARY_REPOSITORY, CANARY_REPOSITORY),
+        (None, CANARY_REPOSITORY),
+        (CANARY_REPOSITORY, REPOSITORY),
+    ),
+)
+def test_factory_requires_exact_named_canary_repository_identity(
+    tmp_path,
+    monkeypatch,
+    configured_canary_repository,
+    canary_repository,
+):
+    _install_test_live_guard(monkeypatch)
+    config = _config(tmp_path)
+    if configured_canary_repository is not None:
+        config = replace(
+            config,
+            canary_repository=configured_canary_repository,
+        )
+    canary = replace(_canary(), repository=canary_repository)
+    authorization = _authorization(
+        canary_repository=configured_canary_repository,
+    )
+
+    if configured_canary_repository == canary_repository:
+        composition = _compose(
+            ProductionActivationCompositionFactory(config),
+            authorization=authorization,
+            canary=canary,
+        )
+
+        assert (
+            composition.canary_evidence_control.manifest_repository
+            == CANARY_REPOSITORY
+        )
+    else:
+        with pytest.raises(ProductionCompositionError) as raised:
+            _compose(
+                ProductionActivationCompositionFactory(config),
+                authorization=authorization,
+                canary=canary,
+            )
+
+        assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+def test_factory_rejects_canary_location_repository_disjoint_from_named_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _install_test_live_guard(monkeypatch)
+    config = replace(
+        _config(tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+        canary_locations=(
+            (
+                "github://canary/evidence",
+                REPOSITORY,
+                "gwo-control",
+                ".gwo-v8/evidence.json",
+            ),
+        ),
+    )
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(config),
+            canary=replace(_canary(), repository=CANARY_REPOSITORY),
+        )
+
+    assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+def test_factory_requires_configured_canary_to_match_owner_canary_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _install_test_live_guard(monkeypatch)
+    config = replace(_config(tmp_path), canary_repository=CANARY_REPOSITORY)
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(config),
+            canary=replace(_canary(), repository=CANARY_REPOSITORY),
+        )
+
+    assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+def test_factory_composition_exports_external_expected_canary_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _install_test_live_guard(monkeypatch)
+    config = replace(_config(tmp_path), canary_repository=CANARY_REPOSITORY)
+    authorization = _authorization(canary_repository=CANARY_REPOSITORY)
+    canary = replace(_canary(), repository=CANARY_REPOSITORY)
+
+    composition = _compose(
+        ProductionActivationCompositionFactory(config),
+        authorization=authorization,
+        canary=canary,
+    )
+
+    assert composition.expected_canary_repository == CANARY_REPOSITORY
 
 
 def test_factory_rejects_a_guard_receipt_bound_to_another_subject_before_store_access(

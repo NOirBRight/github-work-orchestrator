@@ -67,6 +67,7 @@ _AUTHORIZATION_KEYS = frozenset(
         "release_subject_digest",
         "evidence_root",
         "target_repository",
+        "canary_repository",
         "writer_transition",
         "target_writer_generation",
     }
@@ -377,6 +378,7 @@ def _validate_authorization_receipt_identity(
         or receipt.release_subject_digest != authorization.release_subject_digest
         or receipt.evidence_root != authorization.evidence_root
         or receipt.target_repository != authorization.target_repository
+        or receipt.canary_repository != authorization.canary_repository
         or receipt.writer_transition != authorization.writer_transition
         or receipt.target_writer_generation
         != authorization.target_writer_generation
@@ -401,6 +403,7 @@ def _validate_bundle_identity(
         or receipt.release_subject_digest != authorization.release_subject_digest
         or receipt.evidence_root != authorization.evidence_root
         or receipt.target_repository != authorization.target_repository
+        or receipt.canary_repository != authorization.canary_repository
         or receipt.writer_transition != authorization.writer_transition
         or receipt.target_writer_generation
         != authorization.target_writer_generation
@@ -495,6 +498,7 @@ def run_production_activation(
             bundle.authorization_receipt,
         ),
         canary_evidence_control=composition.canary_evidence_control,
+        expected_canary_repository=composition.expected_canary_repository,
     )
     preflight = facade.preflight(bundle.request)
     outcome = None

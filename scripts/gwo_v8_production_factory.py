@@ -188,6 +188,7 @@ class ProductionCompositionConfig:
     store_path: Path
     rollback_lineage: RollbackLineage
     target_repository: str | None = None
+    canary_repository: str | None = None
     control_branch: str = "gwo-control"
     store_generation: str | None = None
     source_writer_generation: str | None = None
@@ -219,6 +220,7 @@ class ProductionCompositionConfig:
                 raise ValueError(f"{name} is required")
         for name in (
             "target_repository",
+            "canary_repository",
             "store_generation",
             "source_writer_generation",
             "target_writer_generation",
@@ -523,6 +525,27 @@ def _validate_identity(
         if config.store_generation is not None
         else subject.store_generation
     )
+    expected_canary = (
+        config.canary_repository
+        if config.canary_repository is not None
+        else authorization.canary_repository
+    )
+    if (
+        config.canary_repository is not None
+        and config.canary_repository != authorization.canary_repository
+    ):
+        raise _error(
+            "FACTORY_IDENTITY_DISJOINT",
+            "configured Canary repository is not authorized",
+        )
+    if any(
+        location[1] != expected_canary
+        for location in config.canary_locations
+    ):
+        raise _error(
+            "FACTORY_IDENTITY_DISJOINT",
+            "Canary evidence locations are not bound to the named Canary repository",
+        )
     if expected_source != EXPECTED_SOURCE_WRITER_GENERATION:
         raise _error(
             "FACTORY_IDENTITY_DISJOINT",
@@ -530,7 +553,7 @@ def _validate_identity(
         )
     if (
         compiled_plan.repository != target
-        or canary.repository != target
+        or canary.repository != expected_canary
         or subject.repository != target
         or receipt.repository != target
         or subject.control_branch != config.control_branch
@@ -832,6 +855,11 @@ class ProductionActivationCompositionFactory:
             publication=publication,
             guard=guard,
         )
+        expected_canary = (
+            config.canary_repository
+            if config.canary_repository is not None
+            else authorization.canary_repository
+        )
         locations = {
             source_ref: (repository, branch, path)
             for source_ref, repository, branch, path in config.canary_locations
@@ -839,12 +867,13 @@ class ProductionActivationCompositionFactory:
         canary_control = GitHubCanaryEvidenceControl(
             client,
             locations,
-            manifest_repository=authorization.target_repository,
+            manifest_repository=expected_canary,
             manifest_branch=config.control_branch,
         )
         composition = ProductionActivationComposition(
             controller=controller,
             canary_evidence_control=canary_control,
+            expected_canary_repository=expected_canary,
         )
         if type(composition) is not ProductionActivationComposition:
             raise _error(

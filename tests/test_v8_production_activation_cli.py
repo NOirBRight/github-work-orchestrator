@@ -21,7 +21,11 @@ from gwo_v8.production_activation import (  # noqa: E402
     ProductionActivationError,
     ProductionActivationRequest,
 )
-from gwo_v8.transition import CanaryAcceptance  # noqa: E402
+from gwo_v8.transition import (  # noqa: E402
+    CanaryAcceptance,
+    CanaryRunVerifier,
+    InMemoryCanaryEvidenceControl,
+)
 import run_v8_production_activation as activation_cli  # noqa: E402
 from run_v8_production_activation import (  # noqa: E402
     build_activation_bundle,
@@ -31,6 +35,7 @@ from tests.cutover_guard_test_support import activation_fixture  # noqa: E402
 
 
 RELEASE_SUBJECT_DIGEST = "d" * 64
+CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 
 
 def _authorization(fixture, tmp_path):
@@ -77,8 +82,10 @@ def _request(fixture, authorization):
     )
 
 
-def _payload(fixture, authorization, receipt):
+def _payload(fixture, authorization, receipt, *, canary=None):
     request = _request(fixture, authorization)
+    if canary is not None:
+        request = replace(request, canary=canary)
     return {
         "authorization": authorization.canonical(),
         "authorization_receipt": receipt.canonical(),
@@ -98,16 +105,34 @@ def _payload(fixture, authorization, receipt):
     }
 
 
+def _external_canary():
+    from test_orchestrator_v8_phase4bc import _accepted_canary
+
+    readback = _accepted_canary(repository=CANARY_REPOSITORY)
+    evidence = (
+        *readback.scenario_evidence.values(),
+        *readback.candidate_evidence.values(),
+        *readback.review_evidence.values(),
+    )
+    control = InMemoryCanaryEvidenceControl(tuple(evidence))
+    return CanaryRunVerifier(control).verify(readback), control
+
+
 class _Factory:
-    def __init__(self, fixture):
+    def __init__(self, fixture, *, canary_evidence_control=None):
         self.fixture = fixture
+        self.canary_evidence_control = canary_evidence_control
         self.calls: list[dict[str, object]] = []
 
     def compose(self, **values: object) -> ProductionActivationComposition:
         self.calls.append(values)
         return ProductionActivationComposition(
             controller=self.fixture.controller,
-            canary_evidence_control=self.fixture.canary_evidence_control,
+            canary_evidence_control=(
+                self.fixture.canary_evidence_control
+                if self.canary_evidence_control is None
+                else self.canary_evidence_control
+            ),
         )
 
 
@@ -145,6 +170,29 @@ def test_activation_bundle_builds_all_typed_inputs_and_controller_wiring(tmp_pat
     assert type(result.composition.controller).__name__ == "WriterCutoverController"
 
 
+def test_cli_preserves_named_external_canary_through_composition_wiring(tmp_path):
+    fixture = activation_fixture(tmp_path)
+    authorization = replace(
+        _authorization(fixture, tmp_path),
+        canary_repository=CANARY_REPOSITORY,
+    )
+    receipt = _authorization_receipt(authorization)
+    canary, canary_control = _external_canary()
+    bundle = build_activation_bundle(
+        _payload(fixture, authorization, receipt, canary=canary),
+    )
+    factory = _Factory(
+        fixture,
+        canary_evidence_control=canary_control,
+    )
+
+    result = run_production_activation(bundle, factory=factory, execute=False)
+
+    assert factory.calls[0]["canary"] == canary
+    assert result.preflight.canary_evidence_digest == canary.evidence_package_digest
+    assert result.preflight.current_writer.repository == fixture.repository
+
+
 def test_activation_bundle_rejects_tampered_owner_identity_before_factory(tmp_path):
     fixture = activation_fixture(tmp_path)
     authorization = _authorization(fixture, tmp_path)
@@ -159,6 +207,21 @@ def test_activation_bundle_rejects_tampered_owner_identity_before_factory(tmp_pa
         build_activation_bundle(payload)
 
     assert raised.value.code == "AUTHORIZATION_IDENTITY_INVALID"
+
+
+def test_cli_requires_explicit_canary_repository_in_closed_authorization_schema(
+    tmp_path,
+):
+    fixture = activation_fixture(tmp_path)
+    authorization = _authorization(fixture, tmp_path)
+    receipt = _authorization_receipt(authorization)
+    payload = _payload(fixture, authorization, receipt)
+    payload["authorization"].pop("canary_repository", None)
+
+    with pytest.raises(ProductionActivationError) as raised:
+        build_activation_bundle(payload)
+
+    assert raised.value.code == "ACTIVATION_INPUT_INVALID"
 
 
 def test_preflight_mode_does_not_call_controller_mutation(tmp_path):

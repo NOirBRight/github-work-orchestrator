@@ -680,6 +680,7 @@ class WriterTransitionRecord:
     coordinator_capacity: int
     reason: str | None
     created_at: str
+    canary_repository: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1110,7 @@ class GitHubWriterTransitionControl:
         try:
             normalized = {
                 **value,
+                "canary_repository": value.get("canary_repository"),
                 "canary_evidence_refs": tuple(
                     value.get("canary_evidence_refs") or ()
                 ),
@@ -1379,6 +1381,7 @@ def _record(
     worker_capacity: int,
     coordinator_capacity: int,
     reason: str | None,
+    canary_repository: str | None = None,
 ) -> WriterTransitionRecord:
     identity = {
         "repository": repository,
@@ -1395,6 +1398,8 @@ def _record(
         "coordinator_capacity": coordinator_capacity,
         "reason": reason,
     }
+    if canary_repository is not None:
+        identity["canary_repository"] = canary_repository
     return WriterTransitionRecord(
         record_id=f"writer-transition:{digest_value(identity)[:24]}",
         created_at=_now(),
@@ -1583,6 +1588,7 @@ class WriterCutoverController:
                 and existing.plan_digest == compiled_plan.digest
                 and existing.canary_evidence_digest
                 == canary.evidence_package_digest
+                and existing.canary_repository == canary.repository
                 and existing.worker_capacity == worker_capacity
                 and existing.coordinator_capacity == coordinator_capacity
             ):
@@ -1618,6 +1624,7 @@ class WriterCutoverController:
                 canary_evidence_digest=canary.evidence_package_digest,
                 canary_evidence_refs=canary.evidence_refs,
                 canary_manifest_ref=canary.manifest_ref,
+                canary_repository=canary.repository,
                 worker_capacity=0,
                 coordinator_capacity=0,
                 reason=";".join(ordered),
@@ -1651,6 +1658,7 @@ class WriterCutoverController:
             and existing.plan_digest == compiled_plan.digest
             and existing.canary_evidence_digest
             == canary.evidence_package_digest
+            and existing.canary_repository == canary.repository
             and existing.canary_manifest_ref == canary.manifest_ref
         )
         if current.writer_generation != "v6.1" and not resuming_pending:
@@ -1809,6 +1817,7 @@ class WriterCutoverController:
                 canary_evidence_digest=canary.evidence_package_digest,
                 canary_evidence_refs=canary.evidence_refs,
                 canary_manifest_ref=canary.manifest_ref,
+                canary_repository=canary.repository,
                 worker_capacity=0,
                 coordinator_capacity=0,
                 reason=None,
@@ -1852,6 +1861,7 @@ class WriterCutoverController:
             canary_evidence_digest=canary.evidence_package_digest,
             canary_evidence_refs=canary.evidence_refs,
             canary_manifest_ref=canary.manifest_ref,
+            canary_repository=canary.repository,
             worker_capacity=worker_capacity,
             coordinator_capacity=coordinator_capacity,
             reason=None,
@@ -2012,6 +2022,7 @@ class WriterCutoverController:
                     ),
                     canary_evidence_refs=current_record.canary_evidence_refs,
                     canary_manifest_ref=current_record.canary_manifest_ref,
+                    canary_repository=current_record.canary_repository,
                     worker_capacity=0,
                     coordinator_capacity=0,
                     reason=drain_reason,
@@ -2122,6 +2133,11 @@ class WriterCutoverController:
                 if current_record is None
                 else current_record.canary_manifest_ref
             ),
+            canary_repository=(
+                None
+                if current_record is None
+                else current_record.canary_repository
+            ),
             worker_capacity=0,
             coordinator_capacity=0,
             reason=reason if not blockers else ";".join(sorted(blockers)),
@@ -2144,6 +2160,7 @@ class WriterCutoverController:
                     canary_evidence_digest=None,
                     canary_evidence_refs=record.canary_evidence_refs,
                     canary_manifest_ref=record.canary_manifest_ref,
+                    canary_repository=record.canary_repository,
                     worker_capacity=0,
                     coordinator_capacity=0,
                     reason="V61_RESTORE_READBACK_FAILED",
