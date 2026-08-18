@@ -951,7 +951,9 @@ def _canonical_full_pytest_count(raw: Mapping[str, object]) -> int:
 
     if not candidates:
         raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISSING")
-    return candidates[-1]
+    if any(count != candidates[0] for count in candidates[1:]):
+        raise ReleaseGateError("GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH")
+    return candidates[0]
 
 
 @dataclass(frozen=True, slots=True)

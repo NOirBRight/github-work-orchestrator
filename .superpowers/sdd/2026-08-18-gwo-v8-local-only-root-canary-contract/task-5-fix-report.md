@@ -66,3 +66,45 @@ PASS
   cleanup after successful runs; all listed pytest commands returned exit 0.
 - No root verifier/runner changes, production mutation, activation, tag,
   merge, push, or agent dispatch was performed.
+
+## Bounded GA parser conflict fix
+
+The reviewed release-parser P1 was that canonical local verification collected
+`full_suite`, `full_pytest`, and designated full-command counts but returned the
+last count, allowing conflicting evidence to pass based on field order. The
+minimum fix now rejects any disagreement with the existing
+`GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH` rule and returns the shared count
+only when all candidates agree. Hosted-CI parsing and the existing per-result,
+summary/log, chunk, and command-representation conflict rules are unchanged.
+
+### TDD evidence
+
+**RED** — before the parser change:
+
+```text
+py -3.13 -m pytest tests/test_v8_release_metadata.py -k conflicting_full_pytest_counts -q
+1 failed, 168 deselected
+```
+
+The regression failed because conflicting counts were accepted instead of
+raising `GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH`.
+
+**GREEN and focused checks**:
+
+```text
+py -3.13 -m pytest tests/test_v8_release_metadata.py -k conflicting_full_pytest_counts -q
+1 passed, 168 deselected
+
+py -3.13 -m pytest tests/test_v8_release_metadata.py -q
+169 passed
+
+py -3.13 -m ruff check --isolated --no-cache scripts/verify_v8_ga_release.py tests/test_v8_release_metadata.py
+All checks passed!
+
+git diff --check -- scripts/verify_v8_ga_release.py tests/test_v8_release_metadata.py
+PASS
+```
+
+Only the release parser, release metadata test, and this report are in the
+bounded fix scope. No root verifier/runner files, production state, merge,
+push, or tag were changed.

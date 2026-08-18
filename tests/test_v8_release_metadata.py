@@ -1084,6 +1084,32 @@ def test_canonical_local_verification_rejects_conflicting_command_representation
     assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_FAILED"
 
 
+def test_canonical_local_verification_rejects_conflicting_full_pytest_counts(
+    tmp_path,
+):
+    def result(count: int) -> dict[str, object]:
+        return {
+            "arguments": ["-m", "pytest", "-q"],
+            "exit_code": 0,
+            "status": "passed",
+            "passed": count,
+            "summary": f"{count} passed in 1.0s",
+        }
+
+    manifest = _canonical_local_verification_manifest(
+        full_suite=result(40),
+        full_pytest=result(41),
+        commands=[{**result(42), "name": "full"}],
+    )
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    with pytest.raises(ReleaseGateError) as error:
+        verifier.load_local_verification(path)
+
+    assert error.value.code == "GA_LOCAL_VERIFICATION_PYTEST_COUNT_MISMATCH"
+
+
 @pytest.mark.parametrize("missing", ["status", "passed"])
 def test_canonical_local_verification_requires_full_pytest_result_fields(
     tmp_path, missing
