@@ -38,6 +38,42 @@ def _local_source_case(tmp_path: Path, mutate) -> tuple[object, ...]:
     return record, mutated, activation, admission, mutated_bridge, local, git
 
 
+def _producer_source_case(
+    tmp_path: Path, section: str, mutate
+) -> tuple[object, ...]:
+    record, canary, activation, admission, bridge, local, git = _case(tmp_path)
+    payloads = {
+        "production_activation": deepcopy(activation),
+        "default_writer": deepcopy(admission),
+        "production_canary": json.loads(
+            Path(bridge.production_canary["source_file"]).read_text(encoding="utf-8")
+        ),
+    }
+    payload = payloads[section]
+    mutate(payload)
+    filename = {
+        "production_activation": "production-activation-readback.json",
+        "default_writer": "default-writer-readback.json",
+        "production_canary": "production-canary-readback.json",
+    }[section]
+    raw = verifier.canonical_json_bytes(payload)
+    source = tmp_path / filename
+    source.write_bytes(raw)
+
+    bridge_payload = bridge.to_mapping()
+    bridge_payload[section] = {
+        **bridge_payload[section],
+        "source_file": str(source),
+        "source_file_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    mutated_bridge = GaEvidenceBridge.from_mapping(_rehash_bridge(bridge_payload))
+    if section == "production_activation":
+        activation = payload
+    elif section == "default_writer":
+        admission = payload
+    return record, canary, activation, admission, mutated_bridge, local, git
+
+
 def _verify_bridge(case: tuple[object, ...]):
     record, canary, activation, admission, bridge, local, git = case
     return verifier.verify_pre_tag(
@@ -69,6 +105,72 @@ def test_bridge_recomputes_the_complete_local_root_receipt_digest(tmp_path, muta
         _verify_bridge(case)
 
     assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("section", "mutate"),
+    [
+        (
+            "production_activation",
+            lambda payload: payload["execute_outcome"].update(
+                {"unbound_field": "tampered"}
+            ),
+        ),
+        (
+            "default_writer",
+            lambda payload: payload.update({"unbound_field": "tampered"}),
+        ),
+        (
+            "production_canary",
+            lambda payload: payload["node_keys"].append("unbound-node"),
+        ),
+    ],
+)
+def test_bridge_recomputes_each_producer_receipt_digest(
+    tmp_path, section, mutate
+):
+    case = _producer_source_case(tmp_path, section, mutate)
+
+    with pytest.raises(ReleaseGateError) as error:
+        _verify_bridge(case)
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
+
+
+def test_bridge_pre_tag_accepts_only_the_canonical_local_verification_mode(tmp_path):
+    case = list(_case(tmp_path))
+    case[5] = replace(case[5], verification_mode="local-only")
+
+    with pytest.raises(ReleaseGateError) as error:
+        _verify_bridge(tuple(case))
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_VERIFICATION_INVALID"
+
+
+def test_loader_retains_historical_local_verification_mode_alias(tmp_path):
+    manifest = {
+        "schema": "gwo-c1-local-verification.v2",
+        "mode": "local-only",
+        "subject_sha": "3" * 40,
+        "subject_tree": "a" * 40,
+        "workflow_count": 0,
+        "final_outcome": "pass",
+        "commands": [
+            {
+                "name": "full",
+                "exit_code": 0,
+                "status": "passed",
+                "passed": 42,
+                "summary": "42 passed in 1.0s",
+            }
+        ],
+    }
+    path = tmp_path / "local-verification.json"
+    path.write_bytes(verifier.canonical_json_bytes(manifest))
+
+    readback = verifier.load_local_verification(path)
+
+    assert readback.verification_mode == "local-only"
 
 
 @pytest.mark.parametrize("field", ("hosted_ci", "pr", "remote", "publication"))

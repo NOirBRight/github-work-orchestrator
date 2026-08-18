@@ -193,6 +193,69 @@ _LOCAL_ROOT_SOURCE_FIELDS = frozenset(
 _LOCAL_ROOT_BATCH_FIELDS = frozenset(
     {"batch_id", "batch_sha", "member_count", "receipt_digest", "target_sha"}
 )
+_PRODUCTION_ACTIVATION_RECEIPT_FIELDS = frozenset(
+    {
+        "active_plan",
+        "authorization",
+        "authorization_receipt_digest",
+        "control_ref",
+        "execute_outcome",
+        "guard_receipt",
+        "legacy_writer_fence",
+        "receipt_digest",
+        "release_subject",
+        "repository",
+        "schema",
+        "transition_current",
+        "transition_record",
+    }
+)
+_DEFAULT_WRITER_RECEIPT_FIELDS = frozenset(
+    {
+        "activation_id",
+        "activation_readback_digest",
+        "authorization_receipt_digest",
+        "campaign_key",
+        "canary_evidence_digest",
+        "canary_manifest_ref",
+        "canary_repository",
+        "control_ref",
+        "kind",
+        "legacy_writer_fence_stopped",
+        "mode",
+        "plan_digest",
+        "previous_writer_generation",
+        "receipt_digest",
+        "record_id",
+        "repository",
+        "schema",
+        "status",
+        "writer_generation",
+    }
+)
+_PRODUCTION_CANARY_RECEIPT_FIELDS = frozenset(
+    {
+        "accepted",
+        "all_evidence_exact",
+        "blockers",
+        "coverage",
+        "evidence_readback_count",
+        "evidence_ref_count",
+        "evidence_refs",
+        "manifest_branch",
+        "manifest_ref",
+        "manifest_repository",
+        "manifest_sha256",
+        "node_keys",
+        "package_digest",
+        "package_repository",
+        "readback_verification_file_sha256",
+        "readback_verification_schema",
+        "receipt_digest",
+        "repository",
+        "schema",
+    }
+)
 
 
 class ReleaseGateError(RuntimeError):
@@ -293,8 +356,8 @@ class GaEvidenceBridge:
     ``root-canary-acceptance.json`` is a local-only producer receipt.  The
     production activation and canary package are separate readbacks and have
     separate identities.  The bridge therefore stores source-file hashes and
-    only the fields needed to join those three evidence streams; it does not
-    pretend that their producer receipts are canonical JSON digests.
+    only the fields needed to join those three evidence streams; the verifier
+    rebuilds each producer receipt digest from its source readback.
     """
 
     repository: str
@@ -1857,6 +1920,44 @@ def _bridge_source_readback(
     return supplied_payload
 
 
+def _verify_bridge_producer_receipt_digest(
+    payload: Mapping[str, object], fields: frozenset[str]
+) -> str:
+    if type(payload) is not dict or set(payload) != fields:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    claimed = payload.get("receipt_digest")
+    body = {key: value for key, value in payload.items() if key != "receipt_digest"}
+    try:
+        expected = digest_value(body)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH") from error
+    if type(claimed) is not str or claimed != expected:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return claimed
+
+
+def _verify_bridge_production_activation_receipt(
+    payload: Mapping[str, object],
+) -> str:
+    return _verify_bridge_producer_receipt_digest(
+        payload, _PRODUCTION_ACTIVATION_RECEIPT_FIELDS
+    )
+
+
+def _verify_bridge_default_writer_receipt(payload: Mapping[str, object]) -> str:
+    return _verify_bridge_producer_receipt_digest(
+        payload, _DEFAULT_WRITER_RECEIPT_FIELDS
+    )
+
+
+def _verify_bridge_production_canary_receipt(
+    payload: Mapping[str, object],
+) -> str:
+    return _verify_bridge_producer_receipt_digest(
+        payload, _PRODUCTION_CANARY_RECEIPT_FIELDS
+    )
+
+
 def _bridge_required_sha(payload: Mapping[str, object], name: str, code: str) -> str:
     value = _bridge_text_field(payload, name, code)
     try:
@@ -2074,30 +2175,11 @@ def _verify_bridge_external_canary(
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     if hashlib.sha256(raw).hexdigest() != source_sha:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
-    expected_fields = {
-        "accepted",
-        "all_evidence_exact",
-        "blockers",
-        "coverage",
-        "evidence_readback_count",
-        "evidence_ref_count",
-        "evidence_refs",
-        "manifest_branch",
-        "manifest_ref",
-        "manifest_repository",
-        "manifest_sha256",
-        "node_keys",
-        "package_digest",
-        "package_repository",
-        "readback_verification_file_sha256",
-        "readback_verification_schema",
-        "receipt_digest",
-        "repository",
-        "schema",
-    }
+    expected_fields = _PRODUCTION_CANARY_RECEIPT_FIELDS
     if set(payload) != expected_fields:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     package_payload = dict(payload)
+    _verify_bridge_production_canary_receipt(package_payload)
     if (
         package_payload["schema"] != "gwo-v8-production-canary-readback.v1"
         or package_payload["repository"] != PRODUCTION_CANARY_REPOSITORY
@@ -2170,7 +2252,10 @@ def _verify_pre_tag_bridge(
     bridge = GaEvidenceBridge.from_mapping(evidence_bridge.to_mapping())
     if bridge.repository != record.repository:
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
-    if local_verification.verification_mode not in _LOCAL_VERIFICATION_MODES:
+    if (
+        local_verification.verification_mode
+        != _CANONICAL_LOCAL_VERIFICATION_MODE
+    ):
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_VERIFICATION_INVALID")
 
     local_section = bridge.local_root_canary
@@ -2185,6 +2270,8 @@ def _verify_pre_tag_bridge(
     admission_payload = _bridge_source_readback(
         default_section, admission, "default-writer-readback.json"
     )
+    _verify_bridge_production_activation_receipt(activation_payload)
+    _verify_bridge_default_writer_receipt(admission_payload)
     _verify_bridge_local_root_receipt(local_payload)
 
     local_campaign = _bridge_text_field(
@@ -2891,6 +2978,17 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                     "GA_LOCAL_VERIFICATION_REQUIRED",
                 )
             )
+            if (
+                args.evidence_bridge is not None
+                and local_verification.verification_mode
+                != _CANONICAL_LOCAL_VERIFICATION_MODE
+            ):
+                # Keep the loader's historical aliases readable while handing
+                # the bridge verifier its one canonical mode representation.
+                local_verification = dataclasses.replace(
+                    local_verification,
+                    verification_mode=_CANONICAL_LOCAL_VERIFICATION_MODE,
+                )
             git = GitCliReadback(args.repository, checkout=args.checkout)
             receipt = verify_pre_tag(
                 record,
