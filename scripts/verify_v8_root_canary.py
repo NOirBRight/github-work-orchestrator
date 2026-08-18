@@ -3410,11 +3410,22 @@ def verify_root_canary(
         raise RootCanaryVerificationError("ACCEPTANCE_BUNDLE_INVALID") from error
 
 
+def _serialized_batch(
+    batch: VerifiedBatch, *, local_only: bool
+) -> dict[str, object]:
+    payload = dataclasses.asdict(batch)
+    if local_only:
+        payload.pop("pull_request_number")
+        payload.pop("hosted_run_id")
+    return payload
+
+
 def write_acceptance_document(
     path: Path, receipt: RootCanaryAcceptanceReceiptV1
 ) -> None:
     """Write a human-readable, local/read-only acceptance projection."""
 
+    local_only = receipt.acceptance_mode == _LOCAL_ROOT_MODE
     payload = {
         "schema": (
             _LOCAL_RECEIPT_SCHEMA
@@ -3428,8 +3439,10 @@ def write_acceptance_document(
         "writer_generation": receipt.writer_generation,
         "standard_ticket_keys": receipt.standard_ticket_keys,
         "strict_ticket_key": receipt.strict_ticket_key,
-        "standard_batch": dataclasses.asdict(receipt.standard_batch),
-        "strict_batch": dataclasses.asdict(receipt.strict_batch),
+        "standard_batch": _serialized_batch(
+            receipt.standard_batch, local_only=local_only
+        ),
+        "strict_batch": _serialized_batch(receipt.strict_batch, local_only=local_only),
         "ticket_contract_digests": receipt.ticket_contract_digests,
         "candidate_receipt_digests": receipt.candidate_receipt_digests,
         "policy_witness_digest": receipt.policy_witness_digest,
@@ -3539,6 +3552,13 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     output_payload = dataclasses.asdict(receipt)
+    local_only = receipt.acceptance_mode == _LOCAL_ROOT_MODE
+    output_payload["standard_batch"] = _serialized_batch(
+        receipt.standard_batch, local_only=local_only
+    )
+    output_payload["strict_batch"] = _serialized_batch(
+        receipt.strict_batch, local_only=local_only
+    )
     output_payload["schema"] = (
         _LOCAL_RECEIPT_SCHEMA
         if receipt.acceptance_mode == _LOCAL_ROOT_MODE

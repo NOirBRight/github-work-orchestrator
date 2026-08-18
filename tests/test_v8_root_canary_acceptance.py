@@ -1285,3 +1285,60 @@ def test_local_only_cli_round_trip_uses_the_real_ticket_fixture(
     assert output["receipt_digest"] == verify_root_canary(
         copy.deepcopy(local_only_bundle)
     ).receipt_digest
+
+
+def test_local_only_v2_receipt_has_no_hosted_or_pr_batch_placeholders(
+    tmp_path: Path,
+    local_only_bundle: dict[str, object],
+):
+    diagnostics_path = tmp_path / "local-record.json"
+    output_path = tmp_path / "local-receipt.json"
+    diagnostics_path.write_text(json.dumps(local_only_bundle), encoding="utf-8")
+
+    assert (
+        verify_main(
+            [
+                "--tickets",
+                str(ROOT_TICKETS),
+                "--diagnostics",
+                str(diagnostics_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(output_path.read_text("utf-8"))
+    forbidden_paths: list[str] = []
+    null_paths: list[str] = []
+
+    def inspect(value: object, path: tuple[str, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = "".join(
+                    character for character in str(key).lower() if character.isalnum()
+                )
+                if (
+                    normalized in {"ci", "pr", "run", "runid", "url"}
+                    or normalized.startswith(
+                        ("hosted", "pullrequest", "publication", "remote", "workflow", "check")
+                    )
+                    or normalized.endswith("url")
+                ):
+                    forbidden_paths.append(".".join(path + (str(key),)))
+                inspect(item, path + (str(key),))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                inspect(item, path + (str(index),))
+        elif value is None:
+            null_paths.append(".".join(path))
+
+    inspect(output)
+
+    assert output["schema"] == "gwo-v8-root-canary-acceptance.v2"
+    assert not forbidden_paths
+    assert not null_paths
+    assert output["receipt_digest"] == verify_root_canary(
+        copy.deepcopy(local_only_bundle)
+    ).receipt_digest
