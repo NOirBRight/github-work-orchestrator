@@ -48,6 +48,7 @@ LOCAL_ROOT_WRITER_GENERATION = "writer:local"
 _LEGACY_V8_WRITER_GENERATIONS = frozenset({V8_WRITER_FAMILY, V8_WRITER_GENERATION})
 PRODUCTION_CANARY_REPOSITORY = "NOirBRight/gwo-v8-canary"
 PRODUCTION_CANARY_EVIDENCE_REF_COUNT = 19
+_DURABLE_CANARY_REF_PREFIXES = ("github://", "git://")
 ALLOWED_METADATA_PATHS = (
     "CHANGELOG.md",
     "docs/e2e/gwo-v8-root-canary.md",
@@ -1974,6 +1975,24 @@ def _bridge_required_sha256(payload: Mapping[str, object], name: str, code: str)
         raise
 
 
+def _bridge_durable_canary_refs(
+    payload: Mapping[str, object], name: str
+) -> list[str]:
+    value = _bridge_field(payload, name, "GA_EVIDENCE_BRIDGE_MISMATCH")
+    if type(value) is not list or len(value) != PRODUCTION_CANARY_EVIDENCE_REF_COUNT:
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    if any(
+        type(ref) is not str
+        or not ref.removeprefix("github://").removeprefix("git://")
+        or not ref.startswith(_DURABLE_CANARY_REF_PREFIXES)
+        for ref in value
+    ):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    if len(set(value)) != len(value) or value != sorted(value):
+        raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
+    return value
+
+
 def _bridge_control_ref(payload: Mapping[str, object]) -> dict[str, object]:
     control_ref = _bridge_mapping_field(
         payload, "control_ref", "GA_EVIDENCE_BRIDGE_MISMATCH"
@@ -2180,6 +2199,9 @@ def _verify_bridge_external_canary(
         raise ReleaseGateError("GA_EVIDENCE_BRIDGE_MISMATCH")
     package_payload = dict(payload)
     _verify_bridge_production_canary_receipt(package_payload)
+    package_evidence_refs = _bridge_durable_canary_refs(
+        package_payload, "evidence_refs"
+    )
     if (
         package_payload["schema"] != "gwo-v8-production-canary-readback.v1"
         or package_payload["repository"] != PRODUCTION_CANARY_REPOSITORY
@@ -2191,8 +2213,6 @@ def _verify_bridge_external_canary(
         or package_payload["evidence_ref_count"] != PRODUCTION_CANARY_EVIDENCE_REF_COUNT
         or package_payload["evidence_readback_count"]
         != PRODUCTION_CANARY_EVIDENCE_REF_COUNT
-        or type(package_payload["evidence_refs"]) is not list
-        or len(package_payload["evidence_refs"]) != PRODUCTION_CANARY_EVIDENCE_REF_COUNT
         or package_payload["manifest_branch"] != "gwo-control"
         or package_payload["manifest_ref"] != package["manifest_ref"]
         or package_payload["package_digest"] != package["package_digest"]
@@ -2223,14 +2243,14 @@ def _verify_bridge_external_canary(
     default_repository = _bridge_field(
         admission_payload, "canary_repository", "GA_EVIDENCE_BRIDGE_MISMATCH"
     )
-    transition_refs = _bridge_field(
-        transition, "canary_evidence_refs", "GA_EVIDENCE_BRIDGE_MISMATCH"
+    transition_refs = _bridge_durable_canary_refs(
+        transition, "canary_evidence_refs"
     )
     if (
         transition.get("canary_evidence_digest") != package["package_digest"]
         or transition.get("canary_manifest_ref") != package["manifest_ref"]
         or transition.get("canary_repository") != package["package_repository"]
-        or transition_refs != package_payload["evidence_refs"]
+        or transition_refs != package_evidence_refs
         or default_canary_digest != package["package_digest"]
         or default_manifest_ref != package["manifest_ref"]
         or default_repository != package["package_repository"]

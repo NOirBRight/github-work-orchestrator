@@ -74,6 +74,100 @@ def _producer_source_case(
     return record, canary, activation, admission, mutated_bridge, local, git
 
 
+def _production_canary_refs_case(
+    tmp_path: Path, mutate
+) -> tuple[object, ...]:
+    record, canary, activation, admission, bridge, local, git = _case(tmp_path)
+    canary_payload = json.loads(
+        Path(bridge.production_canary["source_file"]).read_text(encoding="utf-8")
+    )
+    refs = list(canary_payload["evidence_refs"])
+    mutate(refs)
+    canary_payload["evidence_refs"] = refs
+    canary_payload = {
+        **canary_payload,
+        "receipt_digest": verifier.digest_value(
+            {
+                key: value
+                for key, value in canary_payload.items()
+                if key != "receipt_digest"
+            }
+        ),
+    }
+    canary_raw = verifier.canonical_json_bytes(canary_payload)
+    canary_source = tmp_path / "production-canary-readback.json"
+    canary_source.write_bytes(canary_raw)
+
+    activation_payload = deepcopy(activation)
+    activation_payload["transition_record"]["canary_evidence_refs"] = refs
+    activation_payload = {
+        **activation_payload,
+        "receipt_digest": verifier.digest_value(
+            {
+                key: value
+                for key, value in activation_payload.items()
+                if key != "receipt_digest"
+            }
+        ),
+    }
+    activation_raw = verifier.canonical_json_bytes(activation_payload)
+    activation_source = tmp_path / "production-activation-readback.json"
+    activation_source.write_bytes(activation_raw)
+
+    admission_payload = deepcopy(admission)
+    admission_payload["activation_readback_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+    admission_payload = {
+        **admission_payload,
+        "receipt_digest": verifier.digest_value(
+            {
+                key: value
+                for key, value in admission_payload.items()
+                if key != "receipt_digest"
+            }
+        ),
+    }
+    admission_raw = verifier.canonical_json_bytes(admission_payload)
+    admission_source = tmp_path / "default-writer-readback.json"
+    admission_source.write_bytes(admission_raw)
+
+    bridge_payload = bridge.to_mapping()
+    bridge_payload["production_canary"] = {
+        **bridge_payload["production_canary"],
+        "readback_receipt_digest": canary_payload["receipt_digest"],
+        "source_file": str(canary_source),
+        "source_file_sha256": hashlib.sha256(canary_raw).hexdigest(),
+    }
+    bridge_payload["production_activation"] = {
+        **bridge_payload["production_activation"],
+        "readback_receipt_digest": activation_payload["receipt_digest"],
+        "source_file": str(activation_source),
+        "source_file_sha256": hashlib.sha256(activation_raw).hexdigest(),
+    }
+    bridge_payload["default_writer"] = {
+        **bridge_payload["default_writer"],
+        "readback_receipt_digest": admission_payload["receipt_digest"],
+        "source_file": str(admission_source),
+        "source_file_sha256": hashlib.sha256(admission_raw).hexdigest(),
+    }
+    mutated_bridge = GaEvidenceBridge.from_mapping(_rehash_bridge(bridge_payload))
+    record = replace(
+        record,
+        activation_receipt_digest=activation_payload["receipt_digest"],
+        default_writer_receipt_digest=admission_payload["receipt_digest"],
+    )
+    return (
+        record,
+        canary,
+        activation_payload,
+        admission_payload,
+        mutated_bridge,
+        local,
+        git,
+    )
+
+
 def _verify_bridge(case: tuple[object, ...]):
     record, canary, activation, admission, bridge, local, git = case
     return verifier.verify_pre_tag(
@@ -130,6 +224,36 @@ def test_bridge_recomputes_each_producer_receipt_digest(
     tmp_path, section, mutate
 ):
     case = _producer_source_case(tmp_path, section, mutate)
+
+    with pytest.raises(ReleaseGateError) as error:
+        _verify_bridge(case)
+
+    assert error.value.code == "GA_EVIDENCE_BRIDGE_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda refs: refs.__setitem__(-1, refs[0]),
+            id="duplicate",
+        ),
+        pytest.param(
+            lambda refs: refs.__setitem__(
+                slice(0, 2), [refs[1], refs[0]]
+            ),
+            id="unsorted",
+        ),
+        pytest.param(
+            lambda refs: refs.__setitem__(0, "synthetic://evidence"),
+            id="non-durable",
+        ),
+    ],
+)
+def test_bridge_pre_tag_rejects_invalid_production_canary_evidence_refs(
+    tmp_path, mutate
+):
+    case = _production_canary_refs_case(tmp_path, mutate)
 
     with pytest.raises(ReleaseGateError) as error:
         _verify_bridge(case)
