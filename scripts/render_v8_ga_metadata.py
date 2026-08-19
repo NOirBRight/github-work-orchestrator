@@ -33,6 +33,7 @@ from scripts.verify_v8_ga_release import (
     digest_value,
     _reject_local_hosted_fields,
     _strict_canonical_json_loads,
+    _verify_bridge_local_root_receipt,
     canonical_json_bytes,
     write_ga_release_record,
 )
@@ -596,6 +597,7 @@ def _renderer_evidence_bridge_context(
     local_payload = _read_bridge_source(
         local_root, "root-canary-acceptance.json", "GA evidence local source"
     )
+    _verify_bridge_local_root_receipt(local_payload)
     canary_source_payload = _read_bridge_source(
         production_canary,
         "production-canary-readback.json",

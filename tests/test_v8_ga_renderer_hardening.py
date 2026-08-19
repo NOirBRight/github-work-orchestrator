@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -8,7 +9,11 @@ import sys
 import pytest
 
 import scripts.render_v8_ga_metadata as renderer
-from scripts.verify_v8_ga_release import ReleaseGateError
+from scripts.verify_v8_ga_release import (
+    ReleaseGateError,
+    RootCanaryAcceptanceReceiptV1,
+    VerifiedBatch,
+)
 from tests.test_v8_release_metadata import (
     _renderer_bridge_fixture,
     _renderer_bridge_with_source_payload,
@@ -26,9 +31,151 @@ def _with_canonical_receipt(payload: dict[str, object]) -> dict[str, object]:
     return body | {"receipt_digest": renderer.digest_value(body)}
 
 
+def _complete_local_root_payload() -> dict[str, object]:
+    standard_batch = VerifiedBatch(
+        batch_id="1" * 64,
+        member_count=3,
+        pull_request_number=None,
+        hosted_run_id=None,
+        batch_sha="7" * 40,
+        target_sha="7" * 40,
+        receipt_digest="2" * 64,
+    )
+    strict_batch = VerifiedBatch(
+        batch_id="3" * 64,
+        member_count=1,
+        pull_request_number=None,
+        hosted_run_id=None,
+        batch_sha="6" * 40,
+        target_sha="6" * 40,
+        receipt_digest="4" * 64,
+    )
+    receipt = RootCanaryAcceptanceReceiptV1(
+        repository="NOirBRight/github-work-orchestrator",
+        campaign_key="campaign:test",
+        plan_revision_digest="5" * 64,
+        activation_id="campaign:test",
+        writer_generation="writer:local",
+        standard_ticket_keys=("issue:195", "issue:196", "issue:197"),
+        strict_ticket_key="issue:198",
+        standard_batch=standard_batch,
+        strict_batch=strict_batch,
+        peak_worker_slots=4,
+        refill_proven=True,
+        permission_same_binding=True,
+        stale_diagnosis_bounded=True,
+        terminal_replacement_bounded=True,
+        terminal_replacement_receipt_digests=(),
+        duplicate_effect_ids=(),
+        ticket_contract_digests=(
+            ("issue:195", "8" * 64),
+            ("issue:196", "9" * 64),
+            ("issue:197", "a" * 64),
+            ("issue:198", "b" * 64),
+        ),
+        candidate_receipt_digests=(
+            ("issue:195", "c" * 64),
+            ("issue:196", "d" * 64),
+            ("issue:197", "e" * 64),
+            ("issue:198", "f" * 64),
+        ),
+        policy_witness_digest="0" * 64,
+        authority_root_digest="1" * 64,
+        runtime_selector_digest="2" * 64,
+        finding_ledger_digests=(
+            ("issue:195", "3" * 64),
+            ("issue:196", "4" * 64),
+            ("issue:197", "5" * 64),
+            ("issue:198", "6" * 64),
+        ),
+        batch_receipt_digests=(
+            ("multi", standard_batch.receipt_digest),
+            ("singleton", strict_batch.receipt_digest),
+        ),
+        fault_journal_digest="7" * 64,
+        canary_target_sha="6" * 40,
+        authoritative_evidence={},
+        receipt_digest="",
+        acceptance_mode="local-only-v1",
+    )
+    receipt = replace(
+        receipt,
+        receipt_digest=renderer.digest_value(receipt.canonical_digest_payload()),
+    )
+
+    def batch_payload(batch: VerifiedBatch) -> dict[str, object]:
+        return {
+            "batch_id": batch.batch_id,
+            "batch_sha": batch.batch_sha,
+            "member_count": batch.member_count,
+            "receipt_digest": batch.receipt_digest,
+            "target_sha": batch.target_sha,
+        }
+
+    return {
+        "acceptance_mode": receipt.acceptance_mode,
+        "activation_id": receipt.activation_id,
+        "authoritative_evidence": receipt.authoritative_evidence,
+        "authority_root_digest": receipt.authority_root_digest,
+        "batch_receipt_digests": [
+            list(pair) for pair in receipt.batch_receipt_digests
+        ],
+        "campaign_key": receipt.campaign_key,
+        "canary_target_sha": receipt.canary_target_sha,
+        "candidate_receipt_digests": [
+            list(pair) for pair in receipt.candidate_receipt_digests
+        ],
+        "duplicate_effect_ids": list(receipt.duplicate_effect_ids),
+        "fault_journal_digest": receipt.fault_journal_digest,
+        "finding_ledger_digests": [
+            list(pair) for pair in receipt.finding_ledger_digests
+        ],
+        "peak_worker_slots": receipt.peak_worker_slots,
+        "permission_same_binding": receipt.permission_same_binding,
+        "plan_revision_digest": receipt.plan_revision_digest,
+        "policy_witness_digest": receipt.policy_witness_digest,
+        "receipt_digest": receipt.receipt_digest,
+        "refill_proven": receipt.refill_proven,
+        "repository": receipt.repository,
+        "runtime_selector_digest": receipt.runtime_selector_digest,
+        "schema": "gwo-v8-root-canary-acceptance.v2",
+        "stale_diagnosis_bounded": receipt.stale_diagnosis_bounded,
+        "standard_batch": batch_payload(receipt.standard_batch),
+        "standard_ticket_keys": list(receipt.standard_ticket_keys),
+        "strict_batch": batch_payload(receipt.strict_batch),
+        "strict_ticket_key": receipt.strict_ticket_key,
+        "terminal_replacement_bounded": receipt.terminal_replacement_bounded,
+        "terminal_replacement_receipt_digests": list(
+            receipt.terminal_replacement_receipt_digests
+        ),
+        "ticket_contract_digests": [
+            list(pair) for pair in receipt.ticket_contract_digests
+        ],
+        "writer_generation": receipt.writer_generation,
+    }
+
+
 def _valid_renderer_bridge_fixture(tmp_path):
     bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
     evidence_refs = [f"github://canary-evidence/{index}" for index in range(19)]
+
+    local_payload = _complete_local_root_payload()
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "local_root_canary", local_payload
+    )
+    bridge["local_root_canary"].update(
+        {
+            "acceptance_mode": local_payload["acceptance_mode"],
+            "activation_id": local_payload["activation_id"],
+            "campaign_key": local_payload["campaign_key"],
+            "canary_target_sha": local_payload["canary_target_sha"],
+            "producer_receipt_digest": local_payload["receipt_digest"],
+            "repository": local_payload["repository"],
+            "schema": local_payload["schema"],
+            "writer_generation": local_payload["writer_generation"],
+        }
+    )
+    bridge = _rehash_bridge(bridge)
 
     canary_payload = json.loads(
         json.dumps(source_payloads["production_canary"][1])
@@ -436,6 +583,29 @@ def test_renderer_rejects_recomputed_digest_with_an_unbound_producer_field(
         bridge["default_writer"]["readback_receipt_digest"] = default_payload[
             "receipt_digest"
         ]
+    bridge = _rehash_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path / "tampered", bridge)
+
+
+def test_renderer_rejects_recomputed_local_root_digest_with_an_unbound_field(
+    tmp_path,
+):
+    bridge, _complete_refs = _valid_renderer_bridge_fixture(tmp_path)
+    _render_with_bridge(tmp_path / "baseline", bridge)
+
+    local_payload = json.loads(
+        (tmp_path / "root-canary-acceptance.json").read_text(encoding="utf-8")
+    )
+    local_payload["unbound_renderer_field"] = {"producer": "local_root"}
+    local_payload = _with_canonical_receipt(local_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "local_root_canary", local_payload
+    )
+    bridge["local_root_canary"]["producer_receipt_digest"] = local_payload[
+        "receipt_digest"
+    ]
     bridge = _rehash_bridge(bridge)
 
     with pytest.raises(ReleaseGateError):
