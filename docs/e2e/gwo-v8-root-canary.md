@@ -17,7 +17,7 @@
   "canary_receipt_digest": "ea642b5606efc10adaf3671174b10e3df2f1a5f2dfc8b60a86b251db5845c938",
   "canary_target_sha": "d31d5787df8ff53f081ed45df42389ef2e505ffb",
   "default_writer_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
-  "evidence_base_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
+  "evidence_base_sha": "7b6a1616a32b03d8bcf2b36417741534877fee9e",
   "evidence_bridge_activation_subject": {
     "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
     "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
