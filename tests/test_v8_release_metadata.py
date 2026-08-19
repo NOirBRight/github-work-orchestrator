@@ -1340,7 +1340,7 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
 
 def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
     bridge = {
-        "bridge_digest": "97c173547a4bfd1444503cfb3ed76cc0ea03e1eba2d800a4d8fa2d854fb70ea4",
+        "bridge_digest": "532fca4187a7da6cbfa5b36bf674a028e0eb8d851c9076608b562167442ee536",
         "default_writer": {
             "activation_id": "activation:47895d07122a3d9827ecdf63",
             "legacy_writer_fence_stopped": True,
@@ -1396,6 +1396,11 @@ def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
             ),
             "source_file_sha256": "354092b2e186096e7f7693683f1ad7d449b4ffe13ff56eca6254b4f83e77baca",
         },
+        "activation_release_subject": {
+            "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
+            "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
+            "release_subject_digest": "f4a260c1bfb39d6541c33f8f8f4449edc5453bd94cedbc1f1a244c9daf28a969",
+        },
         "release_subject": {
             "merged_main_sha": "f81994db1bee226cd6ca429e79c9b1cdf6d02897",
             "merged_main_tree": "5c97df0ecd0a267f69e80de92d4325f3a6f86743",
@@ -1419,7 +1424,12 @@ def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
         .split("\n```\n", 1)[0]
     )
 
-    assert payload["evidence_bridge"]["bridge_digest"] == bridge["bridge_digest"]
+    assert payload["evidence_bridge_digest"] == bridge["bridge_digest"]
+    assert (
+        payload["evidence_bridge_activation_subject"]
+        == bridge["activation_release_subject"]
+    )
+    assert "evidence_bridge" not in payload
     assert payload["evidence_bridge_links"] == {
         "activation_id": "activation:47895d07122a3d9827ecdf63",
         "default_writer_readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
@@ -1430,6 +1440,140 @@ def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
         "transition_record_id": "writer-transition:ce14291c00b0c5bfe7251729",
         "writer_generation": "v8-generation-1",
     }
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path / "conflicting-inputs",
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:foreign",
+                "canary_target_sha": "6" * 40,
+                "receipt_digest": "foreign-canary",
+            },
+            named_admission={"receipt_digest": "foreign-activation"},
+            default_writer={
+                "receipt_digest": "foreign-default",
+                "activation_id": "activation:foreign",
+                "writer_generation": "v8-generation-1",
+            },
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_IDENTITY_MISMATCH"
+
+
+def _rehash_metadata_bridge(bridge):
+    body = {key: value for key, value in bridge.items() if key != "bridge_digest"}
+    return body | {"bridge_digest": digest_value(body)}
+
+
+def test_renderer_accepts_bridge_derived_inputs_when_explicitly_repeated(tmp_path):
+    bridge = _load_renderer_bridge()
+    context = renderer._renderer_evidence_bridge_context(bridge)
+
+    render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        acceptance=context["acceptance"],
+        named_admission=context["named_admission"],
+        default_writer=context["default_writer"],
+        evidence_bridge=bridge,
+    )
+
+
+def _load_renderer_bridge():
+    path = Path(
+        r"D:\gwo-release-evidence\2026-08-19-gwo-v8-ga-production-cutover\ga-evidence-bridge.json"
+    )
+    if not path.exists():
+        pytest.skip(f"real derived evidence is required: {path}")
+    bridge = json.loads(path.read_text(encoding="utf-8"))
+    bridge["activation_release_subject"] = dict(bridge["release_subject"])
+    return _rehash_metadata_bridge(bridge)
+
+
+def test_renderer_rejects_bridge_activation_lineage_drift(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["production_activation"] = {
+        **bridge["production_activation"],
+        "previous_writer_generation": "v6.1",
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID"
+
+
+def test_renderer_rejects_activation_subject_not_authorized_by_readback(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["activation_release_subject"]["merged_main_sha"] = "0" * 40
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_IDENTITY_MISMATCH"
+
+
+def test_renderer_rejects_activation_readback_source_digest_mismatch(tmp_path):
+    bridge = _load_renderer_bridge()
+    bridge["production_activation"] = {
+        **bridge["production_activation"],
+        "source_file_sha256": "0" * 64,
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_DIGEST_MISMATCH"
+
+
+def test_renderer_preserves_activation_subject_when_final_subject_moves(tmp_path):
+    bridge = _load_renderer_bridge()
+    activation_subject = dict(bridge["activation_release_subject"])
+    bridge["release_subject"] = {
+        "merged_main_sha": "a" * 40,
+        "merged_main_tree": "b" * 40,
+        "release_subject_digest": "c" * 64,
+    }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    paths = render_ga_documents(
+        tmp_path,
+        evidence_base_sha="4" * 40,
+        tickets={"tickets": [{"number": 1}]},
+        evidence_bridge=bridge,
+    )
+    payload = json.loads(
+        paths[1]
+        .read_text(encoding="utf-8")
+        .split("```json\n", 1)[1]
+        .split("\n```\n", 1)[0]
+    )
+
+    assert payload["evidence_bridge_activation_subject"] == activation_subject
+    assert "evidence_bridge" not in payload
 
 
 def test_renderer_labels_repository_verification_local_only(tmp_path):

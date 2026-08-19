@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,6 +83,7 @@ _DYNAMIC_KEY_ALIASES = frozenset(
 
 _EVIDENCE_BRIDGE_FIELDS = frozenset(
     {
+        "activation_release_subject",
         "bridge_digest",
         "default_writer",
         "local_root_canary",
@@ -279,6 +281,50 @@ def _bridge_fields(value: Mapping[str, object], allowed: frozenset[str]) -> None
         raise ReleaseGateError("GA_METADATA_BRIDGE_FIELDS_INVALID")
 
 
+def _bind_activation_release_subject_to_readback(
+    production_activation_source: str,
+    production_activation_source_sha256: str,
+    activation_release_subject: Mapping[str, object],
+) -> None:
+    try:
+        raw = Path(production_activation_source).read_bytes()
+    except (OSError, ValueError) as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
+    if hashlib.sha256(raw).hexdigest() != production_activation_source_sha256:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_DIGEST_MISMATCH")
+    try:
+        readback = _strict_canonical_json_loads(raw)
+    except ReleaseGateError as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
+    if not isinstance(readback, Mapping):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    authorization = readback.get("authorization")
+    if not isinstance(authorization, Mapping):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    try:
+        authorized_subject = {
+            "merged_main_sha": authorization["merged_main_sha"],
+            "merged_main_tree": authorization["merged_main_git_tree"],
+            "release_subject_digest": authorization["release_subject_digest"],
+        }
+    except KeyError as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID") from error
+    if (
+        type(authorized_subject["merged_main_sha"]) is not str
+        or _SHA.fullmatch(authorized_subject["merged_main_sha"]) is None
+        or type(authorized_subject["merged_main_tree"]) is not str
+        or _SHA.fullmatch(authorized_subject["merged_main_tree"]) is None
+        or type(authorized_subject["release_subject_digest"]) is not str
+        or _SHA256.fullmatch(authorized_subject["release_subject_digest"]) is None
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    if any(
+        activation_release_subject[field] != authorized_subject[field]
+        for field in _EVIDENCE_RELEASE_SUBJECT_FIELDS
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+
+
 def _renderer_evidence_bridge_context(
     evidence_bridge: Mapping[str, object],
 ) -> dict[str, object]:
@@ -299,6 +345,7 @@ def _renderer_evidence_bridge_context(
     local_root = evidence_bridge.get("local_root_canary")
     production_canary = evidence_bridge.get("production_canary")
     production_activation = evidence_bridge.get("production_activation")
+    activation_release_subject = evidence_bridge.get("activation_release_subject")
     default_writer = evidence_bridge.get("default_writer")
     release_subject = evidence_bridge.get("release_subject")
     if not all(
@@ -307,6 +354,7 @@ def _renderer_evidence_bridge_context(
             local_root,
             production_canary,
             production_activation,
+            activation_release_subject,
             default_writer,
             release_subject,
         )
@@ -399,6 +447,10 @@ def _renderer_evidence_bridge_context(
         production_activation.get("source_file_sha256"),
         "GA evidence activation source digest",
     )
+    if production_activation.get("previous_writer_generation") != (
+        _PRODUCTION_WRITER_GENERATION
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID")
 
     _bridge_fields(default_writer, _EVIDENCE_DEFAULT_FIELDS)
     if default_writer.get("legacy_writer_fence_stopped") is not True:
@@ -435,6 +487,22 @@ def _renderer_evidence_bridge_context(
         local_writer_generation == production_writer_generation
     ):
         raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_COLLISION")
+
+    # The activation readback subject is an independently authorized subject.
+    # Validate it separately from the final GA subject: the latter may move as
+    # metadata is published, while the former remains bound to cutover.
+    _bridge_fields(activation_release_subject, _EVIDENCE_RELEASE_SUBJECT_FIELDS)
+    _require_sha("merged_main", activation_release_subject.get("merged_main_sha"))
+    _require_sha("merged_main_tree", activation_release_subject.get("merged_main_tree"))
+    _bridge_sha256(
+        activation_release_subject.get("release_subject_digest"),
+        "GA evidence activation release subject digest",
+    )
+    _bind_activation_release_subject_to_readback(
+        production_activation["source_file"],
+        production_activation["source_file_sha256"],
+        activation_release_subject,
+    )
 
     _bridge_fields(release_subject, _EVIDENCE_RELEASE_SUBJECT_FIELDS)
     _require_sha("merged_main", release_subject.get("merged_main_sha"))
@@ -479,8 +547,10 @@ def _renderer_evidence_bridge_context(
         "writer_generation": production_writer_generation,
     }
     return {
+        "activation_release_subject": dict(activation_release_subject),
         "acceptance": normalized_acceptance,
         "bridge": dict(evidence_bridge),
+        "bridge_digest": bridge_digest,
         "default_writer": normalized_default_writer,
         "links": links,
         "named_admission": normalized_named_admission,
@@ -493,6 +563,110 @@ def _renderer_evidence_bridge_context(
         "named_receipt_digest": production_activation_receipt_digest,
         "default_receipt_digest": default_receipt_digest,
     }
+
+
+def _bridge_compare_input(
+    provided: object,
+    derived: Mapping[str, object],
+    expected_identity: Mapping[str, str | None],
+    *,
+    allow_none: frozenset[str] = frozenset(),
+) -> None:
+    """Bind an explicitly supplied input to the bridge projection.
+
+    The bridge sections are compact projections of the authoritative
+    readbacks, so callers may provide additional receipt fields.  Every field
+    in the projection must nevertheless be present and canonically equal;
+    nested identity aliases are checked as well so an extra identity-bearing
+    field cannot silently disagree with the bridge.
+    """
+    if not isinstance(provided, Mapping):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    try:
+        observed = {key: provided[key] for key in derived}
+        if canonical_json_bytes(observed) != canonical_json_bytes(dict(derived)):
+            raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH")
+    except (KeyError, TypeError, UnicodeError, ValueError) as error:
+        raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH") from error
+    try:
+        _assert_input_identities(provided, expected_identity, allow_none=allow_none)
+    except ReleaseGateError as error:
+        if error.code == "GA_METADATA_IDENTITY_MISMATCH":
+            raise ReleaseGateError("GA_METADATA_BRIDGE_IDENTITY_MISMATCH") from error
+        raise
+
+
+def _bind_bridge_inputs(
+    evidence_context: Mapping[str, object],
+    acceptance: Mapping[str, object] | None,
+    named_admission: Mapping[str, object] | None,
+    default_writer: Mapping[str, object] | None,
+) -> tuple[Mapping[str, object], Mapping[str, object], Mapping[str, object]]:
+    derived_acceptance = evidence_context["acceptance"]
+    derived_named_admission = evidence_context["named_admission"]
+    derived_default_writer = evidence_context["default_writer"]
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            derived_acceptance,
+            derived_named_admission,
+            derived_default_writer,
+        )
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    repository = evidence_context["repository"]
+    campaign_key = evidence_context["campaign_key"]
+    activation_id = evidence_context["activation_id"]
+    writer_generation = evidence_context["writer_generation"]
+    if not all(
+        type(value) is str and bool(value.strip())
+        for value in (repository, campaign_key, activation_id, writer_generation)
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+
+    if acceptance is None:
+        bound_acceptance = derived_acceptance
+    else:
+        _bridge_compare_input(
+            acceptance,
+            derived_acceptance,
+            {
+                "repository": repository,
+                "campaign_key": campaign_key,
+                "activation_id": derived_acceptance["activation_id"],
+                "writer_generation": derived_acceptance["writer_generation"],
+            },
+        )
+        bound_acceptance = acceptance
+    if named_admission is None:
+        bound_named_admission = derived_named_admission
+    else:
+        _bridge_compare_input(
+            named_admission,
+            derived_named_admission,
+            {
+                "repository": repository,
+                "activation_id": activation_id,
+                "writer_generation": writer_generation,
+            },
+        )
+        bound_named_admission = named_admission
+    if default_writer is None:
+        bound_default_writer = derived_default_writer
+    else:
+        _bridge_compare_input(
+            default_writer,
+            derived_default_writer,
+            {
+                "repository": repository,
+                "campaign_key": None,
+                "activation_id": activation_id,
+                "writer_generation": writer_generation,
+            },
+            allow_none=frozenset({"campaign_key"}),
+        )
+        bound_default_writer = default_writer
+    return bound_acceptance, bound_named_admission, bound_default_writer
 
 
 def _write_markdown_json(path: Path, title: str, payload: Mapping[str, object]) -> None:
@@ -751,12 +925,9 @@ def render_ga_documents(
             raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
         _validate_metadata_json(evidence_bridge, "evidence_bridge")
         evidence_context = _renderer_evidence_bridge_context(evidence_bridge)
-        if acceptance is None:
-            acceptance = evidence_context["acceptance"]
-        if named_admission is None:
-            named_admission = evidence_context["named_admission"]
-        if default_writer is None:
-            default_writer = evidence_context["default_writer"]
+        acceptance, named_admission, default_writer = _bind_bridge_inputs(
+            evidence_context, acceptance, named_admission, default_writer
+        )
     static_named_admission = named_admission
     inputs: list[tuple[str, object | None]] = [
         ("tickets", tickets),
@@ -857,8 +1028,11 @@ def render_ga_documents(
         "writer_generation": writer_generation,
     }
     if bridge is not None:
-        common["evidence_bridge"] = bridge
         if evidence_context is not None:
+            common["evidence_bridge_digest"] = evidence_context["bridge_digest"]
+            common["evidence_bridge_activation_subject"] = evidence_context[
+                "activation_release_subject"
+            ]
             common["evidence_bridge_links"] = evidence_context["links"]
             common["production_canary_package_digest"] = evidence_context["links"][
                 "production_canary_package_digest"
@@ -944,12 +1118,9 @@ def write_live_release_record(
             raise ReleaseGateError("GA_METADATA_INPUT_INVALID")
         _validate_metadata_json(evidence_bridge, "evidence_bridge")
         evidence_context = _renderer_evidence_bridge_context(evidence_bridge)
-        if acceptance is None:
-            acceptance = evidence_context["acceptance"]
-        if named_admission is None:
-            named_admission = evidence_context["named_admission"]
-        if default_writer is None:
-            default_writer = evidence_context["default_writer"]
+        acceptance, named_admission, default_writer = _bind_bridge_inputs(
+            evidence_context, acceptance, named_admission, default_writer
+        )
     static_named_admission = named_admission
     for name, value in (
         ("acceptance", acceptance),
