@@ -157,7 +157,9 @@ def _complete_local_root_payload() -> dict[str, object]:
 
 def _valid_renderer_bridge_fixture(tmp_path):
     bridge, source_payloads = _renderer_bridge_fixture(tmp_path)
-    evidence_refs = [f"github://canary-evidence/{index}" for index in range(19)]
+    evidence_refs = sorted(
+        f"github://canary-evidence/{index}" for index in range(19)
+    )
 
     local_payload = _complete_local_root_payload()
     bridge = _renderer_bridge_with_source_payload(
@@ -233,6 +235,51 @@ def _valid_renderer_bridge_fixture(tmp_path):
     bridge = _rehash_bridge(bridge)
 
     return _rehash_bridge(bridge), evidence_refs
+
+
+def _renderer_bridge_with_canary_evidence_refs(
+    tmp_path, bridge: dict[str, object], evidence_refs: list[str]
+) -> dict[str, object]:
+    canary_payload = json.loads(
+        (tmp_path / "production-canary-readback.json").read_text(encoding="utf-8")
+    )
+    canary_payload["evidence_refs"] = evidence_refs
+    canary_payload = _with_canonical_receipt(canary_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_canary", canary_payload
+    )
+    bridge["production_canary"]["readback_receipt_digest"] = canary_payload[
+        "receipt_digest"
+    ]
+
+    activation_payload = json.loads(
+        (tmp_path / "production-activation-readback.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    activation_payload["transition_record"]["canary_evidence_refs"] = evidence_refs
+    activation_payload = _with_canonical_receipt(activation_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "production_activation", activation_payload
+    )
+    bridge["production_activation"]["readback_receipt_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+
+    default_payload = json.loads(
+        (tmp_path / "default-writer-readback.json").read_text(encoding="utf-8")
+    )
+    default_payload["activation_readback_digest"] = activation_payload[
+        "receipt_digest"
+    ]
+    default_payload = _with_canonical_receipt(default_payload)
+    bridge = _renderer_bridge_with_source_payload(
+        tmp_path, bridge, "default_writer", default_payload
+    )
+    bridge["default_writer"]["readback_receipt_digest"] = default_payload[
+        "receipt_digest"
+    ]
+    return _rehash_bridge(bridge)
 
 
 def _canary_payload_with_digest(
@@ -607,6 +654,25 @@ def test_renderer_rejects_recomputed_local_root_digest_with_an_unbound_field(
         "receipt_digest"
     ]
     bridge = _rehash_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError):
+        _render_with_bridge(tmp_path / "tampered", bridge)
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "unsorted", "non_durable"))
+def test_renderer_rejects_invalid_canary_evidence_refs(tmp_path, mutation):
+    bridge, evidence_refs = _valid_renderer_bridge_fixture(tmp_path)
+    _render_with_bridge(tmp_path / "baseline", bridge)
+    mutated_refs = list(evidence_refs)
+    if mutation == "duplicate":
+        mutated_refs[1] = mutated_refs[0]
+    elif mutation == "unsorted":
+        mutated_refs[0], mutated_refs[1] = mutated_refs[1], mutated_refs[0]
+    else:
+        mutated_refs[-1] = "local://canary-evidence/18"
+    bridge = _renderer_bridge_with_canary_evidence_refs(
+        tmp_path, bridge, mutated_refs
+    )
 
     with pytest.raises(ReleaseGateError):
         _render_with_bridge(tmp_path / "tampered", bridge)

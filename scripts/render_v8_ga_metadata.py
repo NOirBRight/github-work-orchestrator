@@ -26,6 +26,7 @@ from scripts.verify_v8_ga_release import (
     _DEFAULT_WRITER_RECEIPT_FIELDS,
     _PRODUCTION_ACTIVATION_RECEIPT_FIELDS,
     _PRODUCTION_CANARY_RECEIPT_FIELDS,
+    _bridge_durable_canary_refs,
     DYNAMIC_METADATA_FIELDS,
     PRODUCTION_CANARY_EVIDENCE_REF_COUNT,
     ReleaseGateError,
@@ -390,13 +391,6 @@ def _source_sha256(payload: Mapping[str, object], field: str) -> str:
     return value
 
 
-def _source_list(payload: Mapping[str, object], field: str) -> list[object]:
-    value = payload.get(field)
-    if type(value) is not list:
-        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
-    return value
-
-
 def _source_control_ref(payload: Mapping[str, object]) -> dict[str, object]:
     control_ref = _source_mapping(payload, "control_ref")
     if set(control_ref) != {"branch", "commit_sha", "tree_sha"}:
@@ -697,12 +691,12 @@ def _renderer_evidence_bridge_context(
     transition_canary_manifest_ref = _source_text(
         transition_record, "canary_manifest_ref"
     )
-    transition_canary_refs = _source_list(
+    transition_canary_refs = _bridge_durable_canary_refs(
         transition_record, "canary_evidence_refs"
     )
-    package_evidence_refs = _source_list(canary_payload, "evidence_refs")
-    if len(package_evidence_refs) != PRODUCTION_CANARY_EVIDENCE_REF_COUNT:
-        raise ReleaseGateError("GA_METADATA_BRIDGE_INPUT_INVALID")
+    package_evidence_refs = _bridge_durable_canary_refs(
+        canary_payload, "evidence_refs"
+    )
     _assert_source_equal(
         _source_text(activation_payload, "schema")
         == "gwo-v8-production-activation-readback.v1"
