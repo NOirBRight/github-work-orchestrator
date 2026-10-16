@@ -59,8 +59,27 @@ def contract(**overrides):
         "hotset": ["src/example.py"],
         "model_profile": "standard",
         "model_binding": "gpt-5.6-luna / high",
-        "model_binding_status": "verified",
-        "model_binding_evidence": "native-runtime-readback:example",
+        "model_binding_requirement": "best-effort",
+        "model_binding_status": "request-accepted",
+        "native_worker_requests": [
+            {
+                "operation": "create",
+                "purpose": "full-contract",
+                "model": "gpt-5.6-luna",
+                "thinking": "high",
+            }
+        ],
+        "model_binding_evidence": {
+            "request_receipt": "accepted",
+            "effective_readback": {
+                "available": False,
+                "model": None,
+                "thinking": None,
+            },
+            "limitation_note": (
+                "effective model and reasoning readback is unavailable on this Task host"
+            ),
+        },
         "permission_profile": {
             "filesystem": "unrestricted",
             "network": "enabled",
@@ -148,17 +167,128 @@ class ExecutionContractTests(unittest.TestCase):
             standard_explicit["verification_plan"]["manual_evidence"]
         )
 
-    def test_unverified_model_binding_fails_closed(self) -> None:
+    def test_best_effort_request_accepted_without_readback_is_dispatchable(self) -> None:
+        report = CONTRACT.validate_contract(contract())
+        self.assertTrue(report["dispatchable"])
+        self.assertEqual("best-effort", report["model_binding_requirement"])
+        self.assertEqual("request-accepted", report["model_binding_status"])
+
+    def test_exact_runtime_requires_runtime_verified_readback(self) -> None:
         report = CONTRACT.validate_contract(
-            contract(model_binding_status="unverified")
+            contract(model_binding_requirement="exact-runtime")
         )
         self.assertFalse(report["dispatchable"])
-        self.assertIn("model-binding-must-be-verified", report["errors"])
+        self.assertIn(
+            "model-binding-exact-runtime-requires-runtime-verified",
+            report["errors"],
+        )
+
+    def test_exact_runtime_verified_binding_is_dispatchable(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                model_binding_requirement="exact-runtime",
+                model_binding_status="runtime-verified",
+                model_binding_evidence={
+                    "request_receipt": "accepted",
+                    "effective_readback": {
+                        "available": True,
+                        "model": "gpt-5.6-luna",
+                        "thinking": "high",
+                    },
+                    "limitation_note": "not needed when readback is available",
+                },
+            )
+        )
+        self.assertTrue(report["dispatchable"])
+
+    def test_omitted_native_model_or_thinking_fails_closed(self) -> None:
+        for missing_field in ("model", "thinking"):
+            with self.subTest(missing_field=missing_field):
+                request = contract()["native_worker_requests"][0].copy()
+                request.pop(missing_field)
+                report = CONTRACT.validate_contract(
+                    contract(native_worker_requests=[request])
+                )
+                self.assertFalse(report["dispatchable"])
+                self.assertIn(
+                    f"missing-native-worker-request:{missing_field}",
+                    report["errors"],
+                )
+
+    def test_unsupported_profile_fails_closed(self) -> None:
+        report = CONTRACT.validate_contract(contract(model_profile="unqualified"))
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("unsupported-model-profile", report["errors"])
+
+    def test_rejected_request_and_unknown_status_fail_closed(self) -> None:
+        rejected = CONTRACT.validate_contract(
+            contract(
+                model_binding_status="rejected",
+                model_binding_evidence={
+                    "request_receipt": "rejected",
+                    "effective_readback": {
+                        "available": False,
+                        "model": None,
+                        "thinking": None,
+                    },
+                    "limitation_note": "native request was rejected",
+                },
+            )
+        )
+        unknown = CONTRACT.validate_contract(
+            contract(model_binding_status="unknown")
+        )
+        self.assertFalse(rejected["dispatchable"])
+        self.assertIn("model-binding-rejected", rejected["errors"])
+        self.assertFalse(unknown["dispatchable"])
+        self.assertIn("model-binding-unknown", unknown["errors"])
+
+    def test_contradictory_runtime_readback_fails_closed(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                model_binding_status="rejected",
+                model_binding_evidence={
+                    "request_receipt": "accepted",
+                    "effective_readback": {
+                        "available": True,
+                        "model": "gpt-5.6-terra",
+                        "thinking": "high",
+                    },
+                    "limitation_note": "runtime readback contradicted the request",
+                },
+            )
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("model-binding-runtime-contradiction", report["errors"])
+
+    def test_legacy_bootstrap_and_full_contract_binding_mismatch_fails_closed(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                native_worker_requests=[
+                    {
+                        "operation": "create",
+                        "purpose": "bootstrap",
+                        "model": "gpt-5.6-luna",
+                        "thinking": "medium",
+                    },
+                    {
+                        "operation": "follow-up",
+                        "purpose": "full-contract",
+                        "model": "gpt-5.6-luna",
+                        "thinking": "high",
+                    },
+                ]
+            )
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn(
+            "model-binding-bootstrap-full-contract-mismatch", report["errors"]
+        )
 
     def test_missing_model_binding_evidence_fails_closed(self) -> None:
         report = CONTRACT.validate_contract(contract(model_binding_evidence=""))
         self.assertFalse(report["dispatchable"])
-        self.assertIn("missing-or-empty:model_binding_evidence", report["errors"])
+        self.assertIn("model-binding-evidence-must-be-object", report["errors"])
 
     def test_review_fix_is_delta_only_unless_boundary_changes(self) -> None:
         ordinary = CONTRACT.verification_plan("strict", phase="review-fix")
