@@ -1340,10 +1340,11 @@ def test_renderer_writes_static_metadata_without_dynamic_sha_or_ci(tmp_path):
 
 def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
     bridge = {
-        "bridge_digest": "532fca4187a7da6cbfa5b36bf674a028e0eb8d851c9076608b562167442ee536",
+        "bridge_digest": "30962c93b38ae16eaaa5dd0fdb805fdd22fa4108fd6374e37abafad6cfb2dea7",
         "default_writer": {
             "activation_id": "activation:47895d07122a3d9827ecdf63",
             "legacy_writer_fence_stopped": True,
+            "previous_writer_generation": "v8-generation-1",
             "readback_receipt_digest": "42b595a7d4a93146200e2eaab629d804f1c0b9e383e7c7233af495e89a0c3084",
             "record_id": "writer-transition:ce14291c00b0c5bfe7251729",
             "source_file": (
@@ -1424,7 +1425,7 @@ def test_renderer_accepts_canonical_ga_evidence_bridge_readback(tmp_path):
         .split("\n```\n", 1)[0]
     )
 
-    assert payload["evidence_bridge_digest"] == bridge["bridge_digest"]
+    assert payload["evidence_bridge_digest"] == _bridge_identity_digest(bridge)
     assert (
         payload["evidence_bridge_activation_subject"]
         == bridge["activation_release_subject"]
@@ -1469,6 +1470,15 @@ def _rehash_metadata_bridge(bridge):
     return body | {"bridge_digest": digest_value(body)}
 
 
+def _bridge_identity_digest(bridge):
+    body = {
+        key: value
+        for key, value in bridge.items()
+        if key not in {"bridge_digest", "release_subject"}
+    }
+    return digest_value(body)
+
+
 def test_renderer_accepts_bridge_derived_inputs_when_explicitly_repeated(tmp_path):
     bridge = _load_renderer_bridge()
     context = renderer._renderer_evidence_bridge_context(bridge)
@@ -1491,8 +1501,76 @@ def _load_renderer_bridge():
     if not path.exists():
         pytest.skip(f"real derived evidence is required: {path}")
     bridge = json.loads(path.read_text(encoding="utf-8"))
+    bridge["default_writer"] = {
+        **bridge["default_writer"],
+        "previous_writer_generation": "v8-generation-1",
+    }
     bridge["activation_release_subject"] = dict(bridge["release_subject"])
     return _rehash_metadata_bridge(bridge)
+
+
+def _read_renderer_payload(path):
+    return json.loads(
+        path.read_text(encoding="utf-8").split("```json\n", 1)[1].split("\n```\n", 1)[0]
+    )
+
+
+def test_renderer_bridge_digest_excludes_final_release_subject(tmp_path):
+    bridge = _load_renderer_bridge()
+    original = _read_renderer_payload(
+        render_ga_documents(
+            tmp_path / "original",
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )[1]
+    )
+    moved = dict(bridge)
+    moved["release_subject"] = {
+        "merged_main_sha": "a" * 40,
+        "merged_main_tree": "b" * 40,
+        "release_subject_digest": bridge["release_subject"]["release_subject_digest"],
+    }
+    moved = _rehash_metadata_bridge(moved)
+    moved_payload = _read_renderer_payload(
+        render_ga_documents(
+            tmp_path / "moved",
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=moved,
+        )[1]
+    )
+
+    assert original["evidence_bridge_digest"] == moved_payload["evidence_bridge_digest"]
+
+
+@pytest.mark.parametrize("previous_writer_generation", [None, "v6.1"])
+def test_renderer_requires_default_writer_previous_generation(
+    tmp_path, previous_writer_generation
+):
+    bridge = _load_renderer_bridge()
+    if previous_writer_generation is not None:
+        bridge["default_writer"] = {
+            **bridge["default_writer"],
+            "previous_writer_generation": previous_writer_generation,
+        }
+    else:
+        bridge["default_writer"] = {
+            key: value
+            for key, value in bridge["default_writer"].items()
+            if key != "previous_writer_generation"
+        }
+    bridge = _rehash_metadata_bridge(bridge)
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            tmp_path,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            evidence_bridge=bridge,
+        )
+
+    assert error.value.code == "GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID"
 
 
 def test_renderer_rejects_bridge_activation_lineage_drift(tmp_path):

@@ -135,6 +135,7 @@ _EVIDENCE_DEFAULT_FIELDS = frozenset(
     {
         "activation_id",
         "legacy_writer_fence_stopped",
+        "previous_writer_generation",
         "readback_receipt_digest",
         "record_id",
         "source_file",
@@ -338,6 +339,9 @@ def _renderer_evidence_bridge_context(
     payload.pop("bridge_digest", None)
     if digest_value(payload) != bridge_digest:
         raise ReleaseGateError("GA_METADATA_BRIDGE_DIGEST_MISMATCH")
+    bridge_identity_payload = dict(payload)
+    bridge_identity_payload.pop("release_subject", None)
+    bridge_identity_digest = digest_value(bridge_identity_payload)
 
     repository = _bridge_text(
         evidence_bridge.get("repository"), "GA evidence bridge repository"
@@ -455,6 +459,15 @@ def _renderer_evidence_bridge_context(
     _bridge_fields(default_writer, _EVIDENCE_DEFAULT_FIELDS)
     if default_writer.get("legacy_writer_fence_stopped") is not True:
         raise ReleaseGateError("GA_METADATA_BRIDGE_DEFAULT_WRITER_INVALID")
+    default_previous_writer_generation = default_writer.get(
+        "previous_writer_generation"
+    )
+    if (
+        type(default_previous_writer_generation) is not str
+        or not default_previous_writer_generation.strip()
+        or default_previous_writer_generation != _PRODUCTION_WRITER_GENERATION
+    ):
+        raise ReleaseGateError("GA_METADATA_BRIDGE_WRITER_GENERATION_INVALID")
     if (
         _bridge_text(
             default_writer.get("activation_id"), "GA evidence default activation"
@@ -536,6 +549,7 @@ def _renderer_evidence_bridge_context(
         "activation_id": production_activation_id,
         "campaign_key": None,
         "mode": "default_v8",
+        "previous_writer_generation": default_previous_writer_generation,
         "receipt_digest": default_receipt_digest,
         "repository": repository,
         "writer_generation": production_writer_generation,
@@ -551,6 +565,7 @@ def _renderer_evidence_bridge_context(
         "acceptance": normalized_acceptance,
         "bridge": dict(evidence_bridge),
         "bridge_digest": bridge_digest,
+        "bridge_identity_digest": bridge_identity_digest,
         "default_writer": normalized_default_writer,
         "links": links,
         "named_admission": normalized_named_admission,
@@ -1029,7 +1044,9 @@ def render_ga_documents(
     }
     if bridge is not None:
         if evidence_context is not None:
-            common["evidence_bridge_digest"] = evidence_context["bridge_digest"]
+            common["evidence_bridge_digest"] = evidence_context[
+                "bridge_identity_digest"
+            ]
             common["evidence_bridge_activation_subject"] = evidence_context[
                 "activation_release_subject"
             ]
