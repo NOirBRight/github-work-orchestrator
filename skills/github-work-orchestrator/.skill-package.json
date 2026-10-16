@@ -1,6 +1,6 @@
 {
-  "content_sha256": "5b57e3ad0287761d3bb92dc108753d57f07c6969b950218b623a71b04ee51892",
+  "content_sha256": "01e3cd73b4b74070162d5388b96c53c2b797a753bbcb009c2534a2325b31192c",
   "schema_version": 1,
   "skill": "github-work-orchestrator",
-  "version": "2.3.0"
+  "version": "2.4.0"
 }

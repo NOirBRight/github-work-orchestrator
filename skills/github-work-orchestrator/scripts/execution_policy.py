@@ -15,6 +15,17 @@ MAX_VISIBLE_ORCHESTRATORS_PER_ACTIVITY = 1
 MAX_VISIBLE_WORKERS_GLOBAL = 3
 MAX_SUBAGENTS_PER_ORCHESTRATOR = 4
 CLEANUP_DEADLINE_SECONDS = 5 * 60
+EXECUTION_HOSTS = {"codex", "zcode"}
+EXECUTION_LANES = {"inline", "subagent", "visible-worker"}
+ZCODE_SESSION_LOCAL_VISIBLE_REASONS = {
+    "prolonged-observation",
+    "independent-visible-context",
+}
+ZCODE_UNSUPPORTED_VISIBLE_REASONS = {
+    "restart-persistence",
+    "manual-ui-or-login",
+    "human-visible-task",
+}
 TASK_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -33,6 +44,7 @@ def classify_execution_lane(
     manual_ui_or_login: bool = False,
     prolonged_observation: bool = False,
     independent_visible_context: bool = False,
+    human_visible_task: bool = False,
 ) -> dict[str, Any]:
     """Choose the lightest lane that satisfies explicit persistence needs."""
 
@@ -45,6 +57,7 @@ def classify_execution_lane(
             ("manual-ui-or-login", manual_ui_or_login),
             ("prolonged-observation", prolonged_observation),
             ("independent-visible-context", independent_visible_context),
+            ("human-visible-task", human_visible_task),
         )
         if required
     ]
@@ -67,6 +80,73 @@ def classify_execution_lane(
         "reasons": reasons,
         "isolated_worktree_required": True,
         "visible_creation_guard_required": lane == "visible-worker",
+    }
+
+
+def resolve_execution_surface(
+    *,
+    lane: str,
+    reasons: list[str],
+    host: str = "codex",
+    human_visible_task: bool = False,
+) -> dict[str, Any]:
+    """Resolve a semantic lane to one host execution surface."""
+
+    if lane not in EXECUTION_LANES:
+        raise ValueError("invalid execution lane")
+    if host not in EXECUTION_HOSTS:
+        raise ValueError("invalid execution host")
+    if not isinstance(reasons, list) or not reasons or not all(
+        isinstance(reason, str) and reason.strip() for reason in reasons
+    ):
+        raise ValueError("reasons must be a nonempty text list")
+
+    normalized_reasons = list(reasons)
+    if human_visible_task and "human-visible-task" not in normalized_reasons:
+        normalized_reasons.append("human-visible-task")
+
+    if host == "codex":
+        return {
+            "schema_version": 1,
+            "host": host,
+            "lane": lane,
+            "surface": lane,
+            "available": True,
+            "degraded": False,
+            "counts_as_subagent": lane == "subagent",
+            "visible_creation_guard_required": lane == "visible-worker",
+            "blockers": [],
+        }
+
+    blockers = []
+    if lane == "visible-worker":
+        unsupported = sorted(
+            set(normalized_reasons) & ZCODE_UNSUPPORTED_VISIBLE_REASONS
+        )
+        if unsupported:
+            blockers.extend(f"unsupported:{reason}" for reason in unsupported)
+        if not set(normalized_reasons).issubset(
+            ZCODE_SESSION_LOCAL_VISIBLE_REASONS
+            | ZCODE_UNSUPPORTED_VISIBLE_REASONS
+        ):
+            blockers.append("unsupported:unknown-visible-requirement")
+
+    if blockers:
+        surface = "unavailable"
+    elif lane == "visible-worker":
+        surface = "subagent"
+    else:
+        surface = lane
+    return {
+        "schema_version": 1,
+        "host": host,
+        "lane": lane,
+        "surface": surface,
+        "available": not blockers,
+        "degraded": lane == "visible-worker" and surface == "subagent",
+        "counts_as_subagent": surface == "subagent",
+        "visible_creation_guard_required": False,
+        "blockers": blockers,
     }
 
 
@@ -188,6 +268,8 @@ def _parser() -> argparse.ArgumentParser:
     lane.add_argument("--manual-ui-or-login", action="store_true")
     lane.add_argument("--prolonged-observation", action="store_true")
     lane.add_argument("--independent-visible-context", action="store_true")
+    lane.add_argument("--host", choices=sorted(EXECUTION_HOSTS), default="codex")
+    lane.add_argument("--human-visible-task", action="store_true")
 
     capacity = subparsers.add_parser("capacity")
     capacity.add_argument("--visible-orchestrators", type=int, required=True)
@@ -214,14 +296,23 @@ def main() -> int:
     arguments = _parser().parse_args()
     try:
         if arguments.command == "lane":
-            report = classify_execution_lane(
+            lane = classify_execution_lane(
                 expected_minutes=arguments.expected_minutes,
                 same_boundary=arguments.same_boundary,
                 restart_persistence=arguments.restart_persistence,
                 manual_ui_or_login=arguments.manual_ui_or_login,
                 prolonged_observation=arguments.prolonged_observation,
                 independent_visible_context=arguments.independent_visible_context,
+                human_visible_task=arguments.human_visible_task,
             )
+            report = lane | {
+                "host_resolution": resolve_execution_surface(
+                    lane=lane["lane"],
+                    reasons=lane["reasons"],
+                    host=arguments.host,
+                    human_visible_task=arguments.human_visible_task,
+                )
+            }
         elif arguments.command == "capacity":
             report = capacity_report(
                 visible_orchestrators_for_activity=arguments.visible_orchestrators,

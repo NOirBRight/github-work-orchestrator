@@ -1,12 +1,12 @@
 ---
 name: github-issue-worker
-description: Execute one assigned GitHub Issue as a sidebar-visible Worker in one isolated worktree, honoring the pinned base, future branch, hotset, GLM-5.2 binding, permissions, acceptance, verification, callback, publication, and PR target. Use only when an Orchestrator explicitly selects the Visible Worker lane and supplies a complete contract.
+description: Execute one assigned GitHub Issue as a Codex sidebar-visible Worker or bounded ZCode Agent in one isolated worktree, honoring the pinned base, future branch, hotset, GLM-5.2 binding, permissions, acceptance, verification, publication, and PR target. Use only when an Orchestrator supplies a complete execution contract.
 ---
 
 # GitHub Issue Worker
 
 Own one assigned execution, worktree, branch, PR, and evidence trail. Do not
-claim another Issue or spawn a second visible Task.
+claim another Issue or spawn a second Task or Agent.
 
 ## Accept one contract
 
@@ -19,20 +19,23 @@ Require:
 4. Hotset, prohibited writes, and one-editor boundary.
 5. Verification class/commands, manual evidence, architecture decision, and
    `Review-Owner: orchestrator`.
-6. `execution_lane: visible-worker`.
+6. `execution_lane: visible-worker` for Codex or resolved `subagent` for ZCode.
 7. `model_binding: ollama-cloud/glm-5.2`, reasoning `max`, binding
-   requirement/status, and sanitized evidence.
-8. Effective permission profile and exact Orchestrator callback.
+   requirement/status, and sanitized evidence. ZCode also requires the exact
+   `haiku` request alias and separate reasoning transport evidence.
+8. Effective permission profile. Codex also requires the exact Orchestrator
+   callback; ZCode returns through the parent collaboration channel.
 
-Read [Visible Worker execution core](references/shared/worker-execution.md).
-Stop with `BLOCKED` before edits for missing identity, unavailable GLM binding,
-unknown/rejected status, insufficient permissions, wrong base/worktree, open
-architecture decision, or conflicting ownership. Never silently use GPT.
+Read [Worker execution core](references/shared/worker-execution.md). Stop with
+`BLOCKED` before edits for missing identity, unavailable GLM or explicit-max
+binding, unknown/rejected status, insufficient permissions, wrong base/worktree,
+open architecture decision, or conflicting ownership. Never silently use GPT.
 
 ## Boot and pass preflight
 
-Send `WORKER_BOOTED` before repository or GitHub writes. Run the packaged
-deterministic preflight from the exact assigned worktree:
+For a Codex Visible Worker, send `WORKER_BOOTED` before repository or GitHub
+writes. Run the packaged deterministic preflight from the exact assigned
+worktree:
 
 ```text
 python <skill>/scripts/preflight.py --cwd <worktree> \
@@ -44,6 +47,10 @@ python <skill>/scripts/preflight.py --cwd <worktree> \
 Send `PREFLIGHT_READY` and become idle. Do not create a branch, edit source,
 write GitHub, commit, push, or open a PR until the Orchestrator sends literal
 `START` and its native receipt identifies this Task.
+
+For a ZCode Agent, the Orchestrator performs and records these gates before
+launch. The complete initial Agent prompt is START; do not wait for a second
+activation message or emit Task activation signals.
 
 ## Keep the worktree execution-only
 
@@ -65,8 +72,9 @@ repository-documented canonical installation.
 
 ## Implement the assigned scope
 
-After `START`, post a short plan naming expected writes, verification, and
-collisions. Reproduce a bug at a public seam and add the smallest faithful
+After Codex `START`, or immediately from an authorized ZCode initial prompt,
+post a short plan naming expected writes, verification, and collisions.
+Reproduce a bug at a public seam and add the smallest faithful
 regression when applicable. Implement vertically and stay inside the assigned
 hotset.
 
@@ -97,10 +105,12 @@ green `PR_OPENED` signal.
 
 Use the compact
 [publish and callback](references/shared/worker-execution.md#publish-and-callback)
-rules and `scripts/worker_signal.py`. Send the exact envelope to the exact
-Orchestrator callback before the final response. Retry one transport failure
-with the same Signal-ID; after another failure record
-`CALLBACK_DELIVERY_FAILED` and stop.
+rules. A Codex Visible Worker uses `scripts/worker_signal.py` and sends the exact
+envelope to the exact Orchestrator callback before the final response. A ZCode
+Agent returns its final result through the parent collaboration channel; parent
+revisions arrive through `SendMessage` addressed to its exact Agent ID. Retry
+one transport failure with the same Signal-ID only when a semantic receipt was
+requested; after another failure record `CALLBACK_DELIVERY_FAILED` and stop.
 
 Return outcome, changed files, commit/PR, targeted/full verification, timings,
 full-suite count, `Review-Runs: 0`, scope delta, blockers, and whether the Issue
@@ -111,6 +121,8 @@ can close.
 On host failure, stop editing and preserve WIP through one scoped pushed
 checkpoint when possible. Never reset or activate a second editor. On merge or
 stop, report the exact durable/clean state so the Orchestrator can remove the
-eligible worktree and delete a merged local branch within five minutes. Task
-archiving is human-owned; the Orchestrator reports this exact Task as ready for
-archive and never invokes the native archive action automatically.
+eligible worktree and delete a merged local branch within five minutes. Codex
+Task archiving is human-owned; the Orchestrator reports this exact Task as ready
+for archive and never invokes the native archive action automatically. ZCode
+Agents have no Task archive step. If a ZCode parent restart leaves predecessor
+status unknown, preserve the worktree and do not activate a replacement editor.

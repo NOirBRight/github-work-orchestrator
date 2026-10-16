@@ -147,7 +147,9 @@ class SkillPackageTests(unittest.TestCase):
         state_rules = (ROOT / "shared/github-state-rules.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("GitHub Issue and the native Task contract", state_rules)
+        self.assertIn(
+            "GitHub Issue and the native Task or Agent contract", state_rules
+        )
         self.assertIn("not additional runtime Skill installations", state_rules)
 
     def test_packaged_scripts_do_not_mutate_workspace_or_skill_topology(self) -> None:
@@ -477,6 +479,29 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("| `standard` | `ollama-cloud/glm-5.2`", profiles)
         self.assertIn("No silent GPT fallback", profiles)
         self.assertIn("explicit `max`", profiles)
+        self.assertIn("`haiku`", profiles)
+        self.assertIn("`lite`", profiles)
+        self.assertIn("reasoning_binding_status", profiles)
+        self.assertIn("UPSTREAM_REASONING_UNAVAILABLE", profiles)
+
+    def test_zcode_compatibility_is_skill_only_and_task_free(self) -> None:
+        orchestrator = (
+            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        ).read_text(encoding="utf-8")
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        protocol = (ROOT / "shared/communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        combined = "\n".join((orchestrator, worker, protocol))
+        self.assertIn("`Agent`", combined)
+        self.assertIn("`SendMessage`", combined)
+        self.assertIn("exact `agentId`", combined)
+        self.assertIn("no\nTask UUID", orchestrator)
+        self.assertIn("no Task archive step", worker)
+        self.assertIn("without `WORKER_BOOTED`", protocol)
+        self.assertNotIn("ZCode Hook", combined)
 
     def test_orchestrator_declares_tiered_lanes_capacity_and_cleanup(self) -> None:
         orchestrator = (

@@ -1,8 +1,9 @@
 # GitHub and execution-owner state rules
 
 GitHub Issues, native dependencies, assignees, linked PRs, and repository policy
-are the only persistent work-state source. Codex tasks and Subagents are runtime
-execution surfaces, not a second project ledger. Never edit Codex SQLite.
+are the only persistent work-state source. Codex Tasks, ZCode Agents, and
+Subagents are runtime execution surfaces, not a second project ledger. Never
+edit Codex or ZCode private desktop state.
 
 ## Contents
 
@@ -22,10 +23,15 @@ one isolated worktree, one exact editor, and one execution lane:
 - Inline: the Orchestrator is the editor and evidence owner.
 - Subagent: the Orchestrator remains the GitHub/evidence owner; one bounded
   Subagent edits only its assigned worktree/write set and returns the result.
-- Visible Worker: one sidebar-visible Task owns execution and callback evidence.
+  On ZCode this surface is an `Agent`, including a session-local downgrade from
+  Visible Worker when only independent context or prolonged work is required.
+- Visible Worker: one Codex sidebar-visible Task owns execution and callback
+  evidence. ZCode has no equivalent surface.
 
 A Subagent is not a persistent project owner and does not claim another Issue,
 branch, PR, or lifecycle. The Orchestrator publishes and integrates its work.
+A ZCode Agent does not satisfy restart persistence, manual UI/login, or
+human-visible sidebar requirements.
 Discovered independent work returns to Intake or the frontier.
 
 Preserve dirty working trees and unrelated user work. Never use a shared
@@ -55,7 +61,7 @@ Each role Skill resolves from exactly one repository-documented canonical
 installation. Never copy, install, junction, symlink, or generate a Skill under
 a repository or execution worktree, and never encode per-Issue or per-Worker
 state in a dynamic `SKILL.md`, plugin, or project-local Skill. Keep that runtime
-state in the GitHub Issue and the native Task contract.
+state in the GitHub Issue and the native Task or Agent contract.
 
 Version-controlled package sources and lazy `references/`, `scripts/`, and
 `assets/` are package contents, not additional runtime Skill installations.
@@ -65,8 +71,9 @@ Skill installation.
 
 ## Reliable task materialization
 
-This section applies only to the Visible Worker lane. Reserve the host-wide
-creation singleflight immediately before the native Task-creation call. Keep
+This section applies only to the Codex Visible Worker lane. It never applies to
+a ZCode `Agent`. Reserve the host-wide creation singleflight immediately before
+the native Task-creation call. Keep
 only `creating` or `uncertain` state. A queued client receipt is not a Task.
 
 Release the creation guard as soon as native discovery identifies the exact real
@@ -142,10 +149,11 @@ After a verified merge or stop, trigger cleanup immediately; complete it within
 five minutes. This is a deadline, not a polling interval.
 
 Use the execution policy cleanup plan with the exact absolute worktree, merged
-branch when applicable, and Visible Worker Task ID. Remove an isolated worktree
-only when it is clean, durable (pushed or integrated), inactive, and
-unambiguously owned.
-Delete a local branch only when merged. Task archiving is human-owned: report
+branch when applicable, and Codex Visible Worker Task ID. ZCode Subagents omit
+that ID and produce no Task archive action. Remove an isolated worktree only
+when it is clean, durable (pushed or integrated), inactive, and unambiguously
+owned. Delete a local branch only when merged. Task archiving is human-owned:
+report
 the exact corresponding Visible Worker as ready for archive, but never call the
 native archive action automatically because descendant cleanup can cross a
 delegation boundary. Preserve and report dirty, unpushed, ambiguous, active, or

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -182,6 +183,97 @@ class ExecutionContractTests(unittest.TestCase):
         self.assertFalse(report["dispatchable"])
         self.assertIn("exact-runtime-binding-not-verified", report["errors"])
 
+    def test_zcode_subagent_uses_known_alias_and_separate_reasoning_evidence(self) -> None:
+        candidate = contract(
+            execution_host="zcode",
+            model_request_alias="haiku",
+            reasoning_binding_status="request-accepted",
+            reasoning_binding_evidence="gateway-probe-preserved-explicit-max",
+        )
+        candidate.pop("callback_task")
+        report = CONTRACT.validate_contract(candidate)
+        self.assertTrue(report["dispatchable"], report["errors"])
+        self.assertEqual("zcode", report["execution_host"])
+
+    def test_zcode_subagent_rejects_unknown_alias(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                execution_host="zcode",
+                model_request_alias="custom-provider-name",
+                reasoning_binding_status="request-accepted",
+                reasoning_binding_evidence="gateway-probe-preserved-explicit-max",
+            )
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("unknown-zcode-model-request-alias", report["errors"])
+
+    def test_zcode_subagent_rejects_reasoning_failure_states(self) -> None:
+        expected = {
+            "rejected": "reasoning-binding-rejected",
+            "unknown": "reasoning-binding-unknown",
+            "contradicted": "reasoning-binding-contradicted",
+        }
+        for status, error in expected.items():
+            with self.subTest(status=status):
+                report = CONTRACT.validate_contract(
+                    contract(
+                        execution_host="zcode",
+                        model_request_alias="haiku",
+                        reasoning_binding_status=status,
+                        reasoning_binding_evidence="gateway-probe-result",
+                    )
+                )
+                self.assertFalse(report["dispatchable"])
+                self.assertIn(error, report["errors"])
+
+    def test_zcode_subagent_fails_closed_without_reasoning_transport_evidence(self) -> None:
+        missing = CONTRACT.validate_contract(
+            contract(execution_host="zcode", model_request_alias="haiku")
+        )
+        unknown = CONTRACT.validate_contract(
+            contract(
+                execution_host="zcode",
+                model_request_alias="haiku",
+                reasoning_binding_status="unknown",
+                reasoning_binding_evidence="explicit-max-not-observable",
+            )
+        )
+        self.assertIn("invalid-reasoning-binding-status", missing["errors"])
+        self.assertIn(
+            "missing-or-empty:reasoning_binding_evidence", missing["errors"]
+        )
+        self.assertIn("reasoning-binding-unknown", unknown["errors"])
+
+    def test_zcode_visible_worker_must_resolve_before_dispatch(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                execution_host="zcode",
+                execution_lane="visible-worker",
+                callback_task="",
+                model_request_alias="haiku",
+                reasoning_binding_status="request-accepted",
+                reasoning_binding_evidence="gateway-probe-preserved-explicit-max",
+            )
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn(
+            "zcode-visible-worker-must-resolve-to-subagent", report["errors"]
+        )
+        self.assertNotIn("visible-worker-requires-callback-task", report["errors"])
+
+    def test_zcode_inline_does_not_require_agent_binding_fields(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                execution_host="zcode",
+                execution_lane="inline",
+                model_profile="orchestrator",
+                model_binding="zcode-main-model",
+                model_reasoning_effort="session-policy",
+                model_binding_status="runtime-verified",
+            )
+        )
+        self.assertTrue(report["dispatchable"], report["errors"])
+
     def test_implementation_worker_cannot_silently_fall_back_to_gpt(self) -> None:
         report = CONTRACT.validate_contract(
             contract(
@@ -275,12 +367,30 @@ class ExecutionLanePolicyTests(unittest.TestCase):
         )
         self.assertEqual("subagent", report["lane"])
 
+    def test_surface_resolution_rejects_unknown_host_or_reason(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid execution host"):
+            POLICY.resolve_execution_surface(
+                lane="subagent",
+                reasons=["bounded-implementation-default"],
+                host="unknown",
+            )
+        report = POLICY.resolve_execution_surface(
+            lane="visible-worker",
+            reasons=["new-host-requirement"],
+            host="zcode",
+        )
+        self.assertFalse(report["available"])
+        self.assertIn(
+            "unsupported:unknown-visible-requirement", report["blockers"]
+        )
+
     def test_persistent_or_human_work_routes_visible(self) -> None:
         cases = (
             {"restart_persistence": True},
             {"manual_ui_or_login": True},
             {"prolonged_observation": True},
             {"independent_visible_context": True},
+            {"human_visible_task": True},
         )
         for requirement in cases:
             with self.subTest(requirement=requirement):
@@ -290,6 +400,90 @@ class ExecutionLanePolicyTests(unittest.TestCase):
                     **requirement,
                 )
                 self.assertEqual("visible-worker", report["lane"])
+
+    def test_zcode_resolves_bounded_work_to_subagent(self) -> None:
+        lane = POLICY.classify_execution_lane(
+            expected_minutes=45,
+            same_boundary=False,
+        )
+        report = POLICY.resolve_execution_surface(
+            lane=lane["lane"],
+            reasons=lane["reasons"],
+            host="zcode",
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual("subagent", report["surface"])
+        self.assertFalse(report["degraded"])
+
+    def test_zcode_degrades_session_local_visible_reasons_to_subagent(self) -> None:
+        for reason in ("prolonged-observation", "independent-visible-context"):
+            with self.subTest(reason=reason):
+                report = POLICY.resolve_execution_surface(
+                    lane="visible-worker",
+                    reasons=[reason],
+                    host="zcode",
+                )
+                self.assertTrue(report["available"])
+                self.assertEqual("subagent", report["surface"])
+                self.assertTrue(report["degraded"])
+                self.assertTrue(report["counts_as_subagent"])
+                self.assertFalse(report["visible_creation_guard_required"])
+
+    def test_zcode_does_not_degrade_restart_ui_or_sidebar_requirements(self) -> None:
+        cases = (
+            ("restart-persistence", False),
+            ("manual-ui-or-login", False),
+            ("independent-visible-context", True),
+        )
+        for reason, human_visible_task in cases:
+            with self.subTest(reason=reason):
+                report = POLICY.resolve_execution_surface(
+                    lane="visible-worker",
+                    reasons=[reason],
+                    host="zcode",
+                    human_visible_task=human_visible_task,
+                )
+                self.assertFalse(report["available"])
+                self.assertEqual("unavailable", report["surface"])
+                self.assertFalse(report["counts_as_subagent"])
+
+    def test_codex_surface_resolution_preserves_visible_worker(self) -> None:
+        report = POLICY.resolve_execution_surface(
+            lane="visible-worker",
+            reasons=["restart-persistence"],
+            host="codex",
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual("visible-worker", report["surface"])
+        self.assertFalse(report["degraded"])
+        self.assertTrue(report["visible_creation_guard_required"])
+
+    def test_lane_cli_reports_host_resolution(self) -> None:
+        script = (
+            ROOT
+            / "skills"
+            / "github-work-orchestrator"
+            / "scripts"
+            / "execution_policy.py"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "lane",
+                "--host",
+                "zcode",
+                "--expected-minutes",
+                "30",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        policy = json.loads(completed.stdout)["policy"]
+        self.assertEqual("subagent", policy["lane"])
+        self.assertEqual("zcode", policy["host_resolution"]["host"])
+        self.assertEqual("subagent", policy["host_resolution"]["surface"])
 
     def test_capacity_enforces_one_three_four_and_host_slots(self) -> None:
         report = POLICY.capacity_report(

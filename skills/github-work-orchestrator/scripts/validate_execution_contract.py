@@ -12,14 +12,25 @@ from typing import Any
 
 
 VERIFICATION_CLASSES = {"fast", "standard", "strict"}
+EXECUTION_HOSTS = {"codex", "zcode"}
 EXECUTION_LANES = {"inline", "subagent", "visible-worker"}
 MODEL_BINDING_REQUIREMENTS = {"best-effort", "exact-runtime"}
 MODEL_BINDING_STATUSES = {
     "request-accepted",
+    "profile-verified",
     "runtime-verified",
     "rejected",
     "unknown",
+    "contradicted",
 }
+REASONING_BINDING_STATUSES = {
+    "request-accepted",
+    "runtime-verified",
+    "rejected",
+    "unknown",
+    "contradicted",
+}
+ZCODE_MODEL_REQUEST_ALIASES = {"haiku": "lite"}
 IMPLEMENTATION_WORKER_BINDING = "ollama-cloud/glm-5.2"
 IMPLEMENTATION_WORKER_PROFILES = {
     "core",
@@ -145,15 +156,20 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("invalid-architecture-decision")
     if contract.get("review_owner") != "orchestrator":
         errors.append("review-owner-must-be-orchestrator")
+    execution_host = contract.get("execution_host", "codex")
+    if execution_host not in EXECUTION_HOSTS:
+        errors.append("invalid-execution-host")
     execution_lane = contract.get("execution_lane")
     if execution_lane not in EXECUTION_LANES:
         errors.append("invalid-execution-lane")
-    if execution_lane == "visible-worker":
+    if execution_lane == "visible-worker" and execution_host == "codex":
         callback_task = contract.get("callback_task")
         if not nonempty_text(callback_task):
             errors.append("visible-worker-requires-callback-task")
         elif not TASK_ID_RE.fullmatch(callback_task):
             errors.append("visible-worker-callback-task-invalid")
+    elif execution_lane == "visible-worker" and execution_host == "zcode":
+        errors.append("zcode-visible-worker-must-resolve-to-subagent")
 
     binding_requirement = contract.get("model_binding_requirement")
     if binding_requirement not in MODEL_BINDING_REQUIREMENTS:
@@ -165,6 +181,8 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("model-binding-rejected")
     elif binding_status == "unknown":
         errors.append("model-binding-unknown")
+    elif binding_status == "contradicted":
+        errors.append("model-binding-contradicted")
     if (
         binding_requirement == "exact-runtime"
         and binding_status != "runtime-verified"
@@ -172,7 +190,8 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("exact-runtime-binding-not-verified")
     if (
         binding_requirement == "best-effort"
-        and binding_status not in {"request-accepted", "runtime-verified"}
+        and binding_status
+        not in {"request-accepted", "profile-verified", "runtime-verified"}
     ):
         errors.append("best-effort-binding-not-accepted")
 
@@ -189,10 +208,26 @@ def validate_contract(contract: Any) -> dict[str, Any]:
     elif execution_lane == "inline":
         if model_profile != INLINE_PROFILE:
             errors.append("inline-lane-must-use-orchestrator-profile")
-        if model_binding != INLINE_BINDING:
+        if execution_host == "codex" and model_binding != INLINE_BINDING:
             errors.append("inline-lane-must-keep-orchestrator-gpt")
-        if reasoning != INLINE_REASONING:
+        if execution_host == "codex" and reasoning != INLINE_REASONING:
             errors.append("inline-lane-must-keep-orchestrator-reasoning")
+
+    if execution_host == "zcode" and execution_lane == "subagent":
+        request_alias = contract.get("model_request_alias")
+        if request_alias not in ZCODE_MODEL_REQUEST_ALIASES:
+            errors.append("unknown-zcode-model-request-alias")
+        reasoning_status = contract.get("reasoning_binding_status")
+        if reasoning_status not in REASONING_BINDING_STATUSES:
+            errors.append("invalid-reasoning-binding-status")
+        elif reasoning_status == "rejected":
+            errors.append("reasoning-binding-rejected")
+        elif reasoning_status == "unknown":
+            errors.append("reasoning-binding-unknown")
+        elif reasoning_status == "contradicted":
+            errors.append("reasoning-binding-contradicted")
+        if not nonempty_text(contract.get("reasoning_binding_evidence")):
+            errors.append("missing-or-empty:reasoning_binding_evidence")
     base_sha = contract.get("base_sha")
     if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
         errors.append("base-sha-must-be-lowercase-40-hex")
@@ -213,6 +248,7 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         "schema_version": 1,
         "status": "valid" if not errors else "invalid",
         "dispatchable": not errors,
+        "execution_host": execution_host,
         "execution_lane": execution_lane,
         "verification_class": verification_class,
         "verification_plan": (

@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns by aligning direction, reconciling Issues and dependencies, routing work across Inline, Subagent, or Visible Worker lanes, binding implementation Workers, reviewing PRs, integrating results, and cleaning completed work. Use when Codex must run a GitHub campaign, compute/refill a ready frontier, dispatch implementation, or arbitrate integration.
+description: Orchestrate GitHub execution campaigns by aligning direction, reconciling Issues and dependencies, routing work across Inline, Subagent, or Visible Worker lanes, binding implementation Workers, reviewing PRs, integrating results, and cleaning completed work. Use when Codex or ZCode must run a GitHub campaign, compute/refill a ready frontier, dispatch implementation, or arbitrate integration.
 ---
 
 # GitHub Work Orchestrator
@@ -54,10 +54,19 @@ Use the deterministic router:
 
 ```text
 python <skill>/scripts/execution_policy.py lane \
-  --expected-minutes <n> [--same-boundary] \
+  --host <codex|zcode> --expected-minutes <n> [--same-boundary] \
   [--restart-persistence] [--manual-ui-or-login] \
-  [--prolonged-observation] [--independent-visible-context]
+  [--prolonged-observation] [--independent-visible-context] \
+  [--human-visible-task]
 ```
+
+The semantic `lane` remains stable. Use `host_resolution.surface` for the actual
+host call. On Codex they match. On ZCode, bounded Subagent work uses `Agent`.
+A Visible Worker selected only for prolonged observation or independent context
+may resolve to a background `Agent` while the parent session remains live. It is
+then a Subagent for capacity, communication, recovery, and cleanup. A request for
+restart persistence, manual UI/login, or a human-visible sidebar Task resolves to
+`unavailable`; do not claim that a background Agent satisfies it.
 
 - **Inline** — small same-boundary work expected in about 15 minutes. The
   Orchestrator keeps its GPT binding and works in an isolated worktree.
@@ -82,14 +91,20 @@ events only; do not poll for capacity.
 
 All independently bound implementation Subagents and Visible Workers use
 `ollama-cloud/glm-5.2` with explicit reasoning `max`. No silent GPT
-fallback is allowed. Validate/install the canonical custom `worker` agent with:
+fallback is allowed. On Codex, validate/install the canonical custom `worker`
+agent with:
 
 ```text
 python <skill>/scripts/install_worker_agent.py --check
 python <skill>/scripts/install_worker_agent.py --install
 ```
 
-A binding rejection stops that lane for an explicit maintainer decision.
+On ZCode, use the exact `haiku -> lite -> ollama-cloud/glm-5.2` mapping and
+record model and reasoning evidence separately. Until the gateway preserves and
+accepts explicit `max`, independently bound write work stops with
+`UPSTREAM_REASONING_UNAVAILABLE`. Token counts, prompt text, and a configured
+profile are not proof that `max` reached the model. A binding rejection stops
+that lane for an explicit maintainer decision.
 
 ## Execute Inline or Subagent work
 
@@ -99,7 +114,17 @@ task containing exact worktree, branch, hotset, acceptance, verification, model
 binding, and return format. The Subagent does not own GitHub lifecycle or
 publish independently; the Orchestrator integrates and verifies its result.
 
-If a Subagent cannot use GLM-5.2, report the rejection. Do not reroute it to GPT.
+On ZCode, launch one `Agent` with the complete, already authorized contract; no
+Task UUID, callback Task, creation lease, archive, or extra START handshake is
+required. Send revisions to that exact `agentId` with `SendMessage`. A successful
+send is transport acceptance, not semantic acknowledgement; when acknowledgement
+matters, require `SIGNAL_RECEIVED <Signal-ID>` and retry one transport failure
+with the identical envelope. The final Agent result returns outcome, changed
+paths, checks, commit/PR when applicable, and blockers through the parent
+collaboration channel.
+
+If a Subagent cannot use GLM-5.2 or explicit `max`, report the rejection. Do not
+reroute it to GPT.
 
 ## Keep worktrees execution-only
 
@@ -122,6 +147,9 @@ repository/worktree, and never turn per-Issue state into a dynamic `SKILL.md`,
 plugin, or project-local Skill.
 
 ## Create a Visible Worker
+
+This section is Codex-only. On ZCode, use the resolved surface above; never run
+the Task creation lease for an `Agent` or report an Agent as sidebar-visible.
 
 Before the one native creation call, reserve the host-wide creation singleflight
 with a caller-generated private owner token:
@@ -163,7 +191,8 @@ Merge and stop events trigger cleanup; complete eligible cleanup within five min
 The deadline is event-triggered, not a five-minute polling loop.
 
 Run `execution_policy.py cleanup-plan` with the exact absolute worktree path,
-merged branch name when applicable, and exact Visible Worker Task ID. Then:
+merged branch name when applicable, and exact Codex Visible Worker Task ID.
+ZCode Subagents omit the Task ID and never produce a Task archive action. Then:
 
 1. verify the editor is idle, the worktree is clean, ownership is unambiguous,
    and work is pushed or integrated;

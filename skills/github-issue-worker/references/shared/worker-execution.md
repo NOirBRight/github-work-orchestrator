@@ -1,37 +1,48 @@
-# Visible Worker execution core
+# Worker execution core
 
-Load this compact reference only for an assigned sidebar-visible Worker. The
-GitHub Issue owns product acceptance; the repository owns verification
-commands; the Orchestrator owns review and lifecycle.
+Load this compact reference for an assigned Codex sidebar-visible Worker or a
+ZCode Subagent whose resolved surface is `subagent`. The GitHub Issue owns
+product acceptance; the repository owns verification commands; the
+Orchestrator owns review and lifecycle.
 
 ## Contract gate
 
-Accept exactly one Issue, Task, isolated worktree, future branch, PR target,
-callback, and hotset. Require the v2 verification fields, pinned base SHA,
-permission profile, and explicit model contract:
+Accept exactly one Issue, isolated worktree, future branch, PR target, and
+hotset. A Codex Visible Worker also requires one exact Task and callback. A ZCode
+Subagent instead requires `execution_host: zcode`, the resolved `subagent`
+surface, and its exact parent-owned Agent identity after launch; it does not
+require a Task UUID, callback Task, creation lease, or archive. Require the v2
+verification fields, pinned base SHA, permission profile, and explicit model
+contract:
 
 ```text
-execution_lane: visible-worker
+execution_lane: subagent | visible-worker
 model_binding: ollama-cloud/glm-5.2
 model_reasoning_effort: max
 model_binding_requirement: best-effort | exact-runtime
-model_binding_status: request-accepted | runtime-verified
+model_binding_status: request-accepted | profile-verified | runtime-verified
 ```
 
-Do not silently switch to GPT. A rejection, unknown status, contradictory
-evidence, missing identity, open architecture choice, or insufficient authority
-produces one `BLOCKED` signal before edits.
+A ZCode Subagent also requires the exact `haiku` request alias and separate
+accepted or runtime-verified reasoning evidence for explicit `max`. Do not
+silently switch to GPT. A rejection, unknown or contradictory status, missing
+identity, open architecture choice, or insufficient authority produces one
+`BLOCKED` result before edits.
 
 ## Activation and preflight
 
-The initial full turn sends `WORKER_BOOTED` before repository writes. Run the
-packaged read-only preflight against the exact base and permissions. Keep the
-worktree clean and make no branch, source, GitHub, or PR write before the
-Orchestrator's literal `START` continuation.
+For a Codex Visible Worker, the initial full turn sends `WORKER_BOOTED` before
+repository writes. Run the packaged read-only preflight against the exact base
+and permissions. Keep the worktree clean and make no branch, source, GitHub, or
+PR write before the Orchestrator's literal `START` continuation. After
+preflight, send `PREFLIGHT_READY` and become idle. The Orchestrator claims and
+reads back the Issue, verifies one editor, then sends `START`. Only that receipt
+authorizes implementation.
 
-After preflight, send `PREFLIGHT_READY` and become idle. The Orchestrator claims
-and reads back the Issue, verifies one editor, then sends `START`. Only that
-receipt authorizes implementation.
+For a ZCode Subagent, the Orchestrator completes the claim, readback, exact-base,
+one-editor, model, reasoning, and permission gates before the `Agent` call. The
+initial full prompt is the authorization to implement. Do not add a second
+`WORKER_BOOTED`/`PREFLIGHT_READY`/`START` state machine.
 
 ## Execution-only CWD
 
@@ -46,8 +57,8 @@ Do not read-modify-write `.codex-global-state.json`,
 `electron-saved-workspace-roots`, Codex SQLite, or equivalent private desktop
 state. Never copy, install, junction, symlink, or generate a Skill in the
 repository or worktree, and never create a dynamic `SKILL.md`, plugin, or
-project-local Skill for execution state. GitHub and the native Task contract
-remain the only execution-state carriers. Each role Skill resolves from exactly
+project-local Skill for execution state. GitHub and the native Task or Agent
+contract remain the only execution-state carriers. Each role Skill resolves from exactly
 one repository-documented canonical installation. Version-controlled package
 sources and lazy `references/`, `scripts/`, and `assets/` are not extra runtime
 Skill installations.
@@ -69,25 +80,32 @@ review from the Worker.
 Implement the smallest accepted scope. Stay inside the assigned worktree and
 hotset. Send `DISCUSSION_REQUIRED` before choosing durable architecture, public
 compatibility, security/privacy policy, migration, or cross-Issue scope. Do not
-merge, close, unassign, reprioritize, or create another Task.
+merge, close, unassign, reprioritize, or create another Task or Agent.
 
 ## Publish and callback
 
 Finish local candidate checks before the first push. Commit and push the one
-assigned branch, open/update the assigned PR, and send `PR_OPENED` immediately.
-CI, Orchestrator review, and safe evidence then run in parallel.
+assigned branch, open/update the assigned PR, and report `PR_OPENED`
+immediately. CI, Orchestrator review, and safe evidence then run in parallel.
 
-Build the canonical signal with `scripts/worker_signal.py`, then send it through
-native Task messaging to the exact Orchestrator callback. Retry one transport
-failure with the same Signal-ID; after a second failure record
-`CALLBACK_DELIVERY_FAILED` and stop.
+A Codex Visible Worker builds the canonical signal with
+`scripts/worker_signal.py` and sends it through native Task messaging to the
+exact Orchestrator callback. Retry one transport failure with the same Signal-ID;
+after a second failure record `CALLBACK_DELIVERY_FAILED` and stop.
+
+A ZCode Subagent returns its final result through the parent collaboration
+channel. Parent revisions use `SendMessage` with the exact `agentId`; when a
+semantic receipt matters, use the same Signal-ID once and retry only an
+identical envelope after one transport failure.
 
 Every material report includes verification class, timings, full-suite count,
 `Review-Runs: 0`, scope delta, changed paths, and next action.
 
 ## Recovery
 
-On Task-host failure, stop editing. Preserve useful WIP through one scoped
-checkpoint and verified remote SHA when possible. Never reset, force-clean, or
-activate a second editor. The Orchestrator loads its detailed Visible Worker
-recovery reference only after this failure.
+On Task or Agent host failure, stop editing. Preserve useful WIP through one
+scoped checkpoint and verified remote SHA when possible. Never reset,
+force-clean, or activate a second editor. The Orchestrator loads its detailed
+Visible Worker recovery reference only for a Codex Task failure. A ZCode parent
+restart does not prove Agent survival or terminality; if no supported readback
+proves the predecessor terminal, preserve the worktree and block a successor.

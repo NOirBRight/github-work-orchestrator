@@ -35,16 +35,35 @@ the maintainer for a deliberate choice.
 
 ## Binding evidence
 
-Use one requirement and one status:
+Record model and reasoning independently:
 
 | Field | Values | Rule |
 |---|---|---|
 | `model_binding_requirement` | `best-effort`, `exact-runtime` | Use exact-runtime only when model identity is itself acceptance-critical |
-| `model_binding_status` | `request-accepted`, `runtime-verified`, `rejected`, `unknown` | Rejection and unknown fail closed |
+| `model_binding_status` | `request-accepted`, `profile-verified`, `runtime-verified`, `rejected`, `unknown`, `contradicted` | Rejection, unknown, and contradiction fail closed |
+| `reasoning_binding_status` | `request-accepted`, `runtime-verified`, `rejected`, `unknown`, `contradicted` | Required for an independently bound ZCode implementation lane |
+| `reasoning_binding_evidence` | sanitized nonempty text | Name supported request or runtime evidence; token counts and prompt text are not proof |
 
-`best-effort` may proceed with `request-accepted` when the native host exposes
-no effective readback. Record that limitation privately. `exact-runtime`
-requires `runtime-verified`. A requested UI value alone is not runtime proof.
+`best-effort` may proceed with `request-accepted` or `profile-verified` when the
+native host exposes no effective model readback. Record that limitation
+privately. `exact-runtime` requires `runtime-verified`. A requested UI value
+alone is not runtime proof. Independently bound ZCode write work additionally
+requires accepted or runtime-verified explicit `max`; model best-effort does not
+weaken that reasoning gate.
+
+## ZCode binding
+
+ZCode implementation Agents use the exact request selector `haiku`. In the
+supported session mapping this resolves through `lite` to
+`ollama-cloud/glm-5.2`. Treat that as an explicit alias registry, not a string
+normalization rule; reject unknown selectors and never strip provider prefixes
+to guess equivalence.
+
+The Agent profile and invocation selector prove only what was requested.
+Runtime metadata may prove model identity, but `reasoningTokens > 0` does not
+prove an effort level. Until the gateway accepts and preserves explicit `max`,
+stop independent ZCode write lanes with `UPSTREAM_REASONING_UNAVAILABLE`; do not
+fall through to a provider default or GPT.
 
 ## Selection order
 
@@ -66,4 +85,6 @@ The canonical personal-agent template is
 `skills/github-work-orchestrator/assets/worker.toml`. It overrides Codex's
 built-in `worker` agent with GLM-5.2. Validate and install it through
 `scripts/install_worker_agent.py`; never overwrite a different existing file
-without the operator's explicit `--replace` decision.
+without the operator's explicit `--replace` decision. This installer is
+Codex-only; a ZCode `Agent` uses the alias contract above and never installs this
+TOML file.

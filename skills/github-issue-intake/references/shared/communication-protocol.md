@@ -2,11 +2,13 @@
 
 Use native Codex messaging for material Visible Worker transitions and GitHub
 for durable work state. Inline work stays in the Orchestrator. Subagents return
-through the parent collaboration channel and do not create a project ledger.
+through the parent collaboration channel and do not create a project ledger. On
+ZCode, parent-to-Agent revisions use `SendMessage` with the exact `agentId`; the
+Agent's progress and final result use the parent collaboration channel.
 
 ## Delivery handshake
 
-Every Visible Worker signal uses a stable `Signal-ID`:
+Every Codex Visible Worker signal uses a stable `Signal-ID`:
 
 1. Build the complete envelope below.
 2. Call native `send_message_to_thread` with the exact Orchestrator callback
@@ -16,6 +18,14 @@ Every Visible Worker signal uses a stable `Signal-ID`:
    not resend it.
 5. On transport error, retry once with the identical envelope. After another
    failure, record `CALLBACK_DELIVERY_FAILED <Signal-ID>` and stop cleanly.
+
+ZCode Subagents need no startup callback handshake. Their final result returns
+through the parent collaboration channel. For a material mid-run revision, the
+parent sends the complete stable envelope through `SendMessage` to the exact
+`agentId`. `queued`, `steered`, or `resumed_background` proves only transport
+acceptance. When semantic acknowledgement matters, require the Agent to return
+`SIGNAL_RECEIVED <Signal-ID>`; on transport error retry once with the identical
+envelope, then stop with `CALLBACK_DELIVERY_FAILED <Signal-ID>`.
 
 Keep callback IDs, Task/Subagent IDs, worktree paths, owner tokens, credentials,
 and private machine details out of GitHub.
@@ -68,9 +78,12 @@ formal review, and safe candidate evidence can run in parallel.
 
 Inline work records candidate evidence directly. A Subagent receives one
 bounded prompt with exact worktree/write boundaries and returns outcome,
-changed paths, checks, and blockers to its parent. The Orchestrator verifies and
-publishes the result. Do not use a GitHub comment as a hidden Subagent callback
-or let a Subagent spawn a second work item.
+changed paths, checks, commit/PR when applicable, and blockers to its parent.
+On ZCode, the complete initial prompt is already authorized and the Agent may
+start without `WORKER_BOOTED`, `PREFLIGHT_READY`, a callback Task, or a second
+literal START. The Orchestrator verifies and publishes the result. Do not use a
+GitHub comment as a hidden Subagent callback or let a Subagent spawn a second
+work item.
 
 ## Orchestrator verification
 
