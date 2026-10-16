@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0036 and ADR-0039
+status: superseded by ADR-0055
 ---
 
 # Model gates, reviews, and integration as Plan Nodes

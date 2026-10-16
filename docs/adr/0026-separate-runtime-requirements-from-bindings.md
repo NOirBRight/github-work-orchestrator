@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0037 and ADR-0039
+status: amended by ADR-0037, ADR-0039, ADR-0042, ADR-0044, and ADR-0059
 ---
 
 # Separate Runtime Requirements from Runtime Bindings

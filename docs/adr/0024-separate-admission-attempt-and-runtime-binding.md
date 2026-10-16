@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0036
+status: amended by ADR-0036 and ADR-0058
 ---
 
 # Separate Admission, Attempt, and Runtime Binding

@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0036
+status: amended by ADR-0036 and ADR-0043
 ---
 
 # Bound repair and reasoning escalation before node failure

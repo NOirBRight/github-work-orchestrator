@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: amended by ADR-0059
 ---
 
 # Define Runtime Adapters by execution model

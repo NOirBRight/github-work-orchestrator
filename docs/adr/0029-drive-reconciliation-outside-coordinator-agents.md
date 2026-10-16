@@ -1,27 +1,28 @@
 ---
-status: accepted
+status: amended by ADR-0050, ADR-0053, ADR-0054, ADR-0056, and ADR-0058
 amends: 0003-use-an-event-driven-paseo-coordinator-loop.md
 ---
 
 # Drive mechanical reconciliation outside Coordinator Agents
 
 V8 does not rely on a Repository Coordinator Agent to wake and supervise its
-own control loop. The GWO Kernel exposes a deterministic, idempotent
-`reconcile --once` pass that observes recorded intent and runtime or GitHub
-readback, executes all currently due mechanical actions, and exits.
+own control loop. ExecutionKernel exposes a deterministic, idempotent
+`advance` operation that observes recorded intent and Runtime or GitHub
+readback, executes all currently due bounded mechanical actions, and returns a
+typed continuation state.
 Materialization is one such Kernel-owned convergence. Coordinator Agents retain
-semantic planning, diagnosis, review, and integration judgment, but are
-replaceable clients of the Kernel rather than the sole clock that keeps
-coordination moving. SQLite remains rebuildable control-plane state and GitHub
+the required Campaign Planning Pass and explicit semantic diagnosis or
+Decision judgment, but are replaceable clients of the Kernel rather than the
+sole clock that keeps coordination moving. Formal Review and Integration are
+Kernel-owned gates. SQLite remains rebuildable control-plane state and GitHub
 remains durable business truth.
 
 V8.0 does not add a GWO daemon, service manager, multi-primary Kernel, internal
-event bus, or permanent reconciliation worker pool. A host-provided Goal Driver
-such as a `/goal` continuation mechanism invokes `reconcile --once`, waits
-without sampling an LLM, and invokes it again when an existing event source or
-due time wakes the Goal. One pass may fan out a bounded batch of independent
-Materialization calls before it exits. A host without Goal Driver support must
-invoke the same pass manually or through its own external scheduler.
+event bus, or permanent reconciliation worker pool. Campaign Watchdog invokes
+`ExecutionKernel.advance`, waits without sampling an LLM, and invokes it again
+when an existing event source or due time wakes the Goal. One call may fan out
+a bounded batch of independent Materialization actions before it returns. A
+host without Watchdog support may invoke the same operation manually.
 
 Each Task Group has a Goal whose objective and acceptance conditions outlive
 individual Coordinator turns and Plan Revisions. A turn ending is not a Goal
@@ -30,15 +31,14 @@ after every in-scope Work Item is completed or integrated and all required
 review, integration, and Decision Gates are satisfied. Resource cleanup is
 Kernel-owned follow-up and does not hold the Goal open.
 
-While the Goal remains active, a reconciliation pass returns a wait directive
+While the Goal remains active, an ExecutionKernel advance returns a wait directive
 without invoking an Agent when an Attempt, GitHub check, materialization retry,
-or other explicit Wait Condition is outstanding. If completion is not yet
-satisfied and no Wait Condition exists, it returns a continuation directive
-and the Goal Driver invokes the Coordinator again. Every Wait Condition names
-its observable wake source and may name a `next_check_at` for targeted readback
-rather than relying on free-form prose. The Goal Driver waits until either
-occurs; V8.0 has no separate global fallback scanner. A Goal becomes blocked
-when its remaining frontier needs a human decision, external input, or runtime
+or other explicit Wait Condition is outstanding. If deterministic work is due,
+ExecutionKernel performs it; it requests a Coordinator only through a typed
+semantic action. Every Wait Condition names its observable wake source and may
+name a `next_check_at` for targeted readback rather than relying on free-form
+prose. Campaign Watchdog waits until either occurs. A Goal becomes blocked when
+its remaining frontier needs a human decision, external input, or Runtime
 configuration, and reactivates when that input arrives.
 
 Continuation is keyed by a semantic-input digest rather than time, activity, or
@@ -51,10 +51,11 @@ Binding and a compact Goal snapshot. Within the existing Goal, authority, and
 effect boundary, discovered work may enter a new Plan Revision automatically;
 expansion requires a Decision Gate.
 
-Runtime events wake the Goal Driver but do not advance durable state without
-readback. A lost callback therefore delays convergence at most; the next Kernel
-pass, triggered by the Wait Condition's `next_check_at`, performs targeted
-readback by stable Agent, session, Admission, and action identities.
+Runtime events wake Campaign Watchdog but do not advance durable state without
+readback. A lost callback therefore delays convergence at most; the next
+ExecutionKernel advance, triggered by the Wait Condition's `next_check_at`,
+performs targeted readback by stable Agent, session, Admission, and action
+identities.
 
 Store recovery reconstructs the active Plan Revision, Goals, Work Items, and
 Evidence Manifests from GitHub; runtime bindings and Prompt acceptance from

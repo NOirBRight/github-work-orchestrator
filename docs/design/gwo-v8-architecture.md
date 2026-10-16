@@ -1,8 +1,11 @@
 # GWO V8 architecture
 
-Status: accepted design; implementation complete through Phase 4C. The
-dedicated three-node live Batch canary passed; production writer cutover
-remains an explicit operational action.
+Status: superseded historical design. Do not generate new implementation work
+from this document. The accepted target is
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md).
+
+The remainder records the earlier PlanSpec v2 / Phase 4C design for migration
+and decision history only.
 
 `CONTEXT.md` is the normative vocabulary. The governing ADR chain preserves
 earlier V7-oriented decisions as superseded history; V8 starts from the actual
